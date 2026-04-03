@@ -3732,7 +3732,7 @@ class BinanceAnalyzer:
                                                                                                 else:
                                                                                                     # 10. PostDropBounceOverride (Priority -140)
                                                                                                     post_drop_bounce = PostDropBounceOverride.detect(
-                                                                                                        change_5m, volume_ratio, ofi["bias"], ofi["strength"]
+                                                                                                        change_5m, volume_ratio, ofi["bias"], ofi["strength"], liq["short_dist"]
                                                                                                     )
                                                                                                     if post_drop_bounce["override"]:
                                                                                                         final_bias = post_drop_bounce["bias"]
