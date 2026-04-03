@@ -4108,6 +4108,7 @@ class BinanceAnalyzer:
                             priority = master_squeeze["priority"]
                             prob_engine.add(master_squeeze["bias"], 10.0)
                         else:
+else:
                             # 1.01. ABSOLUTE AGG OVERRIDE (Priority -1098)
                             absolute_agg = AbsoluteAggOverride.detect(
                                 agg, down_energy, ofi["bias"], ofi["strength"],
@@ -4210,6 +4211,8 @@ class BinanceAnalyzer:
                                                             priority = extreme_overbought_ignore["priority"]
                                                             prob_engine.add(extreme_overbought_ignore["bias"], 9.9)
                                                         else:
+                                                            # Lanjut ke detector berikutnya
+                                                            pass
                                                             # 1.3. CROWDED LONG DISTRIBUTION (Priority -165)
                                                             crowded_long = CrowdedLongDistribution.detect(rsi6, volume_ratio, ofi["bias"], change_5m)
                                                             if crowded_long["override"]:
