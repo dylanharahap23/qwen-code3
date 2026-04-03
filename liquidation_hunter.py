@@ -521,7 +521,25 @@ class OverboughtDistributionTrap:
     @staticmethod
     def detect(rsi6: float, short_dist: float, long_dist: float, volume_ratio: float,
                down_energy: float, up_energy: float, ofi_bias: str,
-               ofi_strength: float, change_5m: float) -> Dict:
+               ofi_strength: float, change_5m: float, agg: float = 0.5) -> Dict:
+        # ============================================================
+        # 🔥 PATCH AIOTUSDT: Jika short_liq dekat DAN down_energy=0
+        # ini adalah SHORT SQUEEZE SETUP, bukan distribusi!
+        # Jangan paksa SHORT dalam kondisi ini.
+        # ============================================================
+        if short_dist < 4.0 and short_dist < long_dist and down_energy < 0.01:
+            return {"override": False}  # biarkan squeeze detector yang handle
+
+        # 🔥 PATCH #2: agg = 1.00 (100% BUY) → tidak mungkin distribusi
+        # Distribusi = smart money JUAL ke retail. Kalau 100% trades BUY,
+        # artinya tidak ada yang jual = bukan distribusi.
+        if agg > 0.85 and down_energy < 0.01:
+            return {"override": False}
+
+        # Guard: agg tinggi + up_energy ada = momentum beli nyata
+        if agg > 0.7 and up_energy > 0.3 and short_dist < long_dist:
+            return {"override": False}
+
         # PATCH: short liq SANGAT dekat (<0.5%) dan down_energy=0
         if short_dist < 0.5 and down_energy < 0.01 and change_5m > 0:
             return {"override": False}
@@ -1349,6 +1367,185 @@ class VolumeSpikeBounceDetector:
                 ),
                 "priority": -1092
             }
+
+        return {"override": False}
+
+
+class ShortLiqProximityAggSqueeze:
+    """
+    🔥 AIOTUSDT EXACT PATTERN DETECTOR:
+    
+    Kondisi:
+    - short_liq < 4% (dekat, bisa disapu)
+    - short_liq < long_liq (short lebih dekat)
+    - agg > 0.7 (mayoritas buy)
+    - down_energy = 0 (tidak ada seller di book)
+    - up_energy > 0 (ada buy pressure)
+    - change_5m > 0 (momentum naik)
+    
+    Ini adalah DEFINISI short squeeze:
+    Harga naik dengan buyer aktif, tidak ada seller,
+    dan short stop hanya 3% di atas → HFT akan gas ke atas
+    untuk sapu semua short.
+    
+    RSI overbought justru MEMPERKUAT squeeze karena:
+    RSI tinggi = short sellers panik average → lebih banyak stop di atas.
+    
+    Priority: -1096 (di bawah AbsoluteAgg -1098, di atas TwoPhase -1095)
+    """
+    @staticmethod
+    def detect(short_dist: float, long_dist: float, agg: float,
+               down_energy: float, up_energy: float, change_5m: float,
+               rsi6: float, volume_ratio: float) -> Dict:
+
+        # Core squeeze pattern
+        if (short_dist < 4.0 and
+            short_dist < long_dist and
+            agg > 0.65 and
+            down_energy < 0.01 and
+            up_energy > 0.1 and
+            change_5m > 0):
+            
+            # Tentukan kekuatan squeeze
+            if short_dist < 2.0:
+                strength = "EXTREME"
+                priority = -1097
+            elif short_dist < 3.0:
+                strength = "STRONG"
+                priority = -1096
+            else:
+                strength = "MODERATE"
+                priority = -1094
+
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": f"Short liq proximity + agg squeeze ({strength}): short liq {short_dist:.2f}% dekat, agg={agg:.2f} (majority buy), down_energy={down_energy:.3f}, up_energy={up_energy:.2f}, price up {change_5m:.1f}% → HFT will sweep short stops",
+                "priority": priority
+            }
+
+        # Mirror: long liq dekat + agg rendah + no buyer
+        if (long_dist < 4.0 and
+            long_dist < short_dist and
+            agg < 0.35 and
+            up_energy < 0.01 and
+            down_energy > 0.1 and
+            change_5m < 0):
+
+            if long_dist < 2.0:
+                priority = -1097
+            elif long_dist < 3.0:
+                priority = -1096
+            else:
+                priority = -1094
+
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"Long liq proximity + agg dump: long liq {long_dist:.2f}% dekat, agg={agg:.2f} (majority sell), up_energy={up_energy:.3f}, down_energy={down_energy:.2f}, price down {change_5m:.1f}% → HFT will sweep long stops",
+                "priority": priority
+            }
+
+        return {"override": False}
+
+
+class OFIConsistencyValidator:
+    """
+    🔥 FIX BUG AIOTUSDT: OFI display ≠ OFI JSON
+    
+    Masalah: OFI dihitung dengan window berbeda menghasilkan nilai berbeda.
+    Satu window (display) bilang LONG 1.00, window lain (json) bilang NEUTRAL.
+    
+    Solusi: Gunakan agg sebagai tiebreaker.
+    Jika agg > 0.7 dan OFI = NEUTRAL, upgrade OFI ke LONG.
+    Jika agg < 0.3 dan OFI = NEUTRAL, upgrade OFI ke SHORT.
+    
+    Ini memastikan agg dan OFI konsisten.
+    """
+    @staticmethod
+    def validate_and_fix(ofi_bias: str, ofi_strength: float,
+                         agg: float, flow: float,
+                         up_energy: float, down_energy: float) -> Dict:
+        
+        # Jika OFI NEUTRAL tapi agg sangat bullish + no seller
+        if (ofi_bias == "NEUTRAL" and
+            agg > 0.75 and
+            up_energy > 0 and
+            down_energy < 0.01):
+            # Upgrade OFI ke LONG berdasarkan agg
+            inferred_strength = min((agg - 0.5) * 2, 1.0)  # scale 0.5→1.0 ke 0→1.0
+            return {
+                "bias": "LONG",
+                "strength": inferred_strength,
+                "inferred": True,
+                "reason": f"OFI inferred LONG from agg={agg:.2f}, up_energy={up_energy:.2f}, no sellers"
+            }
+
+        # Jika OFI NEUTRAL tapi agg sangat bearish + no buyer
+        if (ofi_bias == "NEUTRAL" and
+            agg < 0.25 and
+            down_energy > 0 and
+            up_energy < 0.01):
+            inferred_strength = min((0.5 - agg) * 2, 1.0)
+            return {
+                "bias": "SHORT",
+                "strength": inferred_strength,
+                "inferred": True,
+                "reason": f"OFI inferred SHORT from agg={agg:.2f}, down_energy={down_energy:.2f}, no buyers"
+            }
+
+        # OFI sudah valid, kembalikan apa adanya
+        return {"bias": ofi_bias, "strength": ofi_strength, "inferred": False}
+
+
+class DownEnergyZeroShortLiqClose:
+    """
+    🔥 Rule paling sederhana yang belum ada:
+    
+    Jika:
+    - down_energy = 0 (TIDAK ADA SELLER di order book)
+    - short_liq < 4% (target sweep dekat)
+    - short_liq < long_liq (short lebih dekat dari long)
+    
+    Maka TIDAK MUNGKIN dump — tidak ada yang mau jual.
+    HFT PASTI akan naik dulu untuk ambil short liq.
+    
+    Ini seharusnya override SEMUA sinyal overbought/distribusi.
+    Priority: -1093 (tepat di atas TwoPhase -1095)
+    """
+    @staticmethod
+    def detect(down_energy: float, short_dist: float, long_dist: float,
+               up_energy: float, agg: float) -> Dict:
+
+        if (down_energy < 0.01 and
+            short_dist < 4.0 and
+            short_dist < long_dist):
+            
+            # Konfirmasi dengan minimal satu sinyal beli
+            has_buy_signal = (up_energy > 0.1 or agg > 0.55)
+            
+            if has_buy_signal:
+                return {
+                    "override": True,
+                    "bias": "LONG",
+                    "reason": f"Down energy zero + short liq close: down_energy={down_energy:.3f} (no sellers), short liq {short_dist:.2f}% < long liq {long_dist:.2f}%, up_energy={up_energy:.2f}, agg={agg:.2f} → path ke atas kosong, HFT sweep short stops",
+                    "priority": -1093
+                }
+
+        # Mirror: up_energy=0 + long_liq dekat + ada sell signal
+        if (up_energy < 0.01 and
+            long_dist < 4.0 and
+            long_dist < short_dist):
+
+            has_sell_signal = (down_energy > 0.1 or agg < 0.45)
+
+            if has_sell_signal:
+                return {
+                    "override": True,
+                    "bias": "SHORT",
+                    "reason": f"Up energy zero + long liq close: up_energy={up_energy:.3f} (no buyers), long liq {long_dist:.2f}% < short liq {short_dist:.2f}%, down_energy={down_energy:.2f}, agg={agg:.2f} → path ke bawah kosong, HFT sweep long stops",
+                    "priority": -1093
+                }
 
         return {"override": False}
 
@@ -4156,6 +4353,13 @@ class BinanceAnalyzer:
                     self.prev_ofi_timestamp = current_time
                 ofi = {"bias": self.prev_ofi_bias, "strength": ofi_raw["strength"]}
 
+            # ========== OFI Consistency Validator (FIX BUG AIOTUSDT) ==========
+            ofi_validated = OFIConsistencyValidator.validate_and_fix(
+                ofi["bias"], ofi["strength"],
+                agg, flow, up_energy, down_energy
+            )
+            ofi = ofi_validated  # replace ofi dengan yang sudah divalidasi
+
             iceberg = IcebergDetector.detect(trades, price) if trades else {"detected": False}
             cross_lead = CrossExchangeLeader.check_leader(self.symbol)
             funding_trap = FundingRateTrap.detect(funding_rate or 0, oi or 0)
@@ -4170,10 +4374,23 @@ class BinanceAnalyzer:
                 price, change_5m, up_energy, down_energy, LATENCY_MS_ESTIMATE
             )
 
+            # ========== NEW DETECTORS: ShortLiqProximityAggSqueeze & DownEnergyZeroShortLiqClose ==========
+            short_liq_agg_squeeze = ShortLiqProximityAggSqueeze.detect(
+                liq["short_dist"], liq["long_dist"], agg,
+                down_energy, up_energy, change_5m,
+                rsi6, volume_ratio
+            )
+
+            down_energy_zero_close = DownEnergyZeroShortLiqClose.detect(
+                down_energy, liq["short_dist"], liq["long_dist"],
+                up_energy, agg
+            )
+
             # ========== Overbought / Oversold Distribution Traps ==========
             overbought_trap = OverboughtDistributionTrap.detect(
                 rsi6, liq["short_dist"], liq["long_dist"], volume_ratio,
-                down_energy, up_energy, ofi["bias"], ofi["strength"], change_5m
+                down_energy, up_energy, ofi["bias"], ofi["strength"], change_5m,
+                agg=agg  # ← TAMBAHKAN parameter agg
             )
 
             if overbought_trap["override"]:
@@ -4258,6 +4475,24 @@ class BinanceAnalyzer:
                             final_phase = "ABSOLUTE_AGG_OVERRIDE"
                             priority = absolute_agg["priority"]
                             prob_engine.add(absolute_agg["bias"], 9.995)
+
+                        # 1.015. SHORT LIQ PROXIMITY + AGG SQUEEZE (Priority -1097/-1096/-1094)
+                        elif short_liq_agg_squeeze["override"]:
+                            final_bias = short_liq_agg_squeeze["bias"]
+                            final_reason = short_liq_agg_squeeze["reason"]
+                            final_confidence = "ABSOLUTE"
+                            final_phase = "SHORT_LIQ_PROXIMITY_AGG_SQUEEZE"
+                            priority = short_liq_agg_squeeze["priority"]
+                            prob_engine.add(short_liq_agg_squeeze["bias"], 9.993)
+
+                        # 1.02. DOWN ENERGY ZERO + SHORT LIQ CLOSE (Priority -1093)
+                        elif down_energy_zero_close["override"]:
+                            final_bias = down_energy_zero_close["bias"]
+                            final_reason = down_energy_zero_close["reason"]
+                            final_confidence = "ABSOLUTE"
+                            final_phase = "DOWN_ENERGY_ZERO_SHORT_LIQ_CLOSE"
+                            priority = down_energy_zero_close["priority"]
+                            prob_engine.add(down_energy_zero_close["bias"], 9.991)
 
                         # 1.025. VOLUME SPIKE BOUNCE (Priority -1092)
                         elif VolumeSpikeBounceDetector.detect(
