@@ -4138,9 +4138,7 @@ class BinanceAnalyzer:
 
             oi_delta = 0.0
             if oi_history and len(oi_history) >= 2:
-                oi_delta = (
-                    (oi_history[0] - oi_history[1]) / oi_history[1]) * 100
-                    if oi_history[1] != 0 else 0
+                oi_delta = ((oi_history[0] - oi_history[1]) / oi_history[1]) * 100 if oi_history[1] != 0 else 0
 
             volatility = (
                 (max(highs_1m[-20:]) - min(lows_1m[-20:])) / price
