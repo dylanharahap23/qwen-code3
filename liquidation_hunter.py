@@ -1037,6 +1037,160 @@ class MasterSqueezeRule:
         return {"override": False}
 
 
+# ================= LECTURER'S SARAN LOGIC: ABSOLUTE AGG OVERRIDE (Priority -1098) =================
+
+class AbsoluteAggOverride:
+    """
+    🔥 KRIMINAL DETECTOR #1: agg = 1.00 (100% BUY) + down_energy = 0
+    
+    Ini adalah kondisi paling bullish yang ada:
+    - Tidak satu pun trade adalah SELL
+    - Tidak ada seller di order book (down_energy = 0)
+    - OFI LONG kuat
+    
+    Tidak peduli liquidity jauh atau RSI berapa — ini LONG.
+    HFT tidak bisa dump kalau tidak ada yang mau jual.
+    
+    Priority: -1098 (hampir setara MasterSqueeze, di bawah VolSpike -1092)
+    """
+    @staticmethod
+    def detect(agg: float, down_energy: float, ofi_bias: str,
+               ofi_strength: float, up_energy: float,
+               funding_rate: float) -> Dict:
+
+        # 100% BUY + no seller + OFI LONG kuat
+        if (agg >= 0.95 and
+            down_energy < 0.01 and
+            ofi_bias == "LONG" and
+            ofi_strength > 0.5):
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": f"ABSOLUTE AGG: agg={agg:.2f} (100% buy trades), down_energy=0, OFI LONG {ofi_strength:.2f} → tidak ada seller, forced LONG",
+                "priority": -1098
+            }
+
+        # Mirror: 100% SELL + no buyer
+        if (agg <= 0.05 and
+            up_energy < 0.01 and
+            ofi_bias == "SHORT" and
+            ofi_strength > 0.5):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"ABSOLUTE AGG: agg={agg:.2f} (100% sell trades), up_energy=0, OFI SHORT {ofi_strength:.2f} → tidak ada buyer, forced SHORT",
+                "priority": -1098
+            }
+
+        return {"override": False}
+
+
+# ================= LECTURER'S SARAN LOGIC: RSI 5m VS 1m DIVERGENCE (Priority -1068) =================
+
+class RSI5mVs1mDivergence:
+    """
+    🔥 DUSDT PATTERN: RSI 5m jauh lebih oversold dari RSI 1m
+    
+    Kalau RSI_5m < 25 tapi RSI_1m > 30:
+    - 5m menunjukkan oversold BESAR (trend turun sudah lama)
+    - 1m sudah mulai recover (short-term bounce dimulai)
+    - Ini adalah sinyal LONG yang kuat = reversal multi-timeframe
+    
+    Mirror: RSI_5m > 75 tapi RSI_1m < 70 = distribusi, SHORT
+    
+    Priority: -1068 (antara AggConfirmedBounce dan ExhaustedLiquidity)
+    """
+    @staticmethod
+    def detect(rsi6_1m: float, rsi6_5m: float,
+               down_energy: float, up_energy: float,
+               agg: float, funding_rate: float) -> Dict:
+
+        # 5m sangat oversold, 1m sudah recover → bounce multi-TF
+        if (rsi6_5m < 25 and
+            rsi6_1m > 28 and          # 1m sudah mulai naik
+            rsi6_1m - rsi6_5m > 8 and # divergensi minimal 8 poin
+            down_energy < 0.1 and
+            up_energy > 0):
+            
+            # Bonus: funding negatif = crowded short = squeeze material
+            funding_bonus = " + funding negatif (crowded short)" if funding_rate is not None and funding_rate < -0.001 else ""
+            
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": f"RSI multi-TF divergence: RSI_5m={rsi6_5m:.1f} oversold tapi RSI_1m={rsi6_1m:.1f} recovering, no sellers{funding_bonus} → bounce imminent",
+                "priority": -1068
+            }
+
+        # Mirror: 5m sangat overbought, 1m sudah mulai turun
+        if (rsi6_5m > 75 and
+            rsi6_1m < 72 and
+            rsi6_5m - rsi6_1m > 8 and
+            up_energy < 0.1 and
+            down_energy > 0):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"RSI multi-TF divergence: RSI_5m={rsi6_5m:.1f} overbought tapi RSI_1m={rsi6_1m:.1f} declining, no buyers → dump imminent",
+                "priority": -1068
+            }
+
+        return {"override": False}
+
+
+# ================= LECTURER'S SARAN LOGIC: FUNDING NEGATIVE AGG LONG OVERRIDE (Priority -1072) =================
+
+class FundingNegativeAggLongOverride:
+    """
+    🔥 DUSDT PATTERN: Funding negatif + agg tinggi + OFI LONG
+    
+    Funding negatif berarti semua orang short (membayar longs).
+    Kalau di atas itu agg tinggi (mayoritas BUY) dan OFI LONG kuat,
+    berarti ada akumulasi diam-diam → short squeeze segera terjadi.
+    
+    Ini tidak butuh liquidity dekat — funding negatif ADALAH trigger-nya.
+    
+    Priority: -1072 (antara LiquidityMagnetOverride dan AggConfirmedBounce)
+    """
+    @staticmethod
+    def detect(funding_rate: float, agg: float, ofi_bias: str,
+               ofi_strength: float, down_energy: float,
+               rsi6_5m: float, volume_ratio: float) -> Dict:
+
+        if funding_rate is None:
+            return {"override": False}
+
+        # Funding negatif (crowded short) + mayoritas BUY + OFI LONG
+        if (funding_rate < -0.001 and       # crowded short threshold
+            agg > 0.65 and                  # mayoritas BUY
+            ofi_bias == "LONG" and
+            ofi_strength > 0.5 and
+            down_energy < 0.1 and
+            rsi6_5m < 40):                  # tidak overbought di 5m
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": f"Funding crowded short squeeze: funding={funding_rate:.4f} (semua orang short), agg={agg:.2f} (majority buy), OFI LONG {ofi_strength:.2f}, no sellers → short squeeze incoming",
+                "priority": -1072
+            }
+
+        # Mirror: Funding positif (crowded long) + mayoritas SELL + OFI SHORT
+        if (funding_rate > 0.001 and
+            agg < 0.35 and
+            ofi_bias == "SHORT" and
+            ofi_strength > 0.5 and
+            up_energy < 0.1 and
+            rsi6_5m > 60):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"Funding crowded long dump: funding={funding_rate:.4f} (semua orang long), agg={agg:.2f} (majority sell), OFI SHORT {ofi_strength:.2f}, no buyers → long liquidation incoming",
+                "priority": -1072
+            }
+
+        return {"override": False}
+
+
 # ================= LECTURER'S SARAN: NEW DETECTORS (Priority -1080 and -165) =================
 
 class ExtremeOversoldIgnoreLiquidity:
@@ -3274,6 +3428,25 @@ class HFT6PercentDirection:
     def determine(price: float, short_dist: float, long_dist: float,
                   up_energy: float, down_energy: float, oi_delta: float,
                   agg: float, flow: float) -> Dict:
+        # 🔥 PATCH DUSDT: Jika kedua liquidity sangat jauh (>5%),
+        # jangan gunakan liquidity sebagai primary driver.
+        # Pakai energy dan agg sebagai penentu.
+        if short_dist > 5.0 and long_dist > 5.0:
+            if up_energy > 0 and down_energy < 0.01 and agg > 0.6:
+                return {
+                    "bias": "LONG",
+                    "reason": f"Both liq too far (short={short_dist:.1f}%, long={long_dist:.1f}%), energy+agg: up_energy={up_energy:.2f}, agg={agg:.2f} → LONG",
+                    "confidence": "MEDIUM"
+                }
+            if down_energy > 0 and up_energy < 0.01 and agg < 0.4:
+                return {
+                    "bias": "SHORT",
+                    "reason": f"Both liq too far (short={short_dist:.1f}%, long={long_dist:.1f}%), energy+agg: down_energy={down_energy:.2f}, agg={agg:.2f} → SHORT",
+                    "confidence": "MEDIUM"
+                }
+            # Kalau tidak ada signal kuat, kembalikan NEUTRAL
+            return {"bias": "NEUTRAL", "reason": f"Both liq too far ({short_dist:.1f}%/{long_dist:.1f}%), no strong signal", "confidence": "LOW"}
+
         # Prioritas Utama: Jarak Likuiditas (Magnet)
         if short_dist < 1.0 and short_dist < long_dist:
             primary = "LONG"
@@ -3935,7 +4108,20 @@ class BinanceAnalyzer:
                             priority = master_squeeze["priority"]
                             prob_engine.add(master_squeeze["bias"], 10.0)
                         else:
-                            # 1.025. VOLUME SPIKE BOUNCE DETECTOR (Priority -1092)
+                            # 1.01. ABSOLUTE AGG OVERRIDE (Priority -1098)
+                            absolute_agg = AbsoluteAggOverride.detect(
+                                agg, down_energy, ofi["bias"], ofi["strength"],
+                                up_energy, funding_rate or 0
+                            )
+                            if absolute_agg["override"]:
+                                final_bias = absolute_agg["bias"]
+                                final_reason = absolute_agg["reason"]
+                                final_confidence = "ABSOLUTE"
+                                final_phase = "ABSOLUTE_AGG_OVERRIDE"
+                                priority = absolute_agg["priority"]
+                                prob_engine.add(absolute_agg["bias"], 9.995)
+                            else:
+                                # 1.025. VOLUME SPIKE BOUNCE DETECTOR (Priority -1092)
                             volume_spike_bounce = VolumeSpikeBounceDetector.detect(
                                 latest_volume, volume_ma10, rsi6,
                                 up_energy, down_energy, agg,
@@ -4094,7 +4280,20 @@ class BinanceAnalyzer:
                                                                                 priority = agg_confirmed["priority"]
                                                                                 prob_engine.add(agg_confirmed["bias"], 9.75)
                                                                             else:
-                                                                                # 1.66. AGG MAJORITY BOUNCE (Priority -1072)
+                                                                                # 1.655. RSI 5m VS 1m DIVERGENCE (Priority -1068)
+                                                                                rsi_divergence = RSI5mVs1mDivergence.detect(
+                                                                                    rsi6, rsi6_5m, down_energy, up_energy,
+                                                                                    agg, funding_rate or 0
+                                                                                )
+                                                                                if rsi_divergence["override"]:
+                                                                                    final_bias = rsi_divergence["bias"]
+                                                                                    final_reason = rsi_divergence["reason"]
+                                                                                    final_confidence = "ABSOLUTE"
+                                                                                    final_phase = "RSI_5m_VS_1m_DIVERGENCE"
+                                                                                    priority = rsi_divergence["priority"]
+                                                                                    prob_engine.add(rsi_divergence["bias"], 9.73)
+                                                                                else:
+                                                                                    # 1.66. AGG MAJORITY BOUNCE (Priority -1072)
                                                                                 agg_majority = AggMajorityBounce.detect(
                                                                                     agg, rsi6, liq["long_dist"], change_5m,
                                                                                     up_energy, down_energy
@@ -4583,11 +4782,17 @@ class BinanceAnalyzer:
                                                                                                                                                                                                                                     prob_engine.add(energy_gap["bias"], 3.0)
                                                                                                                                                                                                                                 else:
                                                                                                                                                                                                                                     # If no override, fallback to voting
-                                                                                                                                                                                                                                    prob_engine.add(ofi["bias"], ofi["strength"] * 2.0)
-                                                                                                                                                                                                                                    if up_energy < down_energy:
-                                                                                                                                                                                                                                        prob_engine.add("LONG", 1.0)
-                                                                                                                                                                                                                                    else:
-                                                                                                                                                                                                                                        prob_engine.add("SHORT", 1.0)
+                                                                                                                                                                                                                                    # 🔥 VotingWeightAggBoost: boost weight OFI & energy saat agg ekstrem
+                                                                                                                                                                                                                                    agg_boost = 1.0
+                                                                                                                                                                                                                                    if agg > 0.85 or agg < 0.15:
+                                                                                                                                                                                                                                        agg_boost = 3.0  # agg ekstrem = signal 3x lebih kuat
+                                                                                                                                                                                                                                    
+                                                                                                                                                                                                                                    prob_engine.add(ofi["bias"], ofi["strength"] * 2.0 * agg_boost)
+                                                                                                                                                                                                                                    
+                                                                                                                                                                                                                                    # Boost energy weight saat agg ekstrem
+                                                                                                                                                                                                                                    energy_bias = "LONG" if up_energy < down_energy else "SHORT"
+                                                                                                                                                                                                                                    energy_weight = 1.0 * agg_boost
+                                                                                                                                                                                                                                    prob_engine.add(energy_bias, energy_weight)
                                                                                                                                                                                                                                     if liq["short_dist"] < liq["long_dist"]:
                                                                                                                                                                                                                                         prob_engine.add("LONG", 1.0)
                                                                                                                                                                                                                                     else:
