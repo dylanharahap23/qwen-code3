@@ -523,7 +523,15 @@ class OverboughtDistributionTrap:
         
         NEW: Tidak override jika short liq sangat dekat (<2%) dan lebih dekat dari long liq
         → liquidity mengarah LONG, jangan SHORT.
+        
+        PATCH: Jika short liq SANGAT dekat (<0.5%) dan down_energy=0
+        → HFT belum selesai sweep, jangan SHORT dulu (biarkan TwoPhaseHFTSweep yang handle)
         """
+        # 🔥 PATCH: Jika short liq SANGAT dekat (<0.5%) dan down_energy=0
+        # → HFT belum selesai sweep, jangan SHORT dulu
+        if short_dist < 0.5 and down_energy < 0.01 and change_5m > 0:
+            return {"override": False}  # biarkan TwoPhaseHFTSweep yang handle
+        
         # 🔥 EXTREME OVERBOUGHT: force SHORT regardless of liquidity proximity
         if rsi6 > 85 and volume_ratio < 0.6 and down_energy < 0.01:
             # 🔥 Jangan paksa SHORT jika short liq sangat dekat dan OFI SHORT kuat (squeeze)
@@ -1135,6 +1143,99 @@ class HFTAlgoConsensusOverride:
                         "reason": f"HFT-Algo consensus: both {algo_bias} with low volume ({volume_ratio:.2f}x) → forcing {algo_bias}",
                         "priority": -170
                     }
+        return {"override": False}
+
+
+# ================= LECTURER'S SARAN LOGIC: TWO-PHASE HFT SWEEP DETECTOR =================
+
+class TwoPhaseHFTSweepDetector:
+    """
+    Mendeteksi rencana HFT 2 fase:
+    Fase 1: Pump untuk sweep short liq (jika short_dist < 0.5%)
+    Fase 2: Dump untuk sweep long liq setelah short liq habis
+    
+    Kunci: Jika SHORT liq sangat dekat (<0.5%) tapi RSI sudah overbought
+    ekstrem DAN long_liq jauh lebih besar, maka:
+    - Jangka pendek (fase 1): LONG (sweep short dulu)
+    - Jangka menengah (fase 2): SHORT (dump setelah sweep)
+    
+    Priority: -1095 (antara MasterSqueeze -1100 dan HFTExplicitDump -1090)
+    """
+    @staticmethod
+    def detect(short_dist: float, long_dist: float, rsi6: float,
+               down_energy: float, up_energy: float, change_5m: float,
+               ofi_bias: str, ofi_strength: float, volume_ratio: float) -> Dict:
+        
+        # Fase 1: Short liq SANGAT dekat, belum disapu → paksa LONG dulu
+        if (short_dist < 0.5 and
+            short_dist < long_dist * 0.1 and  # short liq << long liq
+            rsi6 > 75 and                       # overbought (distribusi di atas)
+            down_energy < 0.01 and              # tidak ada seller aktif
+            change_5m > 2.0):                   # momentum masih naik
+            return {
+                "override": True,
+                "bias": "LONG",
+                "phase_type": "TWO_PHASE_SWEEP_PHASE1",
+                "reason": f"Two-phase HFT sweep: short liq {short_dist:.2f}% << long liq {long_dist:.2f}%, RSI {rsi6:.1f} overbought, no sellers → HFT pump dulu untuk sapu short stop, baru dump",
+                "priority": -1095
+            }
+        return {"override": False}
+
+
+# ================= LECTURER'S SARAN LOGIC: OFI DIVERGENCE TRAP =================
+
+class OFIDivergenceTrap:
+    """
+    Ketika OFI SHORT kuat (strength > 0.4) tapi:
+    - down_energy = 0 (tidak ada sell pressure nyata di book)
+    - harga masih naik (change_5m > 0)
+    - short liq dekat
+    
+    Artinya: order sell yang masuk LANGSUNG DISERAP oleh buyer besar.
+    Ini adalah tanda squeeze kuat, bukan sinyal SHORT.
+    
+    Priority: -855 (sedikit di bawah EmptyBookMomentum -850)
+    """
+    @staticmethod
+    def detect(ofi_bias: str, ofi_strength: float, down_energy: float,
+               change_5m: float, short_dist: float, volume_ratio: float) -> Dict:
+        if (ofi_bias == "SHORT" and
+            ofi_strength > 0.3 and
+            down_energy < 0.01 and       # tidak ada seller di book
+            change_5m > 0 and            # harga masih naik
+            short_dist < 1.5 and         # short liq dekat
+            volume_ratio < 0.8):
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": f"OFI divergence trap: OFI SHORT {ofi_strength:.2f} tapi down_energy=0 dan harga naik {change_5m:.1f}% → sell orders diserap buyer, squeeze lanjut",
+                "priority": -855
+            }
+        return {"override": False}
+
+
+# ================= LECTURER'S SARAN LOGIC: RSI-ENERGY DIVERGENCE =================
+
+class RSIEnergyDivergence:
+    """
+    RSI overbought tapi energy = 0 di kedua sisi = pasar frozen.
+    Pasar frozen dengan short liq dekat → harga akan bergerak ke short liq.
+    
+    Priority: -856
+    """
+    @staticmethod
+    def detect(rsi6: float, up_energy: float, down_energy: float,
+               short_dist: float, long_dist: float) -> Dict:
+        if (rsi6 > 75 and
+            up_energy == 0 and
+            down_energy == 0 and
+            short_dist < long_dist):
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": f"RSI-Energy divergence: RSI {rsi6:.1f} overbought tapi energy nol di keduanya, short liq {short_dist:.2f}% lebih dekat → frozen market, harga ke short liq",
+                "priority": -856
+            }
         return {"override": False}
 
 
@@ -3636,6 +3737,7 @@ class BinanceAnalyzer:
                         # ========== HIGH PRIORITY OVERRIDES (with priority order) ==========
                         # Priority ladder (highest to lowest):
                         # -1100: MasterSqueezeRule (GOLDEN RULE)
+                        # -1095: TwoPhaseHFTSweepDetector (NEW: HFT 2-phase sweep detection)
                         # -1090: HFTExplicitDumpOverride (NEW: HFT explicit dump signal)
                         # -1085: ExtremeFundingRateTrap (NEW: Funding rate extreme trap)
                         # -1080: ExtremeOversoldIgnoreLiquidity / ExtremeOverboughtIgnoreLiquidity
@@ -3646,6 +3748,8 @@ class BinanceAnalyzer:
                         # -1000: LiquidityMagnetContinuation (LIQ MAGNET LAYER)
                         # -950: OFIAbsorptionSqueeze (ABSORPTION/FAKE OFI LAYER)
                         # -900: VelocityDecayReversal (REVERSAL CONFIRMATION)
+                        # -856: RSIEnergyDivergence (NEW: RSI overbought with zero energy)
+                        # -855: OFIDivergenceTrap (NEW: OFI divergence trap)
                         # -850: EmptyBookMomentum (EMPTY BOOK/THIN BOOK LAYER)
                         # -265: SqueezeContinuationDetector (existing)
                         
@@ -3662,47 +3766,61 @@ class BinanceAnalyzer:
                             priority = master_squeeze["priority"]
                             prob_engine.add(master_squeeze["bias"], 10.0)
                         else:
-                            # 1.05. HFT EXPLICIT DUMP OVERRIDE (Priority -1090)
-                            hft_dump = HFTExplicitDumpOverride.detect(
-                                hft_6pct["bias"], hft_6pct["reason"],
-                                agg, ofi["bias"], change_5m,
-                                funding_rate or 0, volume_ratio
+                            # 1.025. TWO-PHASE HFT SWEEP DETECTOR (Priority -1095)
+                            two_phase_hft = TwoPhaseHFTSweepDetector.detect(
+                                liq["short_dist"], liq["long_dist"], rsi6,
+                                down_energy, up_energy, change_5m,
+                                ofi["bias"], ofi["strength"], volume_ratio
                             )
-                            if hft_dump["override"]:
-                                final_bias = hft_dump["bias"]
-                                final_reason = hft_dump["reason"]
+                            if two_phase_hft["override"]:
+                                final_bias = two_phase_hft["bias"]
+                                final_reason = two_phase_hft["reason"]
                                 final_confidence = "ABSOLUTE"
-                                final_phase = "HFT_EXPLICIT_DUMP"
-                                priority = hft_dump["priority"]
-                                prob_engine.add(hft_dump["bias"], 9.95)
+                                final_phase = "TWO_PHASE_HFT_SWEEP"
+                                priority = two_phase_hft["priority"]
+                                prob_engine.add(two_phase_hft["bias"], 9.98)
                             else:
-                                # 1.06. EXTREME FUNDING RATE TRAP (Priority -1085)
-                                extreme_funding = ExtremeFundingRateTrap.detect(
-                                    funding_rate or 0, agg, hft_6pct["bias"],
-                                    ofi["bias"], ofi["strength"],
-                                    change_5m, volume_ratio
+                                # 1.05. HFT EXPLICIT DUMP OVERRIDE (Priority -1090)
+                                hft_dump = HFTExplicitDumpOverride.detect(
+                                    hft_6pct["bias"], hft_6pct["reason"],
+                                    agg, ofi["bias"], change_5m,
+                                    funding_rate or 0, volume_ratio
                                 )
-                                if extreme_funding["override"]:
-                                    final_bias = extreme_funding["bias"]
-                                    final_reason = extreme_funding["reason"]
+                                if hft_dump["override"]:
+                                    final_bias = hft_dump["bias"]
+                                    final_reason = hft_dump["reason"]
                                     final_confidence = "ABSOLUTE"
-                                    final_phase = "EXTREME_FUNDING_TRAP"
-                                    priority = extreme_funding["priority"]
-                                    prob_engine.add(extreme_funding["bias"], 9.9)
+                                    final_phase = "HFT_EXPLICIT_DUMP"
+                                    priority = hft_dump["priority"]
+                                    prob_engine.add(hft_dump["bias"], 9.95)
                                 else:
-                                    # 1.07. EXTREME FUNDING LIQUIDITY OVERRIDE (Priority -1086)
-                                    extreme_funding_liq = ExtremeFundingLiquidityOverride.detect(
-                                        funding_rate or 0, liq["long_dist"], liq["short_dist"],
-                                        hft_6pct["bias"], agg, change_5m
+                                    # 1.06. EXTREME FUNDING RATE TRAP (Priority -1085)
+                                    extreme_funding = ExtremeFundingRateTrap.detect(
+                                        funding_rate or 0, agg, hft_6pct["bias"],
+                                        ofi["bias"], ofi["strength"],
+                                        change_5m, volume_ratio
                                     )
-                                    if extreme_funding_liq["override"]:
-                                        final_bias = extreme_funding_liq["bias"]
-                                        final_reason = extreme_funding_liq["reason"]
+                                    if extreme_funding["override"]:
+                                        final_bias = extreme_funding["bias"]
+                                        final_reason = extreme_funding["reason"]
                                         final_confidence = "ABSOLUTE"
-                                        final_phase = "EXTREME_FUNDING_LIQUIDITY"
-                                        priority = extreme_funding_liq["priority"]
-                                        prob_engine.add(extreme_funding_liq["bias"], 9.95)
+                                        final_phase = "EXTREME_FUNDING_TRAP"
+                                        priority = extreme_funding["priority"]
+                                        prob_engine.add(extreme_funding["bias"], 9.9)
                                     else:
+                                        # 1.07. EXTREME FUNDING LIQUIDITY OVERRIDE (Priority -1086)
+                                        extreme_funding_liq = ExtremeFundingLiquidityOverride.detect(
+                                            funding_rate or 0, liq["long_dist"], liq["short_dist"],
+                                            hft_6pct["bias"], agg, change_5m
+                                        )
+                                        if extreme_funding_liq["override"]:
+                                            final_bias = extreme_funding_liq["bias"]
+                                            final_reason = extreme_funding_liq["reason"]
+                                            final_confidence = "ABSOLUTE"
+                                            final_phase = "EXTREME_FUNDING_LIQUIDITY"
+                                            priority = extreme_funding_liq["priority"]
+                                            prob_engine.add(extreme_funding_liq["bias"], 9.95)
+                                        else:
                                         # 1.1. EXTREME OVERSOLD IGNORE LIQUIDITY (Priority -1080)
                                         extreme_oversold_ignore = ExtremeOversoldIgnoreLiquidity.detect(rsi6, volume_ratio)
                                         if extreme_oversold_ignore["override"]:
@@ -3901,34 +4019,60 @@ class BinanceAnalyzer:
                                                                                                     priority = velocity_decay["priority"]
                                                                                                     prob_engine.add(velocity_decay["bias"], 8.0)
                                                                                                 else:
-                                                                                                    # 5. EMPTY BOOK MOMENTUM (Priority -850)
-                                                                                                    empty_book_mom = EmptyBookMomentum.detect(
-                                                                                                        down_energy, up_energy, change_5m,
+                                                                                                    # 4.5. RSI-ENERGY DIVERGENCE (Priority -856)
+                                                                                                    rsi_energy_div = RSIEnergyDivergence.detect(
+                                                                                                        rsi6, up_energy, down_energy,
                                                                                                         liq["short_dist"], liq["long_dist"]
                                                                                                     )
-                                                                                                    if empty_book_mom["override"]:
-                                                                                                        final_bias = empty_book_mom["bias"]
-                                                                                                        final_reason = empty_book_mom["reason"]
+                                                                                                    if rsi_energy_div["override"]:
+                                                                                                        final_bias = rsi_energy_div["bias"]
+                                                                                                        final_reason = rsi_energy_div["reason"]
                                                                                                         final_confidence = "ABSOLUTE"
-                                                                                                        final_phase = "EMPTY_BOOK_MOMENTUM"
-                                                                                                        priority = empty_book_mom["priority"]
-                                                                                                        prob_engine.add(empty_book_mom["bias"], 7.5)
+                                                                                                        final_phase = "RSI_ENERGY_DIVERGENCE"
+                                                                                                        priority = rsi_energy_div["priority"]
+                                                                                                        prob_engine.add(rsi_energy_div["bias"], 7.6)
                                                                                                     else:
-                                                                                                        # 6. Squeeze Continuation Detector (existing, Priority -265)
-                                                                                                        squeeze_cont = SqueezeContinuationDetector.detect(
-                                                                                                            rsi6_5m, change_5m, volume_ratio,
-                                                                                                            liq["short_dist"], up_energy, down_energy,
-                                                                                                            ofi["bias"], ofi["strength"], bid_slope, ask_slope
+                                                                                                        # 4.6. OFI DIVERGENCE TRAP (Priority -855)
+                                                                                                        ofi_div_trap = OFIDivergenceTrap.detect(
+                                                                                                            ofi["bias"], ofi["strength"], down_energy,
+                                                                                                            change_5m, liq["short_dist"], volume_ratio
                                                                                                         )
-                                                                                                        if squeeze_cont["override"]:
-                                                                                                            final_bias = squeeze_cont["bias"]
-                                                                                                            final_reason = squeeze_cont["reason"]
+                                                                                                        if ofi_div_trap["override"]:
+                                                                                                            final_bias = ofi_div_trap["bias"]
+                                                                                                            final_reason = ofi_div_trap["reason"]
                                                                                                             final_confidence = "ABSOLUTE"
-                                                                                                            final_phase = "SQUEEZE_CONTINUATION"
-                                                                                                            priority = squeeze_cont["priority"]
-                                                                                                            prob_engine.add(squeeze_cont["bias"], 5.0)
+                                                                                                            final_phase = "OFI_DIVERGENCE_TRAP"
+                                                                                                            priority = ofi_div_trap["priority"]
+                                                                                                            prob_engine.add(ofi_div_trap["bias"], 7.55)
+                                                                                                        else:
+                                                                                                            # 5. EMPTY BOOK MOMENTUM (Priority -850)
+                                                                                                            empty_book_mom = EmptyBookMomentum.detect(
+                                                                                                                down_energy, up_energy, change_5m,
+                                                                                                                liq["short_dist"], liq["long_dist"]
+                                                                                                            )
+                                                                                                            if empty_book_mom["override"]:
+                                                                                                                final_bias = empty_book_mom["bias"]
+                                                                                                                final_reason = empty_book_mom["reason"]
+                                                                                                                final_confidence = "ABSOLUTE"
+                                                                                                                final_phase = "EMPTY_BOOK_MOMENTUM"
+                                                                                                                priority = empty_book_mom["priority"]
+                                                                                                                prob_engine.add(empty_book_mom["bias"], 7.5)
+                                                                                                            else:
+                                                                                                                # 6. Squeeze Continuation Detector (existing, Priority -265)
+                                                                                                                squeeze_cont = SqueezeContinuationDetector.detect(
+                                                                                                                    rsi6_5m, change_5m, volume_ratio,
+                                                                                                                    liq["short_dist"], up_energy, down_energy,
+                                                                                                                    ofi["bias"], ofi["strength"], bid_slope, ask_slope
+                                                                                                                )
+                                                                                                                if squeeze_cont["override"]:
+                                                                                                                    final_bias = squeeze_cont["bias"]
+                                                                                                                    final_reason = squeeze_cont["reason"]
+                                                                                                                    final_confidence = "ABSOLUTE"
+                                                                                                                    final_phase = "SQUEEZE_CONTINUATION"
+                                                                                                                    priority = squeeze_cont["priority"]
+                                                                                                                    prob_engine.add(squeeze_cont["bias"], 5.0)
 
-                                                                                                        # 6.5. FLUSH EXHAUSTION REVERSAL (Priority -250)
+                                                                                                                # 6.5. FLUSH EXHAUSTION REVERSAL (Priority -250)
                                                                                                         flush_exhaust = FlushExhaustionReversal.detect(
                                                                                                             change_5m, rsi6, volume_ratio,
                                                                                                             down_energy, liq["long_dist"]
