@@ -1236,6 +1236,30 @@ class VolumeSpikeBounceDetector:
         return {"override": False}
 
 
+class AggMajorityBounce:
+    """
+    🔥 Ketika agg > 0.55 (mayoritas BUY), RSI oversold, long_liq dekat,
+    dan volume rendah → HFT sedang akumulasi, bounce imminent.
+    Priority -1072 (antara VolumeSpikeBounce -1092 dan AggConfirmedBounce -1070)
+    """
+    @staticmethod
+    def detect(agg: float, rsi6: float, long_liq: float, change_5m: float,
+               up_energy: float, down_energy: float) -> Dict:
+        if (agg > 0.55 and
+            rsi6 < 35 and
+            long_liq < 3.0 and
+            change_5m < 0 and
+            up_energy > down_energy and
+            down_energy < 0.1):
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": f"Agg majority bounce: agg={agg:.2f} (majority buy), RSI {rsi6:.1f} oversold, long liq {long_liq:.2f}%, up_energy={up_energy:.2f} → accumulation, bounce imminent",
+                "priority": -1072
+            }
+        return {"override": False}
+
+
 # ================= LECTURER'S SARAN LOGIC: OFI DIVERGENCE TRAP =================
 
 class OFIDivergenceTrap:
@@ -3698,6 +3722,7 @@ class BinanceAnalyzer:
             self.ws.stop()
 
     def _is_strong_signal(self, ofi, up_energy, down_energy, change_5m, rsi6) -> bool:
+        # OFI harus memiliki bias yang jelas (bukan NEUTRAL)
         if ofi is not None and ofi.get("bias") != "NEUTRAL" and ofi.get("strength", 0) > 0.7:
             return True
         if (up_energy < ENERGY_ZERO_THRESHOLD and down_energy > MIN_ENERGY_TO_MOVE) or \
@@ -3705,8 +3730,9 @@ class BinanceAnalyzer:
             return True
         if abs(change_5m) > 8.0:
             return True
-        if rsi6 > 80 or rsi6 < 20:
-            return True
+        # Hapus kondisi rsi6 > 80 or rsi6 < 20 karena terlalu agresif
+        # if rsi6 > 80 or rsi6 < 20:
+        #     return True
         return False
 
     def analyze(self) -> Optional[Dict]:
@@ -4068,84 +4094,97 @@ class BinanceAnalyzer:
                                                                                 priority = agg_confirmed["priority"]
                                                                                 prob_engine.add(agg_confirmed["bias"], 9.75)
                                                                             else:
-                                                                                # 1.7. FUNDING RATE CROWDED SHORT OVERRIDE (Priority -1076)
-                                                                                funding_crowded = FundingRateCrowdedShortOverride.detect(
-                                                                                    funding_rate, rsi6, ofi["bias"], ofi["strength"],
-                                                                                    liq["long_dist"], liq["short_dist"], volume_ratio
+                                                                                # 1.66. AGG MAJORITY BOUNCE (Priority -1072)
+                                                                                agg_majority = AggMajorityBounce.detect(
+                                                                                    agg, rsi6, liq["long_dist"], change_5m,
+                                                                                    up_energy, down_energy
                                                                                 )
-                                                                                if funding_crowded["override"]:
-                                                                                    final_bias = funding_crowded["bias"]
-                                                                                    final_reason = funding_crowded["reason"]
+                                                                                if agg_majority["override"]:
+                                                                                    final_bias = agg_majority["bias"]
+                                                                                    final_reason = agg_majority["reason"]
                                                                                     final_confidence = "ABSOLUTE"
-                                                                                    final_phase = "FUNDING_CROWDED_SHORT"
-                                                                                    priority = funding_crowded["priority"]
-                                                                                    prob_engine.add(funding_crowded["bias"], 9.8)
+                                                                                    final_phase = "AGG_MAJORITY_BOUNCE"
+                                                                                    priority = agg_majority["priority"]
+                                                                                    prob_engine.add(agg_majority["bias"], 9.7)
                                                                                 else:
-                                                                                    # 1.55. SHORT SQUEEZE TRAP OVERRIDE (Priority -1060)
-                                                                                    squeeze_trap = ShortSqueezeTrapOverride.detect(
-                                                                                        liq["short_dist"], liq["long_dist"], up_energy, down_energy,
-                                                                                        volume_ratio, rsi6_5m, ofi["bias"], ofi["strength"], change_5m
+                                                                                    # 1.7. FUNDING RATE CROWDED SHORT OVERRIDE (Priority -1076)
+                                                                                    funding_crowded = FundingRateCrowdedShortOverride.detect(
+                                                                                        funding_rate, rsi6, ofi["bias"], ofi["strength"],
+                                                                                        liq["long_dist"], liq["short_dist"], volume_ratio
                                                                                     )
-                                                                                    if squeeze_trap["override"]:
-                                                                                        final_bias = squeeze_trap["bias"]
-                                                                                        final_reason = squeeze_trap["reason"]
+                                                                                    if funding_crowded["override"]:
+                                                                                        final_bias = funding_crowded["bias"]
+                                                                                        final_reason = funding_crowded["reason"]
                                                                                         final_confidence = "ABSOLUTE"
-                                                                                        final_phase = "SHORT_SQUEEZE_TRAP_OVERRIDE"
-                                                                                        priority = squeeze_trap["priority"]
-                                                                                        prob_engine.add(squeeze_trap["bias"], 9.6)
+                                                                                        final_phase = "FUNDING_CROWDED_SHORT"
+                                                                                        priority = funding_crowded["priority"]
+                                                                                        prob_engine.add(funding_crowded["bias"], 9.8)
                                                                                     else:
-                                                                                        # 1.6. NEAR EXHAUSTED LIQUIDITY REVERSAL (Priority -1055)
-                                                                                        near_exhausted = NearExhaustedLiquidityReversal.detect(
-                                                                                            liq["short_dist"], liq["long_dist"], rsi6, volume_ratio, rsi6_5m,
-                                                                                            ofi["bias"], ofi["strength"]
+                                                                                        # 1.55. SHORT SQUEEZE TRAP OVERRIDE (Priority -1060)
+                                                                                        squeeze_trap = ShortSqueezeTrapOverride.detect(
+                                                                                            liq["short_dist"], liq["long_dist"], up_energy, down_energy,
+                                                                                            volume_ratio, rsi6_5m, ofi["bias"], ofi["strength"], change_5m
                                                                                         )
-                                                                                        if near_exhausted["override"]:
-                                                                                            final_bias = near_exhausted["bias"]
-                                                                                            final_reason = near_exhausted["reason"]
+                                                                                        if squeeze_trap["override"]:
+                                                                                            final_bias = squeeze_trap["bias"]
+                                                                                            final_reason = squeeze_trap["reason"]
                                                                                             final_confidence = "ABSOLUTE"
-                                                                                            final_phase = "NEAR_EXHAUSTED_LIQUIDITY_REVERSAL"
-                                                                                            priority = near_exhausted["priority"]
-                                                                                            prob_engine.add(near_exhausted["bias"], 9.7)
+                                                                                            final_phase = "SHORT_SQUEEZE_TRAP_OVERRIDE"
+                                                                                            priority = squeeze_trap["priority"]
+                                                                                            prob_engine.add(squeeze_trap["bias"], 9.6)
                                                                                         else:
-                                                                                            # 1.7. STRICT LIQUIDITY PROXIMITY (Priority -1050)
-                                                                                            strict_liq = LiquidityProximityStrict.detect(
-                                                                                                liq["short_dist"], liq["long_dist"], volume_ratio, rsi6_5m,
-                                                                                                ofi["bias"], ofi["strength"], rsi6, obv_trend, change_5m
+                                                                                            # 1.6. NEAR EXHAUSTED LIQUIDITY REVERSAL (Priority -1055)
+                                                                                            near_exhausted = NearExhaustedLiquidityReversal.detect(
+                                                                                                liq["short_dist"], liq["long_dist"], rsi6, volume_ratio, rsi6_5m,
+                                                                                                ofi["bias"], ofi["strength"]
                                                                                             )
-                                                                                            if strict_liq["override"]:
-                                                                                                final_bias = strict_liq["bias"]
-                                                                                                final_reason = strict_liq["reason"]
+                                                                                            if near_exhausted["override"]:
+                                                                                                final_bias = near_exhausted["bias"]
+                                                                                                final_reason = near_exhausted["reason"]
                                                                                                 final_confidence = "ABSOLUTE"
-                                                                                                final_phase = "STRICT_LIQUIDITY"
-                                                                                                priority = strict_liq["priority"]
-                                                                                                prob_engine.add(strict_liq["bias"], 9.5)
+                                                                                                final_phase = "NEAR_EXHAUSTED_LIQUIDITY_REVERSAL"
+                                                                                                priority = near_exhausted["priority"]
+                                                                                                prob_engine.add(near_exhausted["bias"], 9.7)
                                                                                             else:
-                                                                                                # 1.7. LIQUIDITY MAGNET OVERRIDE (Priority -1075)
-                                                                                                liq_magnet_override = LiquidityMagnetOverride.detect(
-                                                                                                    liq["short_dist"], liq["long_dist"], volume_ratio,
-                                                                                                    rsi6_5m, change_5m
+                                                                                                # 1.7. STRICT LIQUIDITY PROXIMITY (Priority -1050)
+                                                                                                strict_liq = LiquidityProximityStrict.detect(
+                                                                                                    liq["short_dist"], liq["long_dist"], volume_ratio, rsi6_5m,
+                                                                                                    ofi["bias"], ofi["strength"], rsi6, obv_trend, change_5m
                                                                                                 )
-                                                                                                if liq_magnet_override["override"]:
-                                                                                                    final_bias = liq_magnet_override["bias"]
-                                                                                                    final_reason = liq_magnet_override["reason"]
+                                                                                                if strict_liq["override"]:
+                                                                                                    final_bias = strict_liq["bias"]
+                                                                                                    final_reason = strict_liq["reason"]
                                                                                                     final_confidence = "ABSOLUTE"
-                                                                                                    final_phase = "LIQUIDITY_MAGNET_OVERRIDE"
-                                                                                                    priority = liq_magnet_override["priority"]
-                                                                                                    prob_engine.add(liq_magnet_override["bias"], 9.8)
+                                                                                                    final_phase = "STRICT_LIQUIDITY"
+                                                                                                    priority = strict_liq["priority"]
+                                                                                                    prob_engine.add(strict_liq["bias"], 9.5)
                                                                                                 else:
-                                                                                                    # 2. LIQUIDITY MAGNET CONTINUATION (Priority -1000)
-                                                                                                    liq_magnet = LiquidityMagnetContinuation.detect(
-                                                                                                        liq["short_dist"], liq["long_dist"], change_5m,
-                                                                                                        up_energy, down_energy, volume_ratio
+                                                                                                    # 1.7. LIQUIDITY MAGNET OVERRIDE (Priority -1075)
+                                                                                                    liq_magnet_override = LiquidityMagnetOverride.detect(
+                                                                                                        liq["short_dist"], liq["long_dist"], volume_ratio,
+                                                                                                        rsi6_5m, change_5m
                                                                                                     )
-                                                                                                    if liq_magnet["override"]:
-                                                                                                        final_bias = liq_magnet["bias"]
-                                                                                                        final_reason = liq_magnet["reason"]
+                                                                                                    if liq_magnet_override["override"]:
+                                                                                                        final_bias = liq_magnet_override["bias"]
+                                                                                                        final_reason = liq_magnet_override["reason"]
                                                                                                         final_confidence = "ABSOLUTE"
-                                                                                                        final_phase = "LIQUIDITY_MAGNET_CONTINUATION"
-                                                                                                        priority = liq_magnet["priority"]
-                                                                                                        prob_engine.add(liq_magnet["bias"], 9.0)
+                                                                                                        final_phase = "LIQUIDITY_MAGNET_OVERRIDE"
+                                                                                                        priority = liq_magnet_override["priority"]
+                                                                                                        prob_engine.add(liq_magnet_override["bias"], 9.8)
                                                                                                     else:
+                                                                                                                                                                                    # 2. LIQUIDITY MAGNET CONTINUATION (Priority -1000)
+                                                                                                                                                                                    liq_magnet = LiquidityMagnetContinuation.detect(
+                                                                                                                                                                                        liq["short_dist"], liq["long_dist"], change_5m,
+                                                                                                                                                                                        up_energy, down_energy, volume_ratio
+                                                                                                                                                                                    )
+                                                                                                                                                                                    if liq_magnet["override"]:
+                                                                                                                                                                                        final_bias = liq_magnet["bias"]
+                                                                                                                                                                                        final_reason = liq_magnet["reason"]
+                                                                                                                                                                                        final_confidence = "ABSOLUTE"
+                                                                                                                                                                                        final_phase = "LIQUIDITY_MAGNET_CONTINUATION"
+                                                                                                                                                                                        priority = liq_magnet["priority"]
+                                                                                                                                                                                        prob_engine.add(liq_magnet["bias"], 9.0)
+                                                                                                                                                                                    else:
                                                                                                         # 3. OFI ABSORPTION SQUEEZE (Priority -950)
                                                                                                         ofi_absorption = OFIAbsorptionSqueeze.detect(
                                                                                                             ofi["bias"], ofi["strength"], change_5m,
@@ -4990,8 +5029,8 @@ class BinanceAnalyzer:
             # ========== FIXED Volume Filter: Jangan reverse jika bias sudah searah liquidity atau sinyal HFT/Algo kuat ==========
             if final_bias in ["LONG", "SHORT"] and len(volumes_1m) >= 10:
                 if latest_volume < volume_ma10:
-                    # 🔥 JANGAN REVERSE jika priority tinggi (< -250): trap signals dengan prioritas sangat tinggi
-                    if priority < -250:
+                    # 🔥 JANGAN REVERSE jika priority tinggi (< -250) ATAU priority dari crowded detectors (-165)
+                    if priority < -250 or priority == -165:
                         final_reason += f" | High priority signal (priority {priority}) → volume filter bypassed"
                         # Skip reverse, tetap pakai bias original
                     else:
