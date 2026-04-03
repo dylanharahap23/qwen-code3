@@ -1182,6 +1182,60 @@ class TwoPhaseHFTSweepDetector:
         return {"override": False}
 
 
+# ================= LECTURER'S SARAN LOGIC: VOLUME SPIKE BOUNCE DETECTOR =================
+
+class VolumeSpikeBounceDetector:
+    """
+    🔥 KUNCI EDGEUSDT: Volume spike 4x+ dari MA10 saat oversold
+    = institutional accumulation, BUKAN distribusi.
+    
+    Rule: Jika latest_volume > volume_ma10 * 2.5 DAN oversold DAN
+    ada buy pressure (up_energy > 0 DAN agg > 0.55) → paksa LONG.
+    
+    Ini menangkap: panic sell habis → institusi masuk besar-besaran → bounce
+    Priority: -1092 (antara MasterSqueeze -1100 dan TwoPhaseHFT -1095)
+    """
+    @staticmethod
+    def detect(latest_volume: float, volume_ma10: float, rsi6: float,
+               up_energy: float, down_energy: float, agg: float,
+               change_5m: float, long_liq: float, short_liq: float) -> Dict:
+        
+        if volume_ma10 <= 0:
+            return {"override": False}
+        
+        volume_spike_ratio = latest_volume / volume_ma10
+        
+        # Volume spike + oversold + buy pressure = institutional accumulation
+        if (volume_spike_ratio > 2.5 and
+            rsi6 < 30 and
+            up_energy > 0.5 and
+            down_energy < 0.1 and
+            agg > 0.55 and           # mayoritas trades adalah BUY
+            change_5m < 0):          # harga masih turun (panic selling)
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": f"Volume spike bounce: volume {volume_spike_ratio:.1f}x MA10 saat oversold RSI {rsi6:.1f}, up_energy={up_energy:.2f}, agg={agg:.2f} (majority buy) → institutional accumulation, bounce imminent",
+                "priority": -1092
+            }
+        
+        # Mirror: volume spike + overbought + sell pressure = distribution
+        if (volume_spike_ratio > 2.5 and
+            rsi6 > 70 and
+            down_energy > 0.5 and
+            up_energy < 0.1 and
+            agg < 0.45 and           # mayoritas trades adalah SELL
+            change_5m > 0):          # harga masih naik (FOMO buying)
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"Volume spike distribution: volume {volume_spike_ratio:.1f}x MA10 saat overbought RSI {rsi6:.1f}, down_energy={down_energy:.2f}, agg={agg:.2f} (majority sell) → institutional distribution, dump imminent",
+                "priority": -1092
+            }
+        
+        return {"override": False}
+
+
 # ================= LECTURER'S SARAN LOGIC: OFI DIVERGENCE TRAP =================
 
 class OFIDivergenceTrap:
@@ -1560,6 +1614,51 @@ class FundingRateCrowdedShortOverride:
         return {"override": False}
 
 
+# ================= LECTURER'S SARAN LOGIC: AGG CONFIRMED BOUNCE =================
+
+class AggConfirmedBounce:
+    """
+    🔥 Ketika agg > 0.55 (mayoritas BUY), RSI oversold, dan 
+    long_liq dekat — ini adalah setup bounce yang sangat kuat.
+    HFT akan pump untuk menyapu long liq lalu reverse.
+    
+    Priority: -1070 (antara ExhaustedLiquidityReversal dan LiquidityMagnetOverride)
+    """
+    @staticmethod
+    def detect(agg: float, rsi6: float, long_liq: float, short_liq: float,
+               up_energy: float, down_energy: float, change_5m: float) -> Dict:
+        
+        # Agg tinggi (banyak buyer) + oversold + long liq dekat = bounce kuat
+        if (agg > 0.55 and
+            rsi6 < 35 and
+            long_liq < 2.0 and
+            up_energy > down_energy and
+            down_energy < 0.1 and
+            change_5m < 0):          # harga masih turun = entry bagus
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": f"Agg-confirmed bounce: agg={agg:.2f} (majority buy), RSI {rsi6:.1f} oversold, long liq {long_liq:.2f}% close, up_energy={up_energy:.2f} > down_energy={down_energy:.2f} → HFT sweep long liq then pump",
+                "priority": -1070
+            }
+        
+        # Mirror: Agg rendah + overbought + short liq dekat = dump kuat
+        if (agg < 0.45 and
+            rsi6 > 65 and
+            short_liq < 2.0 and
+            down_energy > up_energy and
+            up_energy < 0.1 and
+            change_5m > 0):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"Agg-confirmed dump: agg={agg:.2f} (majority sell), RSI {rsi6:.1f} overbought, short liq {short_liq:.2f}% close, down_energy={down_energy:.2f} > up_energy={up_energy:.2f} → HFT sweep short liq then dump",
+                "priority": -1070
+            }
+        
+        return {"override": False}
+
+
 class FlushExhaustionReversal:
     """
     🚀 Detects sharp drop with oversold, low volume, and no sellers → bounce.
@@ -1921,10 +2020,25 @@ class OversoldLiquidityContinuation:
     🔥 Memaksa SHORT pada oversold dengan long liq sangat dekat (<1.5%),
     OFI SHORT kuat atau netral, down_energy=0, harga turun.
     Priority -139 (lebih tinggi dari oversold liquidity bounce -138).
+    
+    ⚠️ PATCH EDGEUSDT: Jika ada buy pressure nyata, ini BUKAN dump continuation
     """
     @staticmethod
     def detect(volume_ratio: float, long_liq: float, down_energy: float,
-               ofi_bias: str, ofi_strength: float, change_5m: float, rsi6: float) -> Dict:
+               ofi_bias: str, ofi_strength: float, change_5m: float, rsi6: float,
+               up_energy: float = 0.0, agg: float = 0.5,
+               latest_volume: float = 0.0, volume_ma10: float = 1.0) -> Dict:
+        
+        # 🔥 PATCH EDGEUSDT: Jika ada buy pressure nyata, ini BUKAN dump continuation
+        # up_energy > 1.0 = ada buyer aktif di book
+        if up_energy > 1.0:
+            return {"override": False}  # ada buyer, jangan paksa SHORT
+        
+        # agg > 0.55 = mayoritas trades adalah BUY
+        # Volume spike > 1.5x = institutional entry
+        if agg > 0.55 and volume_ma10 > 0 and (latest_volume / volume_ma10) > 1.5:
+            return {"override": False}  # volume spike dengan buy majority = bounce
+        
         if (volume_ratio < 0.7 and
             long_liq < 1.5 and
             down_energy < 0.01 and
@@ -2007,6 +2121,54 @@ class ExhaustionDropReversal:
                 "reason": f"Exhaustion drop reversal: dropped {change_5m:.1f}% with low volume ({volume_ratio:.2f}x), no sellers, short liq {short_liq:.2f}% → bounce likely",
                 "priority": -141
             }
+        return {"override": False}
+
+
+# ================= LECTURER'S SARAN LOGIC: ENERGY AGG CONSENSUS =================
+
+class EnergyAggConsensus:
+    """
+    🔥 Ketika energy dan agg bertentangan dengan sinyal final,
+    batalkan sinyal tersebut.
+    
+    Kasus EDGEUSDT:
+    - Sinyal: SHORT (dari OversoldLiquidityContinuation)
+    - up_energy = 2.75, down_energy = 0 → energy bilang LONG
+    - agg = 0.60 → 60% trades BUY → bilang LONG
+    - Consensus: LONG, bukan SHORT!
+    
+    Priority: -143 (lebih tinggi dari OversoldLiquidityContinuation -139)
+    """
+    @staticmethod
+    def detect(up_energy: float, down_energy: float, agg: float,
+               current_bias: str, rsi6: float, change_5m: float) -> Dict:
+        
+        # Jika energy dan agg konsisten menunjuk LONG tapi sinyal SHORT
+        if (current_bias == "SHORT" and
+            up_energy > 1.0 and
+            down_energy < 0.1 and
+            agg > 0.55 and
+            rsi6 < 40):
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": f"Energy-Agg consensus overrides SHORT: up_energy={up_energy:.2f}, down_energy={down_energy:.2f}, agg={agg:.2f} all pointing LONG with RSI {rsi6:.1f} oversold",
+                "priority": -143
+            }
+        
+        # Mirror: energy + agg konsisten SHORT tapi sinyal LONG
+        if (current_bias == "LONG" and
+            down_energy > 1.0 and
+            up_energy < 0.1 and
+            agg < 0.45 and
+            rsi6 > 60):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"Energy-Agg consensus overrides LONG: down_energy={down_energy:.2f}, up_energy={up_energy:.2f}, agg={agg:.2f} all pointing SHORT with RSI {rsi6:.1f} overbought",
+                "priority": -143
+            }
+        
         return {"override": False}
 
 
@@ -3766,56 +3928,70 @@ class BinanceAnalyzer:
                             priority = master_squeeze["priority"]
                             prob_engine.add(master_squeeze["bias"], 10.0)
                         else:
-                            # 1.025. TWO-PHASE HFT SWEEP DETECTOR (Priority -1095)
-                            two_phase_hft = TwoPhaseHFTSweepDetector.detect(
-                                liq["short_dist"], liq["long_dist"], rsi6,
-                                down_energy, up_energy, change_5m,
-                                ofi["bias"], ofi["strength"], volume_ratio
+                            # 1.025. VOLUME SPIKE BOUNCE DETECTOR (Priority -1092)
+                            volume_spike_bounce = VolumeSpikeBounceDetector.detect(
+                                latest_volume, volume_ma10, rsi6,
+                                up_energy, down_energy, agg,
+                                change_5m, liq["long_dist"], liq["short_dist"]
                             )
-                            if two_phase_hft["override"]:
-                                final_bias = two_phase_hft["bias"]
-                                final_reason = two_phase_hft["reason"]
+                            if volume_spike_bounce["override"]:
+                                final_bias = volume_spike_bounce["bias"]
+                                final_reason = volume_spike_bounce["reason"]
                                 final_confidence = "ABSOLUTE"
-                                final_phase = "TWO_PHASE_HFT_SWEEP"
-                                priority = two_phase_hft["priority"]
-                                prob_engine.add(two_phase_hft["bias"], 9.98)
+                                final_phase = "VOLUME_SPIKE_BOUNCE"
+                                priority = volume_spike_bounce["priority"]
+                                prob_engine.add(volume_spike_bounce["bias"], 9.99)
                             else:
-                                # 1.05. HFT EXPLICIT DUMP OVERRIDE (Priority -1090)
-                                hft_dump = HFTExplicitDumpOverride.detect(
-                                    hft_6pct["bias"], hft_6pct["reason"],
-                                    agg, ofi["bias"], change_5m,
-                                    funding_rate or 0, volume_ratio
+                                # 1.03. TWO-PHASE HFT SWEEP DETECTOR (Priority -1095)
+                                two_phase_hft = TwoPhaseHFTSweepDetector.detect(
+                                    liq["short_dist"], liq["long_dist"], rsi6,
+                                    down_energy, up_energy, change_5m,
+                                    ofi["bias"], ofi["strength"], volume_ratio
                                 )
-                                if hft_dump["override"]:
-                                    final_bias = hft_dump["bias"]
-                                    final_reason = hft_dump["reason"]
+                                if two_phase_hft["override"]:
+                                    final_bias = two_phase_hft["bias"]
+                                    final_reason = two_phase_hft["reason"]
                                     final_confidence = "ABSOLUTE"
-                                    final_phase = "HFT_EXPLICIT_DUMP"
-                                    priority = hft_dump["priority"]
-                                    prob_engine.add(hft_dump["bias"], 9.95)
+                                    final_phase = "TWO_PHASE_HFT_SWEEP"
+                                    priority = two_phase_hft["priority"]
+                                    prob_engine.add(two_phase_hft["bias"], 9.98)
                                 else:
-                                    # 1.06. EXTREME FUNDING RATE TRAP (Priority -1085)
-                                    extreme_funding = ExtremeFundingRateTrap.detect(
-                                        funding_rate or 0, agg, hft_6pct["bias"],
-                                        ofi["bias"], ofi["strength"],
-                                        change_5m, volume_ratio
+                                    # 1.05. HFT EXPLICIT DUMP OVERRIDE (Priority -1090)
+                                    hft_dump = HFTExplicitDumpOverride.detect(
+                                        hft_6pct["bias"], hft_6pct["reason"],
+                                        agg, ofi["bias"], change_5m,
+                                        funding_rate or 0, volume_ratio
                                     )
-                                    if extreme_funding["override"]:
-                                        final_bias = extreme_funding["bias"]
-                                        final_reason = extreme_funding["reason"]
+                                    if hft_dump["override"]:
+                                        final_bias = hft_dump["bias"]
+                                        final_reason = hft_dump["reason"]
                                         final_confidence = "ABSOLUTE"
-                                        final_phase = "EXTREME_FUNDING_TRAP"
-                                        priority = extreme_funding["priority"]
-                                        prob_engine.add(extreme_funding["bias"], 9.9)
+                                        final_phase = "HFT_EXPLICIT_DUMP"
+                                        priority = hft_dump["priority"]
+                                        prob_engine.add(hft_dump["bias"], 9.95)
                                     else:
-                                        # 1.07. EXTREME FUNDING LIQUIDITY OVERRIDE (Priority -1086)
-                                        extreme_funding_liq = ExtremeFundingLiquidityOverride.detect(
-                                            funding_rate or 0, liq["long_dist"], liq["short_dist"],
-                                            hft_6pct["bias"], agg, change_5m
+                                        # 1.06. EXTREME FUNDING RATE TRAP (Priority -1085)
+                                        extreme_funding = ExtremeFundingRateTrap.detect(
+                                            funding_rate or 0, agg, hft_6pct["bias"],
+                                            ofi["bias"], ofi["strength"],
+                                            change_5m, volume_ratio
                                         )
-                                        if extreme_funding_liq["override"]:
-                                            final_bias = extreme_funding_liq["bias"]
-                                            final_reason = extreme_funding_liq["reason"]
+                                        if extreme_funding["override"]:
+                                            final_bias = extreme_funding["bias"]
+                                            final_reason = extreme_funding["reason"]
+                                            final_confidence = "ABSOLUTE"
+                                            final_phase = "EXTREME_FUNDING_TRAP"
+                                            priority = extreme_funding["priority"]
+                                            prob_engine.add(extreme_funding["bias"], 9.9)
+                                        else:
+                                            # 1.07. EXTREME FUNDING LIQUIDITY OVERRIDE (Priority -1086)
+                                            extreme_funding_liq = ExtremeFundingLiquidityOverride.detect(
+                                                funding_rate or 0, liq["long_dist"], liq["short_dist"],
+                                                hft_6pct["bias"], agg, change_5m
+                                            )
+                                            if extreme_funding_liq["override"]:
+                                                final_bias = extreme_funding_liq["bias"]
+                                                final_reason = extreme_funding_liq["reason"]
                                             final_confidence = "ABSOLUTE"
                                             final_phase = "EXTREME_FUNDING_LIQUIDITY"
                                             priority = extreme_funding_liq["priority"]
@@ -3898,60 +4074,73 @@ class BinanceAnalyzer:
                                                                     priority = exhausted_liquidity["priority"]
                                                                     prob_engine.add(exhausted_liquidity["bias"], 9.6)
                                                                 else:
-                                                                    # 1.7. FUNDING RATE CROWDED SHORT OVERRIDE (Priority -1076)
-                                                                    # NEW: Check for crowded short trap before other detectors
-                                                                    funding_crowded = FundingRateCrowdedShortOverride.detect(
-                                                                        funding_rate, rsi6, ofi["bias"], ofi["strength"],
-                                                                        liq["long_dist"], liq["short_dist"], volume_ratio
+                                                                    # 1.65. AGG CONFIRMED BOUNCE (Priority -1070)
+                                                                    agg_confirmed = AggConfirmedBounce.detect(
+                                                                        agg, rsi6, liq["long_dist"], liq["short_dist"],
+                                                                        up_energy, down_energy, change_5m
                                                                     )
-                                                                    if funding_crowded["override"]:
-                                                                        final_bias = funding_crowded["bias"]
-                                                                        final_reason = funding_crowded["reason"]
+                                                                    if agg_confirmed["override"]:
+                                                                        final_bias = agg_confirmed["bias"]
+                                                                        final_reason = agg_confirmed["reason"]
                                                                         final_confidence = "ABSOLUTE"
-                                                                        final_phase = "FUNDING_CROWDED_SHORT"
-                                                                        priority = funding_crowded["priority"]
-                                                                        prob_engine.add(funding_crowded["bias"], 9.8)
+                                                                        final_phase = "AGG_CONFIRMED_BOUNCE"
+                                                                        priority = agg_confirmed["priority"]
+                                                                        prob_engine.add(agg_confirmed["bias"], 9.75)
                                                                     else:
-                                                                        # 1.55. SHORT SQUEEZE TRAP OVERRIDE (Priority -1060)
-                                                                        squeeze_trap = ShortSqueezeTrapOverride.detect(
-                                                                            liq["short_dist"], liq["long_dist"], up_energy, down_energy,
-                                                                            volume_ratio, rsi6_5m, ofi["bias"], ofi["strength"], change_5m
+                                                                        # 1.7. FUNDING RATE CROWDED SHORT OVERRIDE (Priority -1076)
+                                                                        # NEW: Check for crowded short trap before other detectors
+                                                                        funding_crowded = FundingRateCrowdedShortOverride.detect(
+                                                                            funding_rate, rsi6, ofi["bias"], ofi["strength"],
+                                                                            liq["long_dist"], liq["short_dist"], volume_ratio
                                                                         )
-                                                                        if squeeze_trap["override"]:
-                                                                            final_bias = squeeze_trap["bias"]
-                                                                            final_reason = squeeze_trap["reason"]
+                                                                        if funding_crowded["override"]:
+                                                                            final_bias = funding_crowded["bias"]
+                                                                            final_reason = funding_crowded["reason"]
                                                                             final_confidence = "ABSOLUTE"
-                                                                            final_phase = "SHORT_SQUEEZE_TRAP_OVERRIDE"
-                                                                            priority = squeeze_trap["priority"]
-                                                                            prob_engine.add(squeeze_trap["bias"], 9.6)
+                                                                            final_phase = "FUNDING_CROWDED_SHORT"
+                                                                            priority = funding_crowded["priority"]
+                                                                            prob_engine.add(funding_crowded["bias"], 9.8)
                                                                         else:
-                                                                            # 1.6. NEAR EXHAUSTED LIQUIDITY REVERSAL (Priority -1055)
-                                                                            near_exhausted = NearExhaustedLiquidityReversal.detect(
-                                                                                liq["short_dist"], liq["long_dist"], rsi6, volume_ratio, rsi6_5m,
-                                                                                ofi["bias"], ofi["strength"]
+                                                                            # 1.55. SHORT SQUEEZE TRAP OVERRIDE (Priority -1060)
+                                                                            squeeze_trap = ShortSqueezeTrapOverride.detect(
+                                                                                liq["short_dist"], liq["long_dist"], up_energy, down_energy,
+                                                                                volume_ratio, rsi6_5m, ofi["bias"], ofi["strength"], change_5m
                                                                             )
-                                                                            if near_exhausted["override"]:
-                                                                                final_bias = near_exhausted["bias"]
-                                                                                final_reason = near_exhausted["reason"]
+                                                                            if squeeze_trap["override"]:
+                                                                                final_bias = squeeze_trap["bias"]
+                                                                                final_reason = squeeze_trap["reason"]
                                                                                 final_confidence = "ABSOLUTE"
-                                                                                final_phase = "NEAR_EXHAUSTED_LIQUIDITY_REVERSAL"
-                                                                                priority = near_exhausted["priority"]
-                                                                                prob_engine.add(near_exhausted["bias"], 9.7)
+                                                                                final_phase = "SHORT_SQUEEZE_TRAP_OVERRIDE"
+                                                                                priority = squeeze_trap["priority"]
+                                                                                prob_engine.add(squeeze_trap["bias"], 9.6)
                                                                             else:
-                                                                                # 1.7. STRICT LIQUIDITY PROXIMITY (Priority -1050)
-                                                                                strict_liq = LiquidityProximityStrict.detect(
-                                                                                    liq["short_dist"], liq["long_dist"], volume_ratio, rsi6_5m,
-                                                                                    ofi["bias"], ofi["strength"], rsi6, obv_trend, change_5m
+                                                                                # 1.6. NEAR EXHAUSTED LIQUIDITY REVERSAL (Priority -1055)
+                                                                                near_exhausted = NearExhaustedLiquidityReversal.detect(
+                                                                                    liq["short_dist"], liq["long_dist"], rsi6, volume_ratio, rsi6_5m,
+                                                                                    ofi["bias"], ofi["strength"]
                                                                                 )
-                                                                                if strict_liq["override"]:
-                                                                                    final_bias = strict_liq["bias"]
-                                                                                    final_reason = strict_liq["reason"]
+                                                                                if near_exhausted["override"]:
+                                                                                    final_bias = near_exhausted["bias"]
+                                                                                    final_reason = near_exhausted["reason"]
                                                                                     final_confidence = "ABSOLUTE"
-                                                                                    final_phase = "STRICT_LIQUIDITY"
-                                                                                    priority = strict_liq["priority"]
-                                                                                    prob_engine.add(strict_liq["bias"], 9.5)
+                                                                                    final_phase = "NEAR_EXHAUSTED_LIQUIDITY_REVERSAL"
+                                                                                    priority = near_exhausted["priority"]
+                                                                                    prob_engine.add(near_exhausted["bias"], 9.7)
                                                                                 else:
-                                                                                    # 1.7. LIQUIDITY MAGNET OVERRIDE (Priority -1075)
+                                                                                    # 1.7. STRICT LIQUIDITY PROXIMITY (Priority -1050)
+                                                                                    strict_liq = LiquidityProximityStrict.detect(
+                                                                                        liq["short_dist"], liq["long_dist"], volume_ratio, rsi6_5m,
+                                                                                        ofi["bias"], ofi["strength"], rsi6, obv_trend, change_5m
+                                                                                    )
+                                                                                    if strict_liq["override"]:
+                                                                                        final_bias = strict_liq["bias"]
+                                                                                        final_reason = strict_liq["reason"]
+                                                                                        final_confidence = "ABSOLUTE"
+                                                                                        final_phase = "STRICT_LIQUIDITY"
+                                                                                        priority = strict_liq["priority"]
+                                                                                        prob_engine.add(strict_liq["bias"], 9.5)
+                                                                                    else:
+                                                                                        # 1.7. LIQUIDITY MAGNET OVERRIDE (Priority -1075)
                                                                                     # NEW: Force direction based on liquidity magnet when close (<3%) and low volume (<0.7x)
                                                                                     # Threshold diperluas dari 2.5%/0.5x menjadi 3%/0.7x untuk menangkap lebih banyak squeeze plays
                                                                                     # Case studies: NOMUSDT (+8%), ARIAUSDT, BASUSDT (+8%)
@@ -4594,7 +4783,8 @@ class BinanceAnalyzer:
             # ========== OVERSOLD LIQUIDITY CONTINUATION (FALLING KNIFE) ==========
             oversold_liquidity_cont = OversoldLiquidityContinuation.detect(
                 volume_ratio, liq["long_dist"], down_energy,
-                ofi["bias"], ofi["strength"], change_5m, rsi6
+                ofi["bias"], ofi["strength"], change_5m, rsi6,
+                up_energy, agg, latest_volume, volume_ma10
             )
             if oversold_liquidity_cont["override"]:
                 final_bias = oversold_liquidity_cont["bias"]
@@ -4602,6 +4792,18 @@ class BinanceAnalyzer:
                 final_confidence = "ABSOLUTE"
                 final_phase = "OVERSOLD_LIQUIDITY_CONT"
                 priority = oversold_liquidity_cont["priority"]
+                
+                # ========== ENERGY AGG CONSENSUS OVERRIDE (Priority -143) ==========
+                # Check if energy and agg consensus overrides this SHORT signal
+                energy_agg_consensus = EnergyAggConsensus.detect(
+                    up_energy, down_energy, agg, final_bias, rsi6, change_5m
+                )
+                if energy_agg_consensus["override"]:
+                    final_bias = energy_agg_consensus["bias"]
+                    final_reason = energy_agg_consensus["reason"]
+                    final_confidence = "ABSOLUTE"
+                    final_phase = "ENERGY_AGG_CONSENSUS"
+                    priority = energy_agg_consensus["priority"]
 
             # ========== FALLING KNIFE OVERRIDE (Priority -139) ==========
             falling_knife = FallingKnifeOverride.detect(
