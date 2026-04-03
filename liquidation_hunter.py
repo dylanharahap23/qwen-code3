@@ -364,19 +364,24 @@ class FakeBounceTrap:
 
 class PostDropBounceOverride:
     """
-    🔥 Memaksa LONG setelah drop >5% dalam 5m, volume rendah, dan OFI tidak SHORT kuat.
+    🔥 Memaksa LONG setelah drop >3.5% dalam 5m, volume rendah, dan OFI tidak SHORT kuat.
     Priority -140.
     """
     @staticmethod
-    def detect(change_5m: float, volume_ratio: float, ofi_bias: str, ofi_strength: float) -> Dict:
-        if change_5m < -5.0 and volume_ratio < 0.6:
-            if ofi_bias != "SHORT" or ofi_strength < 0.6:
-                return {
-                    "override": True,
-                    "bias": "LONG",
-                    "reason": f"Post-drop bounce: price dropped {change_5m:.1f}% with low volume, no strong selling → bounce likely",
-                    "priority": -140
-                }
+    def detect(change_5m: float, volume_ratio: float, ofi_bias: str, ofi_strength: float, short_liq: float) -> Dict:
+        # Turunkan threshold dari -5.0 menjadi -3.5 agar menangkap drop sedang sekalipun
+        if change_5m < -3.5 and volume_ratio < 0.6:
+            # Jangan override jika short liq sangat dekat (potensi short squeeze)
+            if short_liq < 2.0:
+                pass  # biarkan liquidity logic yang menentukan
+            else:
+                if ofi_bias != "SHORT" or ofi_strength < 0.6:
+                    return {
+                        "override": True,
+                        "bias": "LONG",
+                        "reason": f"Exhaustion drop: price dropped {change_5m:.1f}% with low volume ({volume_ratio:.2f}x), no strong selling → bounce likely",
+                        "priority": -140
+                    }
         return {"override": False}
 
 class OrderBookSlope:
@@ -1686,6 +1691,29 @@ class ExtremeOversoldCloseLiquidityBounce:
                 "override": True,
                 "bias": "LONG",
                 "reason": f"Extreme oversold with very close long liq ({long_liq:.2f}%), RSI {rsi6:.1f}, up_energy={up_energy:.2f} → bounce imminent",
+                "priority": -141
+            }
+        return {"override": False}
+
+
+class ExhaustionDropReversal:
+    """
+    🔥 Mendeteksi exhaustion drop: harga turun tajam dengan volume rendah,
+    tidak ada seller, dan short liq tidak terlalu dekat → reversal LONG.
+    Priority -141 (sama dengan ExtremeOversoldCloseLiquidityBounce)
+    """
+    @staticmethod
+    def detect(change_5m: float, volume_ratio: float, down_energy: float,
+               short_liq: float, rsi6_5m: float) -> Dict:
+        if (change_5m < -3.5 and
+            volume_ratio < 0.6 and
+            down_energy < 0.01 and
+            short_liq > 2.5 and          # Jangan override jika short liq terlalu dekat (bisa squeeze)
+            rsi6_5m < 85):               # Hindari overbought ekstrem yang masih bisa lanjut dump
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": f"Exhaustion drop reversal: dropped {change_5m:.1f}% with low volume ({volume_ratio:.2f}x), no sellers, short liq {short_liq:.2f}% → bounce likely",
                 "priority": -141
             }
         return {"override": False}
@@ -4207,6 +4235,17 @@ class BinanceAnalyzer:
                 final_confidence = "ABSOLUTE"
                 final_phase = "EXTREME_OVERSOLD_CLOSE_LIQ_BOUNCE"
                 priority = extreme_oversold_bounce["priority"]
+
+            # ========== EXHAUSTION DROP REVERSAL (Priority -141) ==========
+            exhaustion_drop_rev = ExhaustionDropReversal.detect(
+                change_5m, volume_ratio, down_energy, liq["short_dist"], rsi6_5m
+            )
+            if exhaustion_drop_rev["override"]:
+                final_bias = exhaustion_drop_rev["bias"]
+                final_reason = exhaustion_drop_rev["reason"]
+                final_confidence = "ABSOLUTE"
+                final_phase = "EXHAUSTION_DROP_REVERSAL"
+                priority = exhaustion_drop_rev["priority"]
 
             # ========== EXTREME OVERBOUGHT DISTRIBUTION (PRIORITY -270) ==========
             extreme_overbought_dist = ExtremeOverboughtDistribution.detect(
