@@ -1139,6 +1139,22 @@ class LiquidityProximityStrict:
     @staticmethod
     def detect(short_dist: float, long_dist: float, volume_ratio: float, rsi6_5m: float,
                ofi_bias: str, ofi_strength: float, rsi6: float, obv_trend: str, change_5m: float) -> Dict:
+        # 🔥 Jika long liq sangat dekat (<1.0%) dan lebih dekat dari short liq → paksa SHORT mutlak
+        if long_dist < 1.0 and long_dist < short_dist:
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"Ultra close long liq ({long_dist:.2f}%) → forced SHORT regardless",
+                "priority": -1051
+            }
+        # 🔥 Jika short liq sangat dekat (<1.0%) dan lebih dekat dari long liq → paksa LONG mutlak
+        if short_dist < 1.0 and short_dist < long_dist:
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": f"Ultra close short liq ({short_dist:.2f}%) → forced LONG regardless",
+                "priority": -1051
+            }
         if volume_ratio < 1.5:
             # 🔥 Block jika extreme overbought/oversold dengan volume rendah
             if (rsi6_5m > 70 and volume_ratio < 0.6) or (rsi6_5m < 30 and volume_ratio < 0.6):
@@ -1451,7 +1467,11 @@ class ExtremeOverboughtDumpOverride:
     """
     @staticmethod
     def detect(rsi6: float, volume_ratio: float, change_5m: float,
-               ofi_bias: str, ofi_strength: float, short_liq: float) -> Dict:
+               ofi_bias: str, ofi_strength: float, short_liq: float, up_energy: float) -> Dict:
+        # 🔥 Jangan paksa SHORT jika short liq masih jauh (>2%) dan ada buy pressure (up_energy > 0.1)
+        if short_liq > 2.0 and up_energy > 0.1:
+            return {"override": False}
+        
         if (rsi6 > 75 and
             volume_ratio < 0.8 and
             change_5m > 5.0 and
@@ -4085,7 +4105,7 @@ class BinanceAnalyzer:
                 priority = extreme_oversold_bounce["priority"]
             else:
                 extreme_overbought_dump = ExtremeOverboughtDumpOverride.detect(
-                    rsi6, volume_ratio, change_5m, ofi["bias"], ofi["strength"], liq["short_dist"]
+                    rsi6, volume_ratio, change_5m, ofi["bias"], ofi["strength"], liq["short_dist"], up_energy
                 )
                 if extreme_overbought_dump["override"]:
                     final_bias = extreme_overbought_dump["bias"]
@@ -4259,7 +4279,10 @@ class BinanceAnalyzer:
                 return False
             
             if volume_ratio < 0.6 and ofi["strength"] > 0.7:
-                if should_block_ofi_dominance(ofi["bias"], agg, hft_6pct["bias"], liq["long_dist"], liq["short_dist"], rsi6):
+                # 🔥 Jika sudah ada sinyal dengan priority lebih tinggi (lebih negatif dari -200), jangan override
+                if 'priority' in locals() and priority < -200:
+                    final_reason += f" | OFI dominance skipped due to higher priority signal (priority {priority})"
+                elif should_block_ofi_dominance(ofi["bias"], agg, hft_6pct["bias"], liq["long_dist"], liq["short_dist"], rsi6):
                     # Jangan paksa LONG, biarkan sinyal lain yang menentukan
                     final_reason += f" | OFI dominance blocked by HFT-liquidity conflict"
                 else:
