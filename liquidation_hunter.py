@@ -1247,6 +1247,46 @@ class ExtremeFundingRateTrap:
         return {"override": False}
 
 
+# ================= LECTURER'S SARAN LOGIC: EXTREME FUNDING LIQUIDITY OVERRIDE =================
+
+class ExtremeFundingLiquidityOverride:
+    """
+    🔥 Ketika funding rate sangat negatif (< -0.005) tapi long liq lebih dekat dari short liq,
+    maka HFT akan ambil long stops dulu → SHORT, bukan LONG.
+    Priority -1086 (lebih tinggi dari ExtremeFundingRateTrap -1085)
+    """
+    @staticmethod
+    def detect(funding_rate: float, long_liq: float, short_liq: float, 
+               hft_bias: str, agg: float, change_5m: float) -> Dict:
+        if funding_rate is None:
+            return {"override": False}
+        # Funding sangat negatif, long liq lebih dekat, HFT SHORT, agg tidak terlalu ekstrem beli
+        if (funding_rate < -0.005 and 
+            long_liq < short_liq and 
+            hft_bias == "SHORT" and 
+            agg < 0.8 and
+            abs(change_5m) < 2.0):  # harga sideways, belum pump/dump
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"Extreme negative funding ({funding_rate:.4f}) but long liq closer ({long_liq:.2f}% < {short_liq:.2f}%) → HFT will take long stops first, forced SHORT",
+                "priority": -1086
+            }
+        # Mirror untuk funding positif ekstrem dengan short liq lebih dekat
+        if (funding_rate > 0.005 and 
+            short_liq < long_liq and 
+            hft_bias == "LONG" and 
+            agg > 0.2 and
+            abs(change_5m) < 2.0):
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": f"Extreme positive funding ({funding_rate:.4f}) but short liq closer ({short_liq:.2f}% < {long_liq:.2f}%) → HFT will take short stops first, forced LONG",
+                "priority": -1086
+            }
+        return {"override": False}
+
+
 # ================= LECTURER'S SARAN LOGIC: AGG/FLOW DIVERGENCE FILTER =================
 
 class AggFlowDivergenceFilter:
@@ -3650,28 +3690,41 @@ class BinanceAnalyzer:
                                     priority = extreme_funding["priority"]
                                     prob_engine.add(extreme_funding["bias"], 9.9)
                                 else:
-                                    # 1.1. EXTREME OVERSOLD IGNORE LIQUIDITY (Priority -1080)
-                                    extreme_oversold_ignore = ExtremeOversoldIgnoreLiquidity.detect(rsi6, volume_ratio)
-                                    if extreme_oversold_ignore["override"]:
-                                        final_bias = extreme_oversold_ignore["bias"]
-                                        final_reason = extreme_oversold_ignore["reason"]
+                                    # 1.07. EXTREME FUNDING LIQUIDITY OVERRIDE (Priority -1086)
+                                    extreme_funding_liq = ExtremeFundingLiquidityOverride.detect(
+                                        funding_rate or 0, liq["long_dist"], liq["short_dist"],
+                                        hft_6pct["bias"], agg, change_5m
+                                    )
+                                    if extreme_funding_liq["override"]:
+                                        final_bias = extreme_funding_liq["bias"]
+                                        final_reason = extreme_funding_liq["reason"]
                                         final_confidence = "ABSOLUTE"
-                                        final_phase = "EXTREME_OVERSOLD_IGNORE_LIQUIDITY"
-                                        priority = extreme_oversold_ignore["priority"]
-                                        prob_engine.add(extreme_oversold_ignore["bias"], 9.9)
+                                        final_phase = "EXTREME_FUNDING_LIQUIDITY"
+                                        priority = extreme_funding_liq["priority"]
+                                        prob_engine.add(extreme_funding_liq["bias"], 9.95)
                                     else:
-                                        # 1.2. EXTREME OVERBOUGHT IGNORE LIQUIDITY (Priority -1080)
-                                        extreme_overbought_ignore = ExtremeOverboughtIgnoreLiquidity.detect(rsi6, volume_ratio)
-                                        if extreme_overbought_ignore["override"]:
-                                            final_bias = extreme_overbought_ignore["bias"]
-                                            final_reason = extreme_overbought_ignore["reason"]
+                                        # 1.1. EXTREME OVERSOLD IGNORE LIQUIDITY (Priority -1080)
+                                        extreme_oversold_ignore = ExtremeOversoldIgnoreLiquidity.detect(rsi6, volume_ratio)
+                                        if extreme_oversold_ignore["override"]:
+                                            final_bias = extreme_oversold_ignore["bias"]
+                                            final_reason = extreme_oversold_ignore["reason"]
                                             final_confidence = "ABSOLUTE"
-                                            final_phase = "EXTREME_OVERBOUGHT_IGNORE_LIQUIDITY"
-                                            priority = extreme_overbought_ignore["priority"]
-                                            prob_engine.add(extreme_overbought_ignore["bias"], 9.9)
+                                            final_phase = "EXTREME_OVERSOLD_IGNORE_LIQUIDITY"
+                                            priority = extreme_oversold_ignore["priority"]
+                                            prob_engine.add(extreme_oversold_ignore["bias"], 9.9)
                                         else:
-                                            # 1.3. CROWDED LONG DISTRIBUTION (Priority -165)
-                                            crowded_long = CrowdedLongDistribution.detect(rsi6, volume_ratio, ofi["bias"], change_5m)
+                                            # 1.2. EXTREME OVERBOUGHT IGNORE LIQUIDITY (Priority -1080)
+                                            extreme_overbought_ignore = ExtremeOverboughtIgnoreLiquidity.detect(rsi6, volume_ratio)
+                                            if extreme_overbought_ignore["override"]:
+                                                final_bias = extreme_overbought_ignore["bias"]
+                                                final_reason = extreme_overbought_ignore["reason"]
+                                                final_confidence = "ABSOLUTE"
+                                                final_phase = "EXTREME_OVERBOUGHT_IGNORE_LIQUIDITY"
+                                                priority = extreme_overbought_ignore["priority"]
+                                                prob_engine.add(extreme_overbought_ignore["bias"], 9.9)
+                                            else:
+                                                # 1.3. CROWDED LONG DISTRIBUTION (Priority -165)
+                                                crowded_long = CrowdedLongDistribution.detect(rsi6, volume_ratio, ofi["bias"], change_5m)
                                             if crowded_long["override"]:
                                                 final_bias = crowded_long["bias"]
                                                 final_reason = crowded_long["reason"]
