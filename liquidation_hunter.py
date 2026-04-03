@@ -426,6 +426,54 @@ class OrderBookSlope:
         return {"bias": "NEUTRAL", "reason": "Balanced order book"}
 
 
+class AskBidSlopeImbalanceDetector:
+    """
+    🔥 RLSUSDT PATTERN: ask_slope 4-5x lebih besar dari bid_slope
+    
+    Ini artinya sell wall jauh lebih tebal dari buy wall.
+    Harga tidak bisa naik karena ada tembok jual raksasa.
+    
+    Current logic hanya trigger di 2x — upgrade ke detector terpisah
+    dengan priority lebih tinggi untuk rasio ekstrem (>3x).
+    
+    Priority: -210 (di atas EnergyGapTrap -215)
+    """
+    @staticmethod
+    def detect(ask_slope: float, bid_slope: float,
+               change_5m: float, rsi6: float,
+               down_energy: float, up_energy: float) -> Dict:
+        
+        if bid_slope <= 0 or ask_slope <= 0:
+            return {"override": False}
+        
+        ask_bid_ratio = ask_slope / bid_slope
+        bid_ask_ratio = bid_slope / ask_slope
+        
+        # Sell wall sangat tebal (>3x) + harga turun = SHORT kuat
+        if (ask_bid_ratio > 3.0 and
+            change_5m < 0 and
+            rsi6 < 50):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"Ask slope dominance: ask={ask_slope:.0f} vs bid={bid_slope:.0f} (ratio {ask_bid_ratio:.1f}x), harga turun {change_5m:.1f}% → sell wall raksasa, dump continues",
+                "priority": -210
+            }
+        
+        # Buy wall sangat tebal (>3x) + harga naik = LONG kuat
+        if (bid_ask_ratio > 3.0 and
+            change_5m > 0 and
+            rsi6 > 50):
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": f"Bid slope dominance: bid={bid_slope:.0f} vs ask={ask_slope:.0f} (ratio {bid_ask_ratio:.1f}x), harga naik {change_5m:.1f}% → buy wall raksasa, pump continues",
+                "priority": -210
+            }
+        
+        return {"override": False}
+
+
 class LatencyArbitragePredictor:
     @staticmethod
     def predict_next_price(price: float, change_5m: float, up_energy: float,
@@ -1243,11 +1291,28 @@ class CrowdedShortAccumulation:
     Priority -165
     """
     @staticmethod
-    def detect(rsi6: float, volume_ratio: float, ofi_bias: str, change_5m: float) -> Dict:
-        if (rsi6 < 30
-                and volume_ratio < 0.9
-                and (ofi_bias == "SHORT" or ofi_bias == "NEUTRAL")
-                and change_5m < -1.0):
+    def detect(rsi6: float, volume_ratio: float, ofi_bias: str, change_5m: float,
+               ask_slope: float = 0, bid_slope: float = 0,          # ← TAMBAH
+               obv_value: float = 0, rsi6_5m: float = 50) -> Dict:  # ← TAMBAH
+        
+        # 🔥 PATCH RLSUSDT: Jangan LONG kalau sell wall jauh lebih tebal
+        if bid_slope > 0 and ask_slope > bid_slope * 2.5:
+            return {"override": False}  # sell wall raksasa, bukan accumulation
+        
+        # 🔥 PATCH: Jangan LONG kalau OBV sangat negatif (distribusi sudah lama)
+        if obv_value < -20_000_000:
+            return {"override": False}  # distribusi panjang, bukan crowded short
+        
+        # 🔥 PATCH: RSI_5m juga oversold = falling knife, bukan bounce
+        # Jika RSI_1m DAN RSI_5m keduanya < 25 = trend turun kuat, jangan LONG
+        if rsi6 < 25 and rsi6_5m < 25 and change_5m < -1.5:
+            return {"override": False}  # double oversold + turun = falling knife
+
+        # Logic asli
+        if (rsi6 < 30 and
+            volume_ratio < 0.9 and
+            (ofi_bias == "SHORT" or ofi_bias == "NEUTRAL") and
+            change_5m < -1.0):
             return {
                 "override": True,
                 "bias": "LONG",
@@ -2408,6 +2473,92 @@ class FallingKnifeOverride:
                 "priority": -139
             }
         return {"override": False}
+
+
+class FallingKnifeOBVConfirm:
+    """
+    🔥 RLSUSDT EXACT PATTERN:
+    
+    Kombinasi mematikan:
+    - OBV value sangat negatif (< -20 juta) = distribusi lama
+    - ask_slope >> bid_slope (>3x) = sell wall tebal
+    - RSI_1m DAN RSI_5m keduanya oversold
+    - harga terus turun (change_5m < 0)
+    - volume rendah (tidak ada rescue buyer)
+    
+    Ini adalah FALLING KNIFE — oversold bukan berarti bounce.
+    Smart money masih distribusi. Jangan masuk LONG.
+    
+    Priority: -205 (lebih tinggi dari OversoldFalseBounceTrap -201)
+    """
+    @staticmethod
+    def detect(obv_value: float, ask_slope: float, bid_slope: float,
+               rsi6: float, rsi6_5m: float, change_5m: float,
+               volume_ratio: float, down_energy: float) -> Dict:
+        
+        if bid_slope <= 0:
+            return {"override": False}
+        
+        ask_bid_ratio = ask_slope / bid_slope if bid_slope > 0 else 1.0
+        
+        # Semua sinyal bearish confluence
+        obv_bearish = obv_value < -20_000_000
+        slope_bearish = ask_bid_ratio > 2.5
+        rsi_double_oversold = rsi6 < 30 and rsi6_5m < 25  # keduanya oversold
+        price_falling = change_5m < -1.0
+        low_volume = volume_ratio < 0.85
+        
+        bearish_count = sum([obv_bearish, slope_bearish, rsi_double_oversold,
+                             price_falling, low_volume])
+        
+        if bearish_count >= 4:  # minimal 4 dari 5 kondisi terpenuhi
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"Falling knife OBV confirm: OBV={obv_value:,.0f} (distribusi lama), ask/bid ratio={ask_bid_ratio:.1f}x, RSI_1m={rsi6:.1f} RSI_5m={rsi6_5m:.1f} keduanya oversold, price down {change_5m:.1f}% → NOT a bounce, dump continues",
+                "priority": -205
+            }
+        
+        return {"override": False}
+
+
+class DataSnapshotConsistencyCheck:
+    """
+    🔥 Fix bug display ≠ JSON.
+    
+    Masalah: Data diambil 2x — sekali untuk display, sekali untuk keputusan.
+    Race condition menghasilkan nilai berbeda.
+    
+    Solusi: Cek konsistensi agg vs ofi_bias.
+    Jika agg > 0.7 tapi ofi_bias = SHORT, atau sebaliknya,
+    gunakan agg sebagai tiebreaker (lebih real-time).
+    """
+    @staticmethod
+    def resolve(agg: float, ofi_bias: str, ofi_strength: float,
+                up_energy: float, down_energy: float) -> Dict:
+        
+        # Deteksi inkonsistensi: agg tinggi tapi OFI SHORT
+        if agg > 0.7 and ofi_bias == "SHORT":
+            # agg lebih real-time → percaya agg
+            # Upgrade OFI ke NEUTRAL atau LONG tergantung energy
+            if up_energy > down_energy:
+                return {"bias": "LONG", "strength": (agg - 0.5) * 2,
+                        "resolved": True, "reason": "agg>0.7 overrides OFI SHORT"}
+            else:
+                return {"bias": "NEUTRAL", "strength": 0,
+                        "resolved": True, "reason": "agg>0.7 neutralizes OFI SHORT"}
+        
+        # agg rendah tapi OFI LONG
+        if agg < 0.3 and ofi_bias == "LONG":
+            if down_energy > up_energy:
+                return {"bias": "SHORT", "strength": (0.5 - agg) * 2,
+                        "resolved": True, "reason": "agg<0.3 overrides OFI LONG"}
+            else:
+                return {"bias": "NEUTRAL", "strength": 0,
+                        "resolved": True, "reason": "agg<0.3 neutralizes OFI LONG"}
+        
+        # Konsisten → kembalikan apa adanya
+        return {"bias": ofi_bias, "strength": ofi_strength, "resolved": False}
 
 
 class ExtremeOversoldCloseLiquidityBounce:
@@ -3932,6 +4083,17 @@ class IndicatorCalculator:
         if current_obv < 0 and current_obv < min(obv) * 0.9:
             trend = "NEGATIVE_EXTREME"
 
+        # 🔥 PATCH AIOTUSDT/RLSUSDT: Override trend berdasarkan absolute value
+        # Jika OBV value sangat negatif tapi tidak monoton → NEGATIVE_EXTREME
+        # Jika OBV value sangat positif tapi tidak monoton → POSITIVE_EXTREME
+        EXTREME_THRESHOLD = 30_000_000  # 30 juta
+
+        if trend == "NEUTRAL":
+            if current_obv < -EXTREME_THRESHOLD:
+                trend = "NEGATIVE_EXTREME"  # OBV negatif besar = distribusi panjang
+            elif current_obv > EXTREME_THRESHOLD:
+                trend = "POSITIVE_EXTREME"  # OBV positif besar = akumulasi panjang
+
         return obv, trend, current_obv
 
     @staticmethod
@@ -4360,6 +4522,12 @@ class BinanceAnalyzer:
             )
             ofi = ofi_validated  # replace ofi dengan yang sudah divalidasi
 
+            # ========== Data Snapshot Consistency Check (FIX BUG DISPLAY ≠ JSON) ==========
+            ofi_resolved = DataSnapshotConsistencyCheck.resolve(
+                agg, ofi["bias"], ofi["strength"], up_energy, down_energy
+            )
+            ofi = ofi_resolved  # replace ofi dengan yang sudah di-resolve
+
             iceberg = IcebergDetector.detect(trades, price) if trades else {"detected": False}
             cross_lead = CrossExchangeLeader.check_leader(self.symbol)
             funding_trap = FundingRateTrap.detect(funding_rate or 0, oi or 0)
@@ -4368,6 +4536,17 @@ class BinanceAnalyzer:
             # ========== OrderBook Slope ==========
             bid_slope, ask_slope = OrderBookSlope.calculate(order_book)
             slope_signal = OrderBookSlope.signal(bid_slope, ask_slope)
+
+            # ========== Ask-Bid Slope Imbalance Detector (RLSUSDT PATTERN) ==========
+            ask_bid_imbalance = AskBidSlopeImbalanceDetector.detect(
+                ask_slope, bid_slope, change_5m, rsi6, down_energy, up_energy
+            )
+
+            # ========== Falling Knife OBV Confirm (RLSUSDT PATTERN) ==========
+            falling_knife_obv = FallingKnifeOBVConfirm.detect(
+                obv_value, ask_slope, bid_slope, rsi6, rsi6_5m,
+                change_5m, volume_ratio, down_energy
+            )
 
             # ========== Latency Arbitrage Predictor ==========
             predicted_price = LatencyArbitragePredictor.predict_next_price(
