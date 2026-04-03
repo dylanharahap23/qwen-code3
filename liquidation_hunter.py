@@ -694,7 +694,7 @@ class ExhaustedLiquidityReversal:
     def detect(short_dist: float, long_dist: float, rsi6: float, volume_ratio: float, rsi6_5m: float,
                ofi_bias: str, ofi_strength: float) -> Dict:
         # 🔥 NEW: Jika long liq habis dan oversold ekstrem, jangan paksa LONG
-        if long_dist < 0.5 and rsi6 < 15 and volume_ratio < 1.0:
+        if long_dist < 0.5 and rsi6 < 25 and volume_ratio < 1.0:
             return {"override": False}
         # 🔥 NEW: Jika short liq habis dan overbought ekstrem, jangan paksa SHORT
         if short_dist < 0.5 and rsi6 > 85 and volume_ratio < 1.0:
@@ -1219,6 +1219,31 @@ class LiquidityMagnetOverride:
                 "bias": "SHORT",
                 "reason": f"Liquidity squeeze override: long liq {long_dist:.2f}% dekat dengan volume {volume_ratio:.2f}x, lebih dekat dari short liq → force SHORT (HFT will dump to sweep long stops)",
                 "priority": -1075
+            }
+        return {"override": False}
+
+
+class FundingRateCrowdedShortOverride:
+    """
+    🔥 Memaksa LONG ketika funding rate sangat negatif (crowded short),
+    RSI oversold, OFI LONG, dan short liq lebih dekat.
+    Priority -1076 (antara LiquidityMagnetOverride -1075 dan ExhaustedLiquidityReversal -1060)
+    """
+    @staticmethod
+    def detect(funding_rate: float, rsi6: float, ofi_bias: str, ofi_strength: float,
+               long_dist: float, short_dist: float, volume_ratio: float) -> Dict:
+        if (funding_rate is not None and 
+            funding_rate < -0.001 and           # sangat negatif = crowded short
+            rsi6 < 35 and                       # oversold
+            ofi_bias == "LONG" and 
+            ofi_strength > 0.4 and
+            short_dist < long_dist and          # short liq lebih dekat (target untuk squeeze)
+            volume_ratio < 0.8):                # volume rendah
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": f"Crowded short trap: funding rate {funding_rate:.4f} sangat negatif, RSI {rsi6:.1f} oversold, OFI LONG {ofi_strength:.2f}, short liq {short_dist:.2f}% < long liq {long_dist:.2f}% → shorts trapped, squeeze up",
+                "priority": -1076
             }
         return {"override": False}
 
@@ -3461,8 +3486,22 @@ class BinanceAnalyzer:
                                                     priority = exhausted_liquidity["priority"]
                                                     prob_engine.add(exhausted_liquidity["bias"], 9.6)
                                                 else:
-                                                    # 1.55. SHORT SQUEEZE TRAP OVERRIDE (Priority -1060)
-                                                    squeeze_trap = ShortSqueezeTrapOverride.detect(
+                                                    # 1.7. FUNDING RATE CROWDED SHORT OVERRIDE (Priority -1076)
+                                                    # NEW: Check for crowded short trap before other detectors
+                                                    funding_crowded = FundingRateCrowdedShortOverride.detect(
+                                                        funding_rate, rsi6, ofi["bias"], ofi["strength"],
+                                                        liq["long_dist"], liq["short_dist"], volume_ratio
+                                                    )
+                                                    if funding_crowded["override"]:
+                                                        final_bias = funding_crowded["bias"]
+                                                        final_reason = funding_crowded["reason"]
+                                                        final_confidence = "ABSOLUTE"
+                                                        final_phase = "FUNDING_CROWDED_SHORT"
+                                                        priority = funding_crowded["priority"]
+                                                        prob_engine.add(funding_crowded["bias"], 9.8)
+                                                    else:
+                                                        # 1.55. SHORT SQUEEZE TRAP OVERRIDE (Priority -1060)
+                                                        squeeze_trap = ShortSqueezeTrapOverride.detect(
                                                         liq["short_dist"], liq["long_dist"], up_energy, down_energy,
                                                         volume_ratio, rsi6_5m, ofi["bias"], ofi["strength"], change_5m
                                                     )
@@ -3516,8 +3555,21 @@ class BinanceAnalyzer:
                                                                     priority = liq_magnet_override["priority"]
                                                                     prob_engine.add(liq_magnet_override["bias"], 9.8)  # weight sangat tinggi
                                                                 else:
-                                                                    # 2. LIQUIDITY MAGNET CONTINUATION (Priority -1000)
-                                                                    liq_magnet = LiquidityMagnetContinuation.detect(
+                                                                    # 1.8. FUNDING RATE CROWDED SHORT OVERRIDE (Priority -1076)
+                                                                    funding_crowded = FundingRateCrowdedShortOverride.detect(
+                                                                        funding_rate, rsi6, ofi["bias"], ofi["strength"],
+                                                                        liq["long_dist"], liq["short_dist"], volume_ratio
+                                                                    )
+                                                                    if funding_crowded["override"]:
+                                                                        final_bias = funding_crowded["bias"]
+                                                                        final_reason = funding_crowded["reason"]
+                                                                        final_confidence = "ABSOLUTE"
+                                                                        final_phase = "FUNDING_CROWDED_SHORT"
+                                                                        priority = funding_crowded["priority"]
+                                                                        prob_engine.add(funding_crowded["bias"], 9.8)
+                                                                    else:
+                                                                        # 2. LIQUIDITY MAGNET CONTINUATION (Priority -1000)
+                                                                        liq_magnet = LiquidityMagnetContinuation.detect(
                                                                         liq["short_dist"], liq["long_dist"], change_5m,
                                                                         up_energy, down_energy, volume_ratio
                                                                     )
@@ -4198,16 +4250,28 @@ class BinanceAnalyzer:
 
             # ========== OFI DOMINANCE OVERRIDE (Priority -145) ==========
             # 🔥 Jika volume rendah dan OFI sangat kuat (>0.7), paksa arah OFI
+            
+            # 🔥 Filter OFI dominance jika HFT dan liquidity bertentangan
+            def should_block_ofi_dominance(ofi_bias, agg, hft_bias, long_dist, short_dist, rsi6):
+                # Jika OFI dominance memaksa LONG tapi HFT bilang SHORT dan long_liq lebih dekat serta RSI netral
+                if agg >= 0.95 and ofi_bias == "LONG" and hft_bias == "SHORT" and long_dist < short_dist and 35 < rsi6 < 65:
+                    return True
+                return False
+            
             if volume_ratio < 0.6 and ofi["strength"] > 0.7:
-                if ofi["bias"] == "LONG":
-                    final_bias = "LONG"
-                    final_reason = f"OFI dominance: {ofi['strength']:.2f} with low volume → forcing LONG"
-                elif ofi["bias"] == "SHORT":
-                    final_bias = "SHORT"
-                    final_reason = f"OFI dominance: {ofi['strength']:.2f} with low volume → forcing SHORT"
-                final_confidence = "ABSOLUTE"
-                final_phase = "OFI_DOMINANCE"
-                priority = -145
+                if should_block_ofi_dominance(ofi["bias"], agg, hft_6pct["bias"], liq["long_dist"], liq["short_dist"], rsi6):
+                    # Jangan paksa LONG, biarkan sinyal lain yang menentukan
+                    final_reason += f" | OFI dominance blocked by HFT-liquidity conflict"
+                else:
+                    if ofi["bias"] == "LONG":
+                        final_bias = "LONG"
+                        final_reason = f"OFI dominance: {ofi['strength']:.2f} with low volume → forcing LONG"
+                    elif ofi["bias"] == "SHORT":
+                        final_bias = "SHORT"
+                        final_reason = f"OFI dominance: {ofi['strength']:.2f} with low volume → forcing SHORT"
+                    final_confidence = "ABSOLUTE"
+                    final_phase = "OFI_DOMINANCE"
+                    priority = -145
 
             # ========== MACD DUEL OVERRIDE (WITH LECTURER'S SARAN FILTER) ==========
             if macd_decision["action"] != "NONE":
