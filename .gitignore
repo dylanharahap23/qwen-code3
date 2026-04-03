@@ -12,20 +12,26 @@ venv/
 .env.local
 *.env.*
 
-# Logs
+# Logs and temporary files
 *.log
-
-# Temporary files
 *.tmp
 *.swp
-*.swo
 
 # Editors
 .vscode/
 .idea/
 
+# Dependencies
+node_modules/
+.mypy_cache/
+.pytest_cache/
+.coverage
+coverage/
+htmlcov/
+
 # Build artifacts
 dist/
 build/
 target/
+.gradle/
 ```
