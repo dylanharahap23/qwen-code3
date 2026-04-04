@@ -4280,6 +4280,45 @@ class GlobalPositionImbalance:
                 "exchange_risk_type": "CROWDED_SHORT_LIQ_CLOSE"
             }
         
+        # ============================================================
+        # 🔥 FIX DUSDT: funding hampir netral TAPI liq SANGAT asimetris
+        # funding = -0.000056 (tidak trigger threshold di atas)
+        # tapi long_liq = 34.71% >> short_liq = 5.97% (ratio 5.81x)
+        # Di kondisi ini exchange tetap akan pilih dump (max pain)
+        # ============================================================
+        if funding_rate is not None and short_dist > 0 and long_dist > 0:
+            liq_ratio_val = long_dist / short_dist if long_dist > short_dist else short_dist / long_dist
+            
+            # Liq sangat asimetris (>5x) + volume sangat rendah
+            if liq_ratio_val >= 5.0 and volume_ratio < 0.5:
+                if long_dist > short_dist:
+                    # Dump lebih profitable walaupun funding netral
+                    return {
+                        "override": True,
+                        "bias": "SHORT",
+                        "reason": (
+                            f"GLOBAL POSITION IMBALANCE (LIQ ASYMMETRY): "
+                            f"long_liq={long_dist:.2f}% vs short_liq={short_dist:.2f}% "
+                            f"(ratio {liq_ratio_val:.1f}x), volume={volume_ratio:.2f}x → "
+                            f"exchange akan dump karena total liquidation value jauh lebih besar"
+                        ),
+                        "priority": -1104,
+                        "exchange_risk_type": "LIQ_VALUE_ASYMMETRY_SHORT"
+                    }
+                else:
+                    return {
+                        "override": True,
+                        "bias": "LONG",
+                        "reason": (
+                            f"GLOBAL POSITION IMBALANCE (LIQ ASYMMETRY): "
+                            f"short_liq={short_dist:.2f}% vs long_liq={long_dist:.2f}% "
+                            f"(ratio {liq_ratio_val:.1f}x), volume={volume_ratio:.2f}x → "
+                            f"exchange akan pump karena total liquidation value jauh lebih besar"
+                        ),
+                        "priority": -1104,
+                        "exchange_risk_type": "LIQ_VALUE_ASYMMETRY_LONG"
+                    }
+        
         return {"override": False}
 
 
@@ -4669,11 +4708,54 @@ class ExchangeRiskScore:
         
         risk_score = min(risk_score, 10)
         
+        # ============================================================
+        # 🔥 FIX DUSDT BUG: Asymmetric liquidity HARUS masuk risk score
+        # Ratio liq ekstrem = exchange risk tinggi walaupun funding netral
+        # ============================================================
+        liq_ratio = 1.0
+        if short_dist > 0 and long_dist > 0:
+            liq_ratio = max(long_dist / short_dist, short_dist / long_dist)
+        
+        if liq_ratio >= 8.0:
+            risk_score += 3
+            risk_breakdown["liq_asymmetry"] = f"EXTREME ratio {liq_ratio:.1f}x (max pain dominant)"
+        elif liq_ratio >= 5.0:
+            risk_score += 2
+            risk_breakdown["liq_asymmetry"] = f"STRONG ratio {liq_ratio:.1f}x"
+        elif liq_ratio >= 3.0:
+            risk_score += 1
+            risk_breakdown["liq_asymmetry"] = f"MODERATE ratio {liq_ratio:.1f}x"
+        
+        if oi_delta > 2.0 and abs(change_5m) > 3.0:
+            risk_score += 1
+            risk_breakdown["oi_growth"] = f"OI naik {oi_delta:.2f}% saat volatile"
+        
+        risk_score = min(risk_score, 10)
+        
+        # ============================================================
+        # 🔥 FIX: safe_direction HARUS mempertimbangkan liq asymmetry
+        # Bukan hanya funding rate!
+        # DUSDT: funding -0.000056 (hampir netral) → lama: NEUTRAL → salah
+        #        tapi long_liq 34% >> short_liq 6% → harusnya: SHORT
+        # ============================================================
         safe_direction = "NEUTRAL"
-        if risk_score >= 5:
-            if funding_rate is not None and funding_rate > 0:
+        
+        # Priority 1: Asymmetric liquidity menentukan safe direction
+        if long_dist > 0 and short_dist > 0:
+            if long_dist > short_dist * 3.0 and volume_ratio < 0.7:
+                # Long liq jauh lebih besar → dump lebih profitable → SHORT safer
                 safe_direction = "SHORT"
-            elif funding_rate is not None and funding_rate < 0:
+                risk_breakdown["safe_dir_reason"] = f"long_liq {long_dist:.1f}% >> short_liq {short_dist:.1f}% (ratio {long_dist/short_dist:.1f}x)"
+            elif short_dist > long_dist * 3.0 and volume_ratio < 0.7:
+                # Short liq jauh lebih besar → pump lebih profitable → LONG safer
+                safe_direction = "LONG"
+                risk_breakdown["safe_dir_reason"] = f"short_liq {short_dist:.1f}% >> long_liq {long_dist:.1f}% (ratio {short_dist/long_dist:.1f}x)"
+        
+        # Priority 2: Funding rate (hanya jika tidak ada asymmetry override)
+        if safe_direction == "NEUTRAL" and risk_score >= 5:
+            if funding_rate is not None and funding_rate > 0.001:
+                safe_direction = "SHORT"
+            elif funding_rate is not None and funding_rate < -0.001:
                 safe_direction = "LONG"
         
         return {
@@ -4681,10 +4763,227 @@ class ExchangeRiskScore:
             "risk_level": "CRITICAL" if risk_score >= 8 else "HIGH" if risk_score >= 5 else "MEDIUM" if risk_score >= 3 else "LOW",
             "risk_breakdown": risk_breakdown,
             "safe_direction": safe_direction,
+            "liq_ratio": liq_ratio,
             "exchange_perspective": (
-                f"Exchange Risk Score: {risk_score}/10 ({', '.join(f'{k}={v}' for k, v in risk_breakdown.items())})"
+                f"Exchange Risk Score: {risk_score}/10 "
+                f"(safe={safe_direction}, liq_ratio={liq_ratio:.1f}x, "
+                f"{', '.join(f'{k}={v}' for k, v in risk_breakdown.items() if k != 'safe_dir_reason')})"
             )
         }
+
+
+class AsymmetricLiquidityMaxPain:
+    """
+    🏦 EXCHANGE MAX PAIN ROUTE — Asymmetric Liquidity Logic
+    
+    DUSDT CASE:
+      Short liq: +5.97%  → reward naik = kecil
+      Long liq:  -34.71% → reward turun = BESAR
+      Volume: 0.34x      → market tipis = mudah digerakkan
+    
+    INSIGHT:
+      Market tidak selalu menuju liquidity TERDEKAT.
+      Market menuju liquidity TERBESAR saat kondisi memungkinkan.
+    
+    RULE:
+      if long_liq > short_liq * RATIO_THRESHOLD and volume_ratio < 0.6:
+          bias = SHORT  (max pain ke bawah lebih profitable)
+      
+      if short_liq > long_liq * RATIO_THRESHOLD and volume_ratio < 0.6:
+          bias = LONG   (max pain ke atas lebih profitable)
+    
+    RATIO_THRESHOLD:
+      - 3x = moderate asymmetry → override jika sinyal lain lemah
+      - 5x = strong asymmetry   → override hampir selalu
+      - 8x = extreme asymmetry  → override selalu (termasuk liq proximity)
+    
+    DUSDT ratio: 34.71 / 5.97 = 5.81x → STRONG ASYMMETRY → harusnya SHORT
+    
+    Priority:
+      - ratio >= 8x: -1104 (setara GlobalPositionImbalance)
+      - ratio >= 5x: -1100 (setara MasterSqueezeRule)
+      - ratio >= 3x: -1075 (setara LiquidityMagnetOverride)
+    
+    GUARDS (jangan override jika):
+      1. short_dist < 1.0 dan ada momentum kuat → squeeze override
+      2. RSI sangat ekstrem (< 10 atau > 90) → momentum lebih dominan
+      3. OFI sangat kuat searah dengan liq terdekat
+      4. Volume spike ekstrem (> 3x) → momentum nyata
+    """
+    
+    # Ratio threshold untuk asymmetric detection
+    RATIO_EXTREME  = 8.0   # 8x lipat → override tertinggi
+    RATIO_STRONG   = 5.0   # 5x lipat → override kuat
+    RATIO_MODERATE = 3.0   # 3x lipat → override moderat
+    
+    @staticmethod
+    def detect(short_dist: float, long_dist: float,
+               volume_ratio: float, change_5m: float,
+               rsi6: float, rsi6_5m: float,
+               ofi_bias: str, ofi_strength: float,
+               funding_rate: float,
+               up_energy: float, down_energy: float,
+               obv_trend: str = "NEUTRAL",
+               agg: float = 0.5) -> dict:
+        
+        # Guard: kedua liq terlalu jauh → tidak relevan
+        if short_dist > 20.0 and long_dist > 20.0:
+            return {"override": False}
+        
+        # Guard: RSI sangat ekstrem → momentum lebih dominan dari max pain
+        if rsi6 < 10 or rsi6 > 90:
+            return {"override": False}
+        
+        # Guard: volume spike nyata → momentum override max pain
+        if volume_ratio > 3.0:
+            return {"override": False}
+        
+        # Hitung ratio asimetri
+        # Case A: long_liq >> short_liq → dump lebih profitable
+        if long_dist > 0 and short_dist > 0:
+            long_to_short_ratio = long_dist / short_dist  # e.g. 34.71/5.97 = 5.81
+            short_to_long_ratio = short_dist / long_dist
+        else:
+            return {"override": False}
+        
+        # ============================================================
+        # CASE A: Long liq JAUH lebih besar → SHORT (dump lebih profitable)
+        # DUSDT exact case: ratio 5.81x
+        # ============================================================
+        if long_dist > short_dist * AsymmetricLiquidityMaxPain.RATIO_MODERATE:
+            
+            # Guard: jika short liq sangat dekat (<1%) dan ada buy momentum → jangan override
+            if short_dist < 1.0 and up_energy > 1.0 and change_5m > 3.0:
+                return {"override": False}
+            
+            # Guard: OFI LONG sangat kuat + no seller → squeeze lebih dominan
+            if (ofi_bias == "LONG" and ofi_strength > 0.8 and 
+                down_energy < 0.01 and short_dist < 2.0):
+                return {"override": False}
+            
+            # Guard: RSI sangat oversold → bouncing dari bottom, bukan max pain
+            if rsi6 < 20 and rsi6_5m < 25:
+                return {"override": False}
+            
+            # Tentukan priority berdasarkan ratio
+            if long_to_short_ratio >= AsymmetricLiquidityMaxPain.RATIO_EXTREME:
+                # 8x+ → override tertinggi, hampir tidak ada kondisi yang menghalangi
+                priority = -1104
+                strength_label = "EXTREME"
+                weight = 10.05
+            elif long_to_short_ratio >= AsymmetricLiquidityMaxPain.RATIO_STRONG:
+                # 5x-8x → override kuat
+                priority = -1100
+                strength_label = "STRONG"
+                weight = 10.0
+            else:
+                # 3x-5x → override moderat (hanya jika volume rendah)
+                if volume_ratio > 0.7:
+                    return {"override": False}  # butuh volume rendah untuk moderate
+                priority = -1075
+                strength_label = "MODERATE"
+                weight = 3.5
+            
+            # Konfirmasi tambahan (tidak wajib, tapi memperkuat)
+            confirmations = []
+            if volume_ratio < 0.5:
+                confirmations.append(f"vol={volume_ratio:.2f}x (sangat rendah→mudah dump)")
+            if funding_rate is not None and funding_rate > 0.0001:
+                confirmations.append(f"funding={funding_rate:.5f} (crowded long)")
+            if obv_trend in ["NEGATIVE_EXTREME", "NEGATIVE"]:
+                confirmations.append("OBV negatif (distribusi)")
+            if change_5m < 0:
+                confirmations.append(f"price down {change_5m:.1f}%")
+            if down_energy > up_energy:
+                confirmations.append(f"down_energy={down_energy:.2f}>up_energy={up_energy:.2f}")
+            if agg < 0.4:
+                confirmations.append(f"agg={agg:.2f} (majority sell)")
+            
+            conf_str = (", ".join(confirmations)) if confirmations else "no extra confirmation"
+            
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"ASYMMETRIC LIQUIDITY MAX PAIN ({strength_label}): "
+                    f"long_liq={long_dist:.2f}% vs short_liq={short_dist:.2f}% "
+                    f"(ratio {long_to_short_ratio:.1f}x) → "
+                    f"dump {long_dist:.1f}% jauh lebih profitable dari squeeze {short_dist:.1f}%, "
+                    f"exchange pilih SHORT | {conf_str}"
+                ),
+                "priority": priority,
+                "liq_ratio": long_to_short_ratio,
+                "weight": weight,
+                "exchange_risk_type": "MAX_PAIN_SHORT"
+            }
+        
+        # ============================================================
+        # CASE B: Short liq JAUH lebih besar → LONG (pump lebih profitable)
+        # Mirror case
+        # ============================================================
+        if short_dist > long_dist * AsymmetricLiquidityMaxPain.RATIO_MODERATE:
+            
+            # Guard: jika long liq sangat dekat (<1%) dan ada sell momentum → jangan override
+            if long_dist < 1.0 and down_energy > 1.0 and change_5m < -3.0:
+                return {"override": False}
+            
+            # Guard: OFI SHORT sangat kuat + no buyer
+            if (ofi_bias == "SHORT" and ofi_strength > 0.8 and 
+                up_energy < 0.01 and long_dist < 2.0):
+                return {"override": False}
+            
+            # Guard: RSI sangat overbought
+            if rsi6 > 80 and rsi6_5m > 75:
+                return {"override": False}
+            
+            if short_to_long_ratio >= AsymmetricLiquidityMaxPain.RATIO_EXTREME:
+                priority = -1104
+                strength_label = "EXTREME"
+                weight = 10.05
+            elif short_to_long_ratio >= AsymmetricLiquidityMaxPain.RATIO_STRONG:
+                priority = -1100
+                strength_label = "STRONG"
+                weight = 10.0
+            else:
+                if volume_ratio > 0.7:
+                    return {"override": False}
+                priority = -1075
+                strength_label = "MODERATE"
+                weight = 3.5
+            
+            confirmations = []
+            if volume_ratio < 0.5:
+                confirmations.append(f"vol={volume_ratio:.2f}x")
+            if funding_rate is not None and funding_rate < -0.0001:
+                confirmations.append(f"funding={funding_rate:.5f} (crowded short)")
+            if obv_trend in ["POSITIVE_EXTREME", "POSITIVE"]:
+                confirmations.append("OBV positif (akumulasi)")
+            if change_5m > 0:
+                confirmations.append(f"price up {change_5m:.1f}%")
+            if up_energy > down_energy:
+                confirmations.append(f"up_energy={up_energy:.2f}>down_energy={down_energy:.2f}")
+            if agg > 0.6:
+                confirmations.append(f"agg={agg:.2f} (majority buy)")
+            
+            conf_str = ", ".join(confirmations) if confirmations else "no extra confirmation"
+            
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": (
+                    f"ASYMMETRIC LIQUIDITY MAX PAIN ({strength_label}): "
+                    f"short_liq={short_dist:.2f}% vs long_liq={long_dist:.2f}% "
+                    f"(ratio {short_to_long_ratio:.1f}x) → "
+                    f"pump {short_dist:.1f}% jauh lebih profitable dari dump {long_dist:.1f}%, "
+                    f"exchange pilih LONG | {conf_str}"
+                ),
+                "priority": priority,
+                "liq_ratio": short_to_long_ratio,
+                "weight": weight,
+                "exchange_risk_type": "MAX_PAIN_LONG"
+            }
+        
+        return {"override": False}
 
 
 class OBVTrendFundingConsensus:
@@ -6100,6 +6399,27 @@ class BinanceAnalyzer:
                             final_phase = "GLOBAL_POSITION_IMBALANCE"
                             priority = global_imbalance["priority"]
                             prob_engine.add(global_imbalance["bias"], 10.05)
+
+                        # ===== PRIORITY -1104/-1100/-1075: ASYMMETRIC LIQUIDITY MAX PAIN =====
+                        # FIX DUSDT: long_liq 34% vs short_liq 6% = ratio 5.8x → SHORT
+                        # Market menuju liquidity TERBESAR, bukan terdekat
+                        if not global_imbalance.get("override"):  # hanya jika GPI tidak trigger
+                            asym_liq = AsymmetricLiquidityMaxPain.detect(
+                                liq["short_dist"], liq["long_dist"],
+                                volume_ratio, change_5m,
+                                rsi6, rsi6_5m,
+                                ofi["bias"], ofi["strength"],
+                                funding_rate,
+                                up_energy, down_energy,
+                                obv_trend, agg
+                            )
+                            if asym_liq["override"]:
+                                final_bias = asym_liq["bias"]
+                                final_reason = asym_liq["reason"]
+                                final_confidence = "ABSOLUTE"
+                                final_phase = "ASYMMETRIC_LIQ_MAX_PAIN"
+                                priority = asym_liq["priority"]
+                                prob_engine.add(asym_liq["bias"], asym_liq["weight"])
 
                         # ===== PRIORITY -1103: EXTREME RSI6 OVERBOUGHT REVERSAL =====
                         extreme_rsi6_rev = ExtremeRsi6OverboughtReversal.detect(
