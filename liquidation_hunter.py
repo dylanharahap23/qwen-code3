@@ -702,12 +702,17 @@ class EmptyBookTrapDetector:
     @staticmethod
     def detect(down_energy: float, up_energy: float, short_dist: float, long_dist: float,
                rsi6_5m: float, volume_ratio: float, obv_trend: str, rsi6: float,
-               ofi_bias: str, ofi_strength: float) -> Dict:
+               ofi_bias: str, ofi_strength: float,
+               funding_rate: float = None) -> Dict:  # ← TAMBAH parameter funding_rate
         if short_dist < 0.5:
             return {"override": False}
 
         # CABANG LONG (bid kosong)
         if down_energy < 0.1 and short_dist < 2.0:
+            # 🔥 PATCH: Jangan paksa LONG saat funding sangat negatif
+            if funding_rate is not None and funding_rate < -0.003:
+                return {"override": False}  # funding sangat negatif = akan dump
+            
             if (rsi6 > 90 or rsi6_5m > 90) and volume_ratio < 1.5:
                 return {"override": False}
             if rsi6 > 75 and obv_trend == "POSITIVE_EXTREME" and volume_ratio < 0.8:
@@ -730,6 +735,10 @@ class EmptyBookTrapDetector:
 
         # CABANG SHORT (ask kosong)
         if up_energy < 0.1 and long_dist < 2.0:
+            # 🔥 PATCH: Jangan paksa SHORT saat funding sangat positif
+            if funding_rate is not None and funding_rate > 0.003:
+                return {"override": False}  # funding sangat positif = akan pump
+            
             if (rsi6 < 10 or rsi6_5m < 10) and volume_ratio < 1.5:
                 return {"override": False}
             if rsi6 < 25 and obv_trend == "NEGATIVE_EXTREME" and volume_ratio < 0.8:
@@ -1089,6 +1098,36 @@ class MasterSqueezeRule:
                 "priority": -1100
             }
 
+        return {"override": False}
+
+
+class ExtremeRsi6OverboughtReversal:
+    """
+    🔥 RSI6 = 100 KILLER: Kondisi overbought absolut — tidak ada ruang naik lagi.
+    
+    Ketika RSI6 menyentuh 99-100, ini adalah kondisi paling ekstrem.
+    Tidak peduli sinyal lain (termasuk funding ban), koreksi PASTI terjadi.
+    
+    Indikator:
+    1. RSI6 >= 99 (overbought absolut)
+    2. Volume turun (< 0.6x) — tidak ada buyer baru
+    3. OFI LONG atau up_energy > 0 — trap sedang berlangsung
+    
+    Priority: -1103 (TERTINGGI MUTLAK — di atas MomentumVolumeSpike -1102!)
+    Karena RSI6 = 100 adalah kondisi matematis ekstrem, tidak bisa dinegosiasikan.
+    """
+    @staticmethod
+    def detect(rsi6: float, volume_ratio: float, ofi_bias: str, up_energy: float) -> Dict:
+        # RSI6 >= 99 adalah kondisi overbought absolut
+        if rsi6 >= 99 and volume_ratio < 0.6:
+            # Jika OFI LONG dan up_energy > 0, ini trap besar
+            # Tidak peduli sinyal lain, harus SHORT
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"EXTREME RSI6 OVERBOUGHT REVERSAL: RSI6={rsi6:.1f} (99+), volume {volume_ratio:.2f}x, OFI {ofi_bias} → blow-off top, immediate dump",
+                "priority": -1103
+            }
         return {"override": False}
 
 
@@ -2205,11 +2244,17 @@ class ExtremeOverboughtContinuation:
     Priority -200
     
     PATCH CUSDT: Tambah funding check dan RSI14 check untuk menghindari blow-off top trap.
+    PATCH RSI6=100: Jangan paksa LONG jika RSI6 > 98 — biarkan ExtremeRsi6OverboughtReversal handle.
     """
     @staticmethod
     def detect(rsi6_5m: float, volume_ratio: float, ofi_bias: str, ofi_strength: float,
                up_energy: float, short_liq: float,
-               funding_rate: float = 0.0, rsi14: float = 50.0) -> Dict:
+               funding_rate: float = 0.0, rsi14: float = 50.0,
+               rsi6: float = 50.0) -> Dict:  # ← TAMBAH parameter rsi6
+        
+        # 🔥 PATCH RSI6=100: Jika RSI6 > 98, jangan paksa LONG
+        if rsi6 > 98:
+            return {"override": False}  # biarkan ExtremeRsi6OverboughtReversal handle
         
         # 🔥 PATCH CUSDT: Jika funding sangat negatif, ini BUKAN squeeze
         # Ini blow-off top yang akan dibalikkan HFT
@@ -5002,7 +5047,8 @@ class BinanceAnalyzer:
                     empty_book = EmptyBookTrapDetector.detect(
                         down_energy, up_energy, liq["short_dist"], liq["long_dist"],
                         rsi6_5m, volume_ratio, obv_trend, rsi6,
-                        ofi["bias"], ofi["strength"]
+                        ofi["bias"], ofi["strength"],
+                        funding_rate  # ← TAMBAHKAN funding_rate
                     )
                     if empty_book["override"]:
                         final_bias = empty_book["bias"]
@@ -5032,11 +5078,37 @@ class BinanceAnalyzer:
 
                         # ===== HIGH PRIORITY OVERRIDES (cascading if-else) =====
 
-                        # ===== PRIORITY -1101: EXTREME FUNDING RATE LONG/SHORT BAN =====
-                        extreme_funding_ban = ExtremeFundingRateLongBan.detect(
-                            funding_rate, rsi6_5m, rsi14, change_5m
+                        # ===== PRIORITY -1103: EXTREME RSI6 OVERBOUGHT REVERSAL =====
+                        extreme_rsi6_rev = ExtremeRsi6OverboughtReversal.detect(
+                            rsi6, volume_ratio, ofi["bias"], up_energy
                         )
-                        if extreme_funding_ban["override"]:
+                        if extreme_rsi6_rev["override"]:
+                            final_bias = extreme_rsi6_rev["bias"]
+                            final_reason = extreme_rsi6_rev["reason"]
+                            final_confidence = "ABSOLUTE"
+                            final_phase = "EXTREME_RSI6_OVERBOUGHT_REVERSAL"
+                            priority = extreme_rsi6_rev["priority"]
+                            prob_engine.add(extreme_rsi6_rev["bias"], 10.02)
+
+                        # ===== PRIORITY -1102: MOMENTUM VOLUME SPIKE PROTECTION =====
+                        elif MomentumVolumeSpikeProtection.detect(
+                                change_5m, latest_volume, volume_ma10,
+                                liq["short_dist"], liq["long_dist"],
+                                obv_trend, up_energy, down_energy)["override"]:
+                            mom_vol_spike = MomentumVolumeSpikeProtection.detect(
+                                change_5m, latest_volume, volume_ma10,
+                                liq["short_dist"], liq["long_dist"],
+                                obv_trend, up_energy, down_energy
+                            )
+                            final_bias = mom_vol_spike["bias"]
+                            final_reason = mom_vol_spike["reason"]
+                            final_confidence = "ABSOLUTE"
+                            final_phase = "MOMENTUM_VOLUME_SPIKE_LOCK"
+                            priority = mom_vol_spike["priority"]
+                            prob_engine.add(mom_vol_spike["bias"], 10.015)
+
+                        # ===== PRIORITY -1101: EXTREME FUNDING RATE LONG/SHORT BAN =====
+                        elif extreme_funding_ban["override"]:
                             final_bias = extreme_funding_ban["bias"]
                             final_reason = extreme_funding_ban["reason"]
                             final_confidence = "ABSOLUTE"
@@ -5069,6 +5141,25 @@ class BinanceAnalyzer:
                             final_phase = "BLOW_OFF_TOP"
                             priority = blow_off["priority"]
                             prob_engine.add(blow_off["bias"], 9.998)
+
+                        # 1.007. LIQUIDITY DIRECTION ABSOLUTE PRIORITY (Priority -1099)
+                        elif LiquidityDirectionAbsolutePriority.detect(
+                                liq["short_dist"], liq["long_dist"],
+                                agg, ofi["bias"], ofi["strength"],
+                                obv_trend, change_5m,
+                                down_energy, up_energy)["override"]:
+                            liq_dir = LiquidityDirectionAbsolutePriority.detect(
+                                liq["short_dist"], liq["long_dist"],
+                                agg, ofi["bias"], ofi["strength"],
+                                obv_trend, change_5m,
+                                down_energy, up_energy
+                            )
+                            final_bias = liq_dir["bias"]
+                            final_reason = liq_dir["reason"]
+                            final_confidence = "ABSOLUTE"
+                            final_phase = "LIQUIDITY_DIRECTION_PRIORITY"
+                            priority = liq_dir["priority"]
+                            prob_engine.add(liq_dir["bias"], 9.997)
 
                         # 1.01. ABSOLUTE AGG OVERRIDE (Priority -1098)
                         elif AbsoluteAggOverride.detect(
@@ -5155,6 +5246,23 @@ class BinanceAnalyzer:
                             final_phase = "HFT_EXPLICIT_DUMP"
                             priority = hft_dump["priority"]
                             prob_engine.add(hft_dump["bias"], 9.95)
+
+                        # 1.055. FUNDING NEGATIVE + OBV POSITIVE SQUEEZE FIRST (Priority -1088)
+                        elif FundingNegativeOBVPositiveSqueezeFirst.detect(
+                                funding_rate, obv_trend, obv_value,
+                                liq["short_dist"], liq["long_dist"],
+                                rsi6_5m, down_energy, change_5m)["override"]:
+                            fund_obv_sqz = FundingNegativeOBVPositiveSqueezeFirst.detect(
+                                funding_rate, obv_trend, obv_value,
+                                liq["short_dist"], liq["long_dist"],
+                                rsi6_5m, down_energy, change_5m
+                            )
+                            final_bias = fund_obv_sqz["bias"]
+                            final_reason = fund_obv_sqz["reason"]
+                            final_confidence = "ABSOLUTE"
+                            final_phase = "FUNDING_NEG_OBV_POS_SQUEEZE_FIRST"
+                            priority = fund_obv_sqz["priority"]
+                            prob_engine.add(fund_obv_sqz["bias"], 9.93)
 
                         # 1.06. EXTREME FUNDING RATE TRAP (Priority -1085)
                         elif ExtremeFundingRateTrap.detect(
@@ -6034,7 +6142,7 @@ class BinanceAnalyzer:
                     extreme_overbought_cont = ExtremeOverboughtContinuation.detect(
                         rsi6_5m, volume_ratio, ofi["bias"], ofi["strength"],
                         up_energy, liq["short_dist"],
-                        funding_rate=funding_rate or 0.0, rsi14=rsi14
+                        funding_rate=funding_rate or 0.0, rsi14=rsi14, rsi6=rsi6
                     )
                     if extreme_overbought_cont["override"]:
                         final_bias = extreme_overbought_cont["bias"]
