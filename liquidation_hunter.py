@@ -1056,7 +1056,7 @@ class EmptyBookMomentum:
 class MasterSqueezeRule:
     """
     💎 MASTER RULE: GOLDEN RULE
-    Priority -1100 (tertinggi absolut)
+    Priority -1100 (sekarang di bawah ExtremeFundingRateLongBan -1101)
     """
     @staticmethod
     def detect(short_dist: float, long_dist: float, change_5m: float,
@@ -1089,6 +1089,132 @@ class MasterSqueezeRule:
                 "priority": -1100
             }
 
+        return {"override": False}
+
+
+class ExtremeFundingRateLongBan:
+    """
+    🔥 CUSDT KILLER: Funding rate < -0.003 = LONG BAN ABSOLUT
+    
+    Pada level ini, longs membayar 0.3%+ per 8 jam.
+    HFT PASTI akan dump untuk paksa liquidasi longs.
+    Tidak ada sinyal teknikal yang bisa override ini.
+    
+    Skala funding rate:
+    - Normal:    ±0.0001
+    - Elevated:  ±0.001  
+    - Extreme:   ±0.003  ← LONG BAN threshold
+    - Critical:  ±0.005  ← CUSDT level
+    
+    Priority: -1101 (di atas MasterSqueezeRule -1100!)
+    Ini satu-satunya sinyal yang override MasterSqueezeRule.
+    """
+    @staticmethod
+    def detect(funding_rate: float, rsi6_5m: float,
+               rsi14: float, change_5m: float) -> Dict:
+        
+        if funding_rate is None:
+            return {"override": False}
+        
+        # LONG BAN: Funding sangat negatif = semua longs terperangkap
+        if funding_rate < -0.003:
+            # Jika RSI juga overbought di semua TF = konfirmasi blow-off top
+            if rsi6_5m > 70 or rsi14 > 70:
+                return {
+                    "override": True,
+                    "bias": "SHORT",
+                    "reason": f"EXTREME FUNDING LONG BAN: funding={funding_rate:.4f} (longs paying {abs(funding_rate)*100:.3f}%/8h), RSI5m={rsi6_5m:.1f}, RSI14={rsi14:.1f} overbought → HFT WILL DUMP to liquidate trapped longs, NO LONG ALLOWED",
+                    "priority": -1101
+                }
+            # Bahkan tanpa RSI overbought, funding < -0.005 = ban absolut
+            if funding_rate < -0.005:
+                return {
+                    "override": True,
+                    "bias": "SHORT",
+                    "reason": f"CRITICAL FUNDING LONG BAN: funding={funding_rate:.4f} = {abs(funding_rate)*100:.3f}%/8h → forced liquidation incoming regardless of other signals",
+                    "priority": -1101
+                }
+        
+        # SHORT BAN: Funding sangat positif = semua shorts terperangkap
+        if funding_rate > 0.003:
+            if rsi6_5m < 30 or rsi14 < 30:
+                return {
+                    "override": True,
+                    "bias": "LONG",
+                    "reason": f"EXTREME FUNDING SHORT BAN: funding={funding_rate:.4f} (shorts paying {funding_rate*100:.3f}%/8h), RSI5m={rsi6_5m:.1f} oversold → HFT WILL PUMP to liquidate trapped shorts, NO SHORT ALLOWED",
+                    "priority": -1101
+                }
+            if funding_rate > 0.005:
+                return {
+                    "override": True,
+                    "bias": "LONG",
+                    "reason": f"CRITICAL FUNDING SHORT BAN: funding={funding_rate:.4f} = {funding_rate*100:.3f}%/8h → forced short liquidation incoming",
+                    "priority": -1101
+                }
+        
+        return {"override": False}
+
+
+class BlowOffTopDetector:
+    """
+    🔥 RSI_5m > 90 bukan squeeze continuation — ini BLOW-OFF TOP.
+    
+    Perbedaan squeeze vs blow-off:
+    - Squeeze:    RSI naik karena buying pressure nyata, short liq dekat
+    - Blow-off:   RSI sangat tinggi karena FOMO, volume turun, funding negatif
+    
+    Indikator blow-off top:
+    1. RSI_5m > 90 (ekstrem parah)
+    2. RSI_14 > 75 (multi-bar overbought)  
+    3. Volume turun (< 0.6x) — tidak ada buyer baru
+    4. Funding negatif (longs sudah crowded)
+    5. change_5m masih positif (momentum melambat)
+    
+    Priority: -1099 (tepat di bawah ExtremeFundingLongBan -1101)
+    Ini lebih tinggi dari MasterSqueezeRule -1100.
+    """
+    @staticmethod
+    def detect(rsi6_5m: float, rsi14: float, volume_ratio: float,
+               funding_rate: float, change_5m: float,
+               short_dist: float, up_energy: float) -> Dict:
+        
+        if funding_rate is None:
+            return {"override": False}
+        
+        # Blow-off top: semua kondisi terpenuhi
+        is_blow_off = (
+            rsi6_5m > 90 and
+            rsi14 > 70 and
+            volume_ratio < 0.6 and
+            funding_rate < -0.001 and  # ada crowding
+            change_5m > 0              # masih naik = FOMO terakhir
+        )
+        
+        if is_blow_off:
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"Blow-off top: RSI5m={rsi6_5m:.1f}>90, RSI14={rsi14:.1f}>70, volume={volume_ratio:.2f}x turun, funding={funding_rate:.4f} negatif → FOMO top, reversal brutal incoming",
+                "priority": -1099
+            }
+        
+        # Mirror: blow-off bottom (capitulation)
+        is_capitulation = (
+            rsi6_5m < 10 and
+            rsi14 < 30 and
+            volume_ratio < 0.6 and
+            funding_rate > 0.001 and
+            change_5m < 0
+        )
+        
+        if is_capitulation:
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": f"Capitulation bottom: RSI5m={rsi6_5m:.1f}<10, RSI14={rsi14:.1f}<30, volume={volume_ratio:.2f}x turun, funding={funding_rate:.4f} positif → panic bottom, bounce brutal incoming",
+                "priority": -1099
+            }
+        
         return {"override": False}
 
 
@@ -2062,22 +2188,33 @@ class ExtremeOverboughtContinuation:
     """
     🔥 Memaksa LONG ketika overbought ekstrem (RSI5m > 80), volume sangat rendah (<0.5x).
     Priority -200
+    
+    PATCH CUSDT: Tambah funding check dan RSI14 check untuk menghindari blow-off top trap.
     """
     @staticmethod
     def detect(rsi6_5m: float, volume_ratio: float, ofi_bias: str, ofi_strength: float,
-               up_energy: float, short_liq: float) -> Dict:
-        if (rsi6_5m > 80
-                and volume_ratio < 0.5
-                and ofi_bias == "LONG"
-                and ofi_strength > 0.5
-                and up_energy > 0):
+               up_energy: float, short_liq: float,
+               funding_rate: float = 0.0, rsi14: float = 50.0) -> Dict:
+        
+        # 🔥 PATCH CUSDT: Jika funding sangat negatif, ini BUKAN squeeze
+        # Ini blow-off top yang akan dibalikkan HFT
+        if funding_rate is not None and funding_rate < -0.002:
+            return {"override": False}
+        
+        # 🔥 PATCH: RSI14 > 80 + RSI5m > 90 = overbought semua TF = reversal
+        if rsi14 > 80 and rsi6_5m > 90:
+            return {"override": False}  # biarkan BlowOffTop yang handle
+        
+        # Logic asli tetap
+        if (rsi6_5m > 80 and
+            volume_ratio < 0.5 and
+            ofi_bias == "LONG" and
+            ofi_strength > 0.5 and
+            up_energy > 0):
             return {
                 "override": True,
                 "bias": "LONG",
-                "reason": (
-                    f"Extreme overbought with strong OFI LONG: RSI5m {rsi6_5m:.1f}, "
-                    f"volume {volume_ratio:.2f}x, OFI strength {ofi_strength:.2f} → squeeze continuation"
-                ),
+                "reason": f"Extreme overbought with strong OFI LONG: RSI5m {rsi6_5m:.1f}, volume {volume_ratio:.2f}x, OFI strength {ofi_strength:.2f} → squeeze continuation",
                 "priority": -200
             }
         return {"override": False}
@@ -4565,6 +4702,12 @@ class BinanceAnalyzer:
                 up_energy, agg
             )
 
+            # ========== Master Squeeze Rule (untuk digunakan di priority ladder) ==========
+            master_squeeze = MasterSqueezeRule.detect(
+                liq["short_dist"], liq["long_dist"], change_5m,
+                down_energy, up_energy, volume_ratio
+            )
+
             # ========== Overbought / Oversold Distribution Traps ==========
             overbought_trap = OverboughtDistributionTrap.detect(
                 rsi6, liq["short_dist"], liq["long_dist"], volume_ratio,
@@ -4627,18 +4770,43 @@ class BinanceAnalyzer:
 
                         # ===== HIGH PRIORITY OVERRIDES (cascading if-else) =====
 
-                        # 1. MASTER SQUEEZE RULE (Priority -1100)
-                        master_squeeze = MasterSqueezeRule.detect(
-                            liq["short_dist"], liq["long_dist"], change_5m,
-                            down_energy, up_energy, volume_ratio
+                        # ===== PRIORITY -1101: EXTREME FUNDING RATE LONG/SHORT BAN =====
+                        extreme_funding_ban = ExtremeFundingRateLongBan.detect(
+                            funding_rate, rsi6_5m, rsi14, change_5m
                         )
-                        if master_squeeze["override"]:
+                        if extreme_funding_ban["override"]:
+                            final_bias = extreme_funding_ban["bias"]
+                            final_reason = extreme_funding_ban["reason"]
+                            final_confidence = "ABSOLUTE"
+                            final_phase = "EXTREME_FUNDING_BAN"
+                            priority = extreme_funding_ban["priority"]
+                            prob_engine.add(extreme_funding_ban["bias"], 10.01)
+
+                        # 1. MASTER SQUEEZE RULE (Priority -1100)
+                        elif master_squeeze["override"]:
                             final_bias = master_squeeze["bias"]
                             final_reason = master_squeeze["reason"]
                             final_confidence = "ABSOLUTE"
                             final_phase = "MASTER_SQUEEZE_RULE"
                             priority = master_squeeze["priority"]
                             prob_engine.add(master_squeeze["bias"], 10.0)
+
+                        # 1.005. BLOW-OFF TOP DETECTOR (Priority -1099)
+                        elif BlowOffTopDetector.detect(
+                                rsi6_5m, rsi14, volume_ratio,
+                                funding_rate or 0, change_5m,
+                                liq["short_dist"], up_energy)["override"]:
+                            blow_off = BlowOffTopDetector.detect(
+                                rsi6_5m, rsi14, volume_ratio,
+                                funding_rate or 0, change_5m,
+                                liq["short_dist"], up_energy
+                            )
+                            final_bias = blow_off["bias"]
+                            final_reason = blow_off["reason"]
+                            final_confidence = "ABSOLUTE"
+                            final_phase = "BLOW_OFF_TOP"
+                            priority = blow_off["priority"]
+                            prob_engine.add(blow_off["bias"], 9.998)
 
                         # 1.01. ABSOLUTE AGG OVERRIDE (Priority -1098)
                         elif AbsoluteAggOverride.detect(
@@ -5601,7 +5769,8 @@ class BinanceAnalyzer:
                 else:
                     extreme_overbought_cont = ExtremeOverboughtContinuation.detect(
                         rsi6_5m, volume_ratio, ofi["bias"], ofi["strength"],
-                        up_energy, liq["short_dist"]
+                        up_energy, liq["short_dist"],
+                        funding_rate=funding_rate or 0.0, rsi14=rsi14
                     )
                     if extreme_overbought_cont["override"]:
                         final_bias = extreme_overbought_cont["bias"]
