@@ -1442,6 +1442,69 @@ class ExtremeOverboughtIgnoreLiquidity:
         return {"override": False}
 
 
+class FreshShortTrapDetector:
+    """
+    🔥 Mendeteksi "Fresh Short Trap" - short baru yang masuk setelah dump panjang.
+    
+    Binance logic: BUKAN lihat mana likuiditas terdekat (lama), tapi lihat
+    "SIAPA YANG BARU MASUK DAN BISA DIBUNUH SEKARANG"
+    
+    Skenario khas (ARIA, DUSDT, AIOT):
+    1. Market sudah dump panjang (change_5m < -2.0)
+    2. RSI oversold (rsi6 < 30)
+    3. OFI mulai LONG (buyer masuk, market STOP turun)
+    4. Volume rendah (<0.8) → market tipis, mudah dipompa
+    5. Ada short liq yang lebih dekat? TIDAK relevan - fresh short yang baru masuk targetnya
+    
+    Priority: -1082 (antara ExtremeOversoldIgnoreLiquidity -1080 dan ExtremeFundingRateTrap -1085)
+    """
+    @staticmethod
+    def detect(change_5m: float, rsi6: float, ofi_bias: str, volume_ratio: float,
+               long_liq: float, short_liq: float, agg: float, up_energy: float,
+               down_energy: float = 0.0) -> Dict:
+        # Kondisi utama: fresh short trap (LONG bias)
+        if (change_5m < -2.0          # baru dump
+                and rsi6 < 30          # oversold
+                and ofi_bias == "LONG" # buyer mulai masuk (market STOP turun)
+                and volume_ratio < 0.8 # volume rendah (market tipis)
+                and agg < 0.7):        # tidak terlalu banyak buy (bukan FOMO besar)
+            # Pengecualian: jika long liq sudah sangat dekat (<1.5%) dan up_energy tinggi -> bisa jadi short squeeze biasa
+            if long_liq < 1.5 and up_energy > 1.0:
+                return {"override": False}
+            
+            # Bonus: jika ada short liq juga dekat, tapi fresh short sudah masuk -> tetap LONG
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": (
+                    f"Fresh Short Trap: market dump {change_5m:.1f}%, RSI {rsi6:.1f} oversold, "
+                    f"OFI LONG {ofi_bias}, volume rendah ({volume_ratio:.2f}x) → short baru masuk, "
+                    f"Binance akan pump untuk bunuh mereka"
+                ),
+                "priority": -1082
+            }
+        
+        # Mirror untuk fresh long trap (jarang, tapi simetris)
+        if (change_5m > 2.0
+                and rsi6 > 70
+                and ofi_bias == "SHORT"
+                and volume_ratio < 0.8
+                and agg > 0.3):
+            if short_liq < 1.5 and down_energy > 1.0:
+                return {"override": False}
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"Fresh Long Trap: market pump {change_5m:.1f}%, RSI {rsi6:.1f} overbought, "
+                    f"OFI SHORT, volume rendah → fresh long masuk, Binance akan dump"
+                ),
+                "priority": -1082
+            }
+        
+        return {"override": False}
+
+
 class CrowdedLongDistribution:
     """
     🔥 Deteksi ketika semua orang sudah LONG → paksa SHORT.
@@ -6803,6 +6866,21 @@ class BinanceAnalyzer:
                             final_phase = "EXTREME_OVERBOUGHT_IGNORE_LIQUIDITY"
                             priority = extreme_overbought_ignore["priority"]
                             prob_engine.add(extreme_overbought_ignore["bias"], 9.9)
+
+                        # 🔥 1.21. FRESH SHORT TRAP (Priority -1082) - NEW
+                        elif FreshShortTrapDetector.detect(
+                                change_5m, rsi6, ofi["bias"], volume_ratio,
+                                liq["long_dist"], liq["short_dist"], agg, up_energy, down_energy)["override"]:
+                            fresh_short_trap = FreshShortTrapDetector.detect(
+                                change_5m, rsi6, ofi["bias"], volume_ratio,
+                                liq["long_dist"], liq["short_dist"], agg, up_energy, down_energy
+                            )
+                            final_bias = fresh_short_trap["bias"]
+                            final_reason = fresh_short_trap["reason"]
+                            final_confidence = "ABSOLUTE"
+                            final_phase = "FRESH_SHORT_TRAP"
+                            priority = fresh_short_trap["priority"]
+                            prob_engine.add(fresh_short_trap["bias"], 9.85)
 
                         # 1.3. CROWDED LONG DISTRIBUTION (Priority -165)
                         elif CrowdedLongDistribution.detect(
