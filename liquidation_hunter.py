@@ -4207,7 +4207,7 @@ class FundingNegativeOBVPositiveSqueezeFirst:
     def detect(funding_rate: float, obv_trend: str, obv_value: float,
                short_dist: float, long_dist: float,
                rsi6_5m: float, down_energy: float,
-               change_5m: float) -> Dict:
+               change_5m: float, up_energy: float = 0.0) -> Dict:
         
         if funding_rate is None:
             return {"override": False}
@@ -5091,15 +5091,12 @@ class BinanceAnalyzer:
                             prob_engine.add(extreme_rsi6_rev["bias"], 10.02)
 
                         # ===== PRIORITY -1102: MOMENTUM VOLUME SPIKE PROTECTION =====
-                        elif MomentumVolumeSpikeProtection.detect(
-                                change_5m, latest_volume, volume_ma10,
-                                liq["short_dist"], liq["long_dist"],
-                                obv_trend, up_energy, down_energy)["override"]:
-                            mom_vol_spike = MomentumVolumeSpikeProtection.detect(
-                                change_5m, latest_volume, volume_ma10,
-                                liq["short_dist"], liq["long_dist"],
-                                obv_trend, up_energy, down_energy
-                            )
+                        mom_vol_spike = MomentumVolumeSpikeProtection.detect(
+                            change_5m, latest_volume, volume_ma10,
+                            liq["short_dist"], liq["long_dist"],
+                            obv_trend, up_energy, down_energy
+                        )
+                        if mom_vol_spike["override"]:
                             final_bias = mom_vol_spike["bias"]
                             final_reason = mom_vol_spike["reason"]
                             final_confidence = "ABSOLUTE"
@@ -5107,8 +5104,13 @@ class BinanceAnalyzer:
                             priority = mom_vol_spike["priority"]
                             prob_engine.add(mom_vol_spike["bias"], 10.015)
 
+                        # ===== DEFINE EXTREME FUNDING BAN BEFORE USE =====
+                        extreme_funding_ban = ExtremeFundingRateLongBan.detect(
+                            funding_rate, rsi6_5m, rsi14, change_5m
+                        )
+
                         # ===== PRIORITY -1101: EXTREME FUNDING RATE LONG/SHORT BAN =====
-                        elif extreme_funding_ban["override"]:
+                        if extreme_funding_ban["override"]:
                             final_bias = extreme_funding_ban["bias"]
                             final_reason = extreme_funding_ban["reason"]
                             final_confidence = "ABSOLUTE"
@@ -5251,11 +5253,11 @@ class BinanceAnalyzer:
                         elif FundingNegativeOBVPositiveSqueezeFirst.detect(
                                 funding_rate, obv_trend, obv_value,
                                 liq["short_dist"], liq["long_dist"],
-                                rsi6_5m, down_energy, change_5m)["override"]:
+                                rsi6_5m, down_energy, change_5m, up_energy)["override"]:
                             fund_obv_sqz = FundingNegativeOBVPositiveSqueezeFirst.detect(
                                 funding_rate, obv_trend, obv_value,
                                 liq["short_dist"], liq["long_dist"],
-                                rsi6_5m, down_energy, change_5m
+                                rsi6_5m, down_energy, change_5m, up_energy
                             )
                             final_bias = fund_obv_sqz["bias"]
                             final_reason = fund_obv_sqz["reason"]
