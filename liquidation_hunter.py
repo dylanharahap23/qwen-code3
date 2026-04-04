@@ -3975,9 +3975,62 @@ class LiquidityDirectionAbsolutePriority:
     def detect(short_dist: float, long_dist: float,
                agg: float, ofi_bias: str, ofi_strength: float,
                obv_trend: str, change_5m: float,
-               down_energy: float, up_energy: float) -> Dict:
+               down_energy: float, up_energy: float,
+               funding_rate: float = 0.0,      # ← TAMBAH
+               obv_value: float = 0.0,          # ← TAMBAH
+               rsi6: float = 50.0,              # ← TAMBAH
+               rsi6_5m: float = 50.0) -> Dict:  # ← TAMBAH
         
         diff = abs(short_dist - long_dist)
+
+        # ============================================================
+        # 🔥 PATCH SKYAIUSDT: Guard OBV + Funding sebelum memaksa arah
+        # ============================================================
+
+        # Guard 1: OBV NEGATIVE_EXTREME + funding crowded long
+        # = distribusi aktif, long_liq akan ditembus bukan di-bounce
+        if (obv_trend == "NEGATIVE_EXTREME" and
+            funding_rate > 0.0005 and       # crowded long
+            obv_value < -30_000_000):       # distribusi besar
+            # Dalam kondisi ini, long_liq bukan target bounce
+            # tapi rintangan yang akan ditembus HFT saat dump
+            # → paksa SHORT jika long_liq lebih dekat
+            if long_dist < short_dist and long_dist < 5.0:
+                return {
+                    "override": True,
+                    "bias": "SHORT",
+                    "reason": (
+                        f"OBV distribution + crowded long override: "
+                        f"OBV={obv_value:,.0f} (NEGATIVE_EXTREME), "
+                        f"funding={funding_rate:.4f} (crowded long), "
+                        f"long liq {long_dist:.2f}% → HFT akan DUMP melewati long liq, bukan bounce"
+                    ),
+                    "priority": -1099
+                }
+            return {"override": False}  # biarkan logik lain tangkap
+
+        # Guard 2: OBV NEGATIVE_EXTREME + RSI netral + harga turun
+        # = falling distribution, tidak ada bounce
+        if (obv_trend == "NEGATIVE_EXTREME" and
+            obv_value < -50_000_000 and
+            rsi6 < 45 and           # tidak oversold = tidak ada bounce catalyst
+            change_5m < 0):         # harga sudah turun
+            if long_dist < short_dist:
+                return {
+                    "override": True,
+                    "bias": "SHORT",
+                    "reason": (
+                        f"OBV falling distribution: OBV={obv_value:,.0f}, "
+                        f"RSI {rsi6:.1f} netral, price down {change_5m:.1f}% → "
+                        f"tidak ada catalyst bounce, long liq akan ditembus"
+                    ),
+                    "priority": -1099
+                }
+            return {"override": False}
+
+        # ============================================================
+        # Logic asli (hanya jalan jika guard di atas tidak trigger)
+        # ============================================================
         
         # Long liq jauh lebih dekat → HFT dump dulu
         if (long_dist < short_dist and
@@ -4020,6 +4073,155 @@ class LiquidityDirectionAbsolutePriority:
                     "priority": -1099
                 }
         
+        return {"override": False}
+
+
+class OBVDistributionFundingTrap:
+    """
+    🔥 SKYAIUSDT EXACT PATTERN:
+    
+    Kombinasi paling berbahaya yang diabaikan sistem:
+    OBV NEGATIVE_EXTREME + Funding positif (crowded long) + RSI netral
+    
+    Ini adalah "Distribution Trap":
+    - OBV negatif = smart money sudah distribusi (jual perlahan)
+    - Funding positif = retail masih optimis, banyak long terbuka  
+    - RSI netral = tidak ada sinyal ekstrem yang visible → retail tidak curiga
+    - long_liq dekat = HFT akan dump untuk sweep long stop
+    
+    Berbeda dengan kondisi bounce normal:
+    - Bounce: OBV positif/netral + RSI oversold + down_energy tinggi
+    - Distribution trap: OBV negatif + RSI netral + funding positif
+    
+    HFT menunggu kondisi ini: retail beli karena "long_liq dekat = bounce",
+    padahal itu justru target dump.
+    
+    Priority: -1100 (sama dengan MasterSqueezeRule)
+    """
+    @staticmethod
+    def detect(obv_trend: str, obv_value: float,
+               funding_rate: float, rsi6: float, rsi6_5m: float,
+               long_dist: float, short_dist: float,
+               agg: float, change_5m: float,
+               down_energy: float, volume_ratio: float) -> Dict:
+
+        if funding_rate is None:
+            return {"override": False}
+
+        # Core pattern: OBV distribusi + crowded long + RSI netral
+        obv_distributing = (
+            obv_trend in ["NEGATIVE_EXTREME", "NEGATIVE"] and
+            obv_value < -30_000_000
+        )
+        crowded_long = funding_rate > 0.0005
+        rsi_neutral = 30 < rsi6 < 60  # tidak oversold, tidak overbought
+        rsi5m_neutral = 30 < rsi6_5m < 65
+
+        if (obv_distributing and
+            crowded_long and
+            rsi_neutral and
+            rsi5m_neutral and
+            long_dist < 5.0):         # ada long liq yang bisa disweep
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"OBV Distribution + Funding Trap: "
+                    f"OBV={obv_value:,.0f} ({obv_trend}), "
+                    f"funding={funding_rate:.4f} (crowded long), "
+                    f"RSI={rsi6:.1f} netral (retail tidak curiga), "
+                    f"long liq {long_dist:.2f}% → HFT dump untuk sweep long stop"
+                ),
+                "priority": -1100
+            }
+
+        # Mirror: OBV akumulasi + crowded short + RSI netral = pump trap
+        obv_accumulating = (
+            obv_trend in ["POSITIVE_EXTREME", "POSITIVE"] and
+            obv_value > 30_000_000
+        )
+        crowded_short = funding_rate < -0.0005
+        rsi_neutral_high = 40 < rsi6 < 70
+
+        if (obv_accumulating and
+            crowded_short and
+            rsi_neutral_high and
+            short_dist < 5.0):
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": (
+                    f"OBV Accumulation + Funding Trap: "
+                    f"OBV={obv_value:,.0f} ({obv_trend}), "
+                    f"funding={funding_rate:.4f} (crowded short), "
+                    f"RSI={rsi6:.1f} netral, "
+                    f"short liq {short_dist:.2f}% → HFT pump untuk sweep short stop"
+                ),
+                "priority": -1100
+            }
+
+        return {"override": False}
+
+
+class OBVTrendFundingConsensus:
+    """
+    🔥 Ketika OBV trend dan funding rate menunjuk arah yang SAMA,
+    ini adalah sinyal consensus yang sangat kuat.
+    
+    Rule:
+    - OBV NEGATIVE + funding positif (crowded long) = SHORT kuat
+      (Smart money jual, retail masih beli = distribusi)
+    - OBV POSITIVE + funding negatif (crowded short) = LONG kuat  
+      (Smart money beli, retail masih jual = akumulasi)
+    
+    Ini harus override sebagian besar sinyal lain karena mencerminkan
+    posisi smart money yang sebenarnya.
+    
+    Priority: -213 (di atas AskBidSlopeImbalance -210)
+    """
+    @staticmethod
+    def detect(obv_trend: str, obv_value: float,
+               funding_rate: float, rsi6: float,
+               long_dist: float, short_dist: float,
+               volume_ratio: float, change_5m: float) -> Dict:
+
+        if funding_rate is None:
+            return {"override": False}
+
+        # OBV negatif + funding positif = distribusi aktif
+        if (obv_trend in ["NEGATIVE_EXTREME", "NEGATIVE"] and
+            obv_value < -20_000_000 and
+            funding_rate > 0.0003 and
+            rsi6 < 55 and              # tidak oversold (ada ruang turun)
+            volume_ratio < 0.7):       # volume rendah = distribusi diam-diam
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"OBV-Funding consensus SHORT: OBV={obv_value:,.0f} distributing, "
+                    f"funding={funding_rate:.4f} crowded long → "
+                    f"smart money selling while retail holds long"
+                ),
+                "priority": -213
+            }
+
+        # OBV positif + funding negatif = akumulasi aktif
+        if (obv_trend in ["POSITIVE_EXTREME", "POSITIVE"] and
+            obv_value > 20_000_000 and
+            funding_rate < -0.0003 and
+            rsi6 > 45 and
+            volume_ratio < 0.7):
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": (
+                    f"OBV-Funding consensus LONG: OBV={obv_value:,.0f} accumulating, "
+                    f"funding={funding_rate:.4f} crowded short → "
+                    f"smart money buying while retail holds short"
+                ),
+                "priority": -213
+            }
+
         return {"override": False}
 
 
@@ -5336,6 +5538,27 @@ class BinanceAnalyzer:
                             priority = master_squeeze["priority"]
                             prob_engine.add(master_squeeze["bias"], 10.0)
 
+                        # 1.006. OBV DISTRIBUTION FUNDING TRAP (Priority -1100)
+                        elif OBVDistributionFundingTrap.detect(
+                                obv_trend, obv_value,
+                                funding_rate or 0.0, rsi6, rsi6_5m,
+                                liq["long_dist"], liq["short_dist"],
+                                agg, change_5m,
+                                down_energy, volume_ratio)["override"]:
+                            obv_fund_trap = OBVDistributionFundingTrap.detect(
+                                obv_trend, obv_value,
+                                funding_rate or 0.0, rsi6, rsi6_5m,
+                                liq["long_dist"], liq["short_dist"],
+                                agg, change_5m,
+                                down_energy, volume_ratio
+                            )
+                            final_bias = obv_fund_trap["bias"]
+                            final_reason = obv_fund_trap["reason"]
+                            final_confidence = "ABSOLUTE"
+                            final_phase = "OBV_DISTRIBUTION_FUNDING_TRAP"
+                            priority = obv_fund_trap["priority"]
+                            prob_engine.add(obv_fund_trap["bias"], 10.0)
+
                         # 1.005. BLOW-OFF TOP DETECTOR (Priority -1099)
                         elif BlowOffTopDetector.detect(
                                 rsi6_5m, rsi14, volume_ratio,
@@ -5358,12 +5581,21 @@ class BinanceAnalyzer:
                                 liq["short_dist"], liq["long_dist"],
                                 agg, ofi["bias"], ofi["strength"],
                                 obv_trend, change_5m,
-                                down_energy, up_energy)["override"]:
+                                down_energy, up_energy,
+                                funding_rate=funding_rate or 0.0,  # ← TAMBAH
+                                obv_value=obv_value,               # ← TAMBAH
+                                rsi6=rsi6,                         # ← TAMBAH
+                                rsi6_5m=rsi6_5m                    # ← TAMBAH
+                            )["override"]:
                             liq_dir = LiquidityDirectionAbsolutePriority.detect(
                                 liq["short_dist"], liq["long_dist"],
                                 agg, ofi["bias"], ofi["strength"],
                                 obv_trend, change_5m,
-                                down_energy, up_energy
+                                down_energy, up_energy,
+                                funding_rate=funding_rate or 0.0,  # ← TAMBAH
+                                obv_value=obv_value,               # ← TAMBAH
+                                rsi6=rsi6,                         # ← TAMBAH
+                                rsi6_5m=rsi6_5m                    # ← TAMBAH
                             )
                             final_bias = liq_dir["bias"]
                             final_reason = liq_dir["reason"]
