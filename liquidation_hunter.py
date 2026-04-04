@@ -5378,6 +5378,71 @@ class FundingNegativeShortSqueezeOverride:
         return {"override": False}
 
 
+class ProfitImbalanceReversal:
+    """
+    🔥 EXCHANGE NEUTRALIZATION LOGIC (Dosen's Insight)
+    
+    Binance tidak peduli arah, tapi peduli agar tidak ada side yang terlalu menang.
+    Jika satu sisi (misal long) sudah hampir mati (long liq kecil, harga turun, RSI oversold),
+    maka exchange akan reverse untuk membunuh short yang sedang profit.
+    
+    Kondisi LONG (setelah dump):
+    - change_5m < -2.5%   (sudah turun signifikan)
+    - rsi6 < 25           (oversold)
+    - long_liq < 2.0%     (long tinggal sedikit → hampir habis)
+    - volume_ratio < 0.8  (tidak ada panic volume, market tipis → mudah dibalik)
+    
+    Kondisi SHORT (setelah pump):
+    - change_5m > 2.5%    (sudah naik signifikan)
+    - rsi6 > 75           (overbought)
+    - short_liq < 2.0%    (short tinggal sedikit)
+    - volume_ratio < 0.8
+    
+    Priority: -1105 (TERTINGGI, di atas semua detector lain)
+    Karena ini adalah kebijakan exchange level tertinggi.
+    """
+    @staticmethod
+    def detect(change_5m: float, rsi6: float,
+               long_liq: float, short_liq: float,
+               volume_ratio: float) -> Dict:
+        
+        # Kasus A: Market sudah dump, long hampir mati → exchange akan pump (LONG)
+        if (change_5m < -2.5 and
+            rsi6 < 25 and
+            long_liq < 2.0 and
+            volume_ratio < 0.8):
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": (
+                    f"PROFIT IMBALANCE REVERSAL (Exchange Neutralization): "
+                    f"price dumped {change_5m:.1f}%, RSI {rsi6:.1f} oversold, "
+                    f"long liq {long_liq:.2f}% hampir habis → long side sudah mati, "
+                    f"exchange akan reverse untuk bunuh short yang profit → LONG"
+                ),
+                "priority": -1105
+            }
+        
+        # Kasus B: Market sudah pump, short hampir mati → exchange akan dump (SHORT)
+        if (change_5m > 2.5 and
+            rsi6 > 75 and
+            short_liq < 2.0 and
+            volume_ratio < 0.8):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"PROFIT IMBALANCE REVERSAL (Exchange Neutralization): "
+                    f"price pumped {change_5m:.1f}%, RSI {rsi6:.1f} overbought, "
+                    f"short liq {short_liq:.2f}% hampir habis → short side sudah mati, "
+                    f"exchange akan reverse untuk bunuh long yang profit → SHORT"
+                ),
+                "priority": -1105
+            }
+        
+        return {"override": False}
+
+
 class OFISpoofingDetector:
     """
     🔥 RLSUSDT PATTERN: OFI SHORT 1.00 tapi sebenarnya LONG
@@ -6387,12 +6452,27 @@ class BinanceAnalyzer:
 
                         # ===== HIGH PRIORITY OVERRIDES (cascading if-else) =====
 
+                        # ===== PRIORITY -1105: PROFIT IMBALANCE REVERSAL (EXCHANGE NEUTRALIZATION) =====
+                        # TERTINGGI - di atas semua detector lain karena ini adalah kebijakan exchange level tertinggi
+                        profit_reversal = ProfitImbalanceReversal.detect(
+                            change_5m, rsi6,
+                            liq["long_dist"], liq["short_dist"],
+                            volume_ratio
+                        )
+                        if profit_reversal["override"]:
+                            final_bias = profit_reversal["bias"]
+                            final_reason = profit_reversal["reason"]
+                            final_confidence = "ABSOLUTE"
+                            final_phase = "PROFIT_IMBALANCE_REVERSAL"
+                            priority = profit_reversal["priority"]
+                            prob_engine.add(profit_reversal["bias"], 10.06)
+
                         # ===== PRIORITY -1104: GLOBAL POSITION IMBALANCE =====
                         global_imbalance = GlobalPositionImbalance.detect(
                             funding_rate, oi_delta, volume_ratio,
                             change_5m, liq["short_dist"], liq["long_dist"]
                         )
-                        if global_imbalance["override"]:
+                        if not profit_reversal.get("override") and global_imbalance["override"]:
                             final_bias = global_imbalance["bias"]
                             final_reason = global_imbalance["reason"]
                             final_confidence = "ABSOLUTE"
@@ -6403,7 +6483,7 @@ class BinanceAnalyzer:
                         # ===== PRIORITY -1104/-1100/-1075: ASYMMETRIC LIQUIDITY MAX PAIN =====
                         # FIX DUSDT: long_liq 34% vs short_liq 6% = ratio 5.8x → SHORT
                         # Market menuju liquidity TERBESAR, bukan terdekat
-                        if not global_imbalance.get("override"):  # hanya jika GPI tidak trigger
+                        if not global_imbalance.get("override") and not profit_reversal.get("override"):  # hanya jika GPI dan Profit Reversal tidak trigger
                             asym_liq = AsymmetricLiquidityMaxPain.detect(
                                 liq["short_dist"], liq["long_dist"],
                                 volume_ratio, change_5m,
@@ -6422,55 +6502,59 @@ class BinanceAnalyzer:
                                 prob_engine.add(asym_liq["bias"], asym_liq["weight"])
 
                         # ===== PRIORITY -1103: EXTREME RSI6 OVERBOUGHT REVERSAL =====
-                        extreme_rsi6_rev = ExtremeRsi6OverboughtReversal.detect(
-                            rsi6, volume_ratio, ofi["bias"], up_energy
-                        )
-                        if extreme_rsi6_rev["override"]:
-                            final_bias = extreme_rsi6_rev["bias"]
-                            final_reason = extreme_rsi6_rev["reason"]
-                            final_confidence = "ABSOLUTE"
-                            final_phase = "EXTREME_RSI6_OVERBOUGHT_REVERSAL"
-                            priority = extreme_rsi6_rev["priority"]
-                            prob_engine.add(extreme_rsi6_rev["bias"], 10.02)
+                        if not profit_reversal.get("override"):
+                            extreme_rsi6_rev = ExtremeRsi6OverboughtReversal.detect(
+                                rsi6, volume_ratio, ofi["bias"], up_energy
+                            )
+                            if extreme_rsi6_rev["override"]:
+                                final_bias = extreme_rsi6_rev["bias"]
+                                final_reason = extreme_rsi6_rev["reason"]
+                                final_confidence = "ABSOLUTE"
+                                final_phase = "EXTREME_RSI6_OVERBOUGHT_REVERSAL"
+                                priority = extreme_rsi6_rev["priority"]
+                                prob_engine.add(extreme_rsi6_rev["bias"], 10.02)
 
                         # ===== PRIORITY -1103: FUNDING NEGATIVE + SHORT LIQ SUPER CLOSE =====
-                        funding_short_squeeze = FundingNegativeShortLiqSqueeze.detect(
-                            funding_rate, liq["short_dist"], liq["long_dist"],
-                            up_energy, down_energy, rsi6, volume_ratio
-                        )
-                        if funding_short_squeeze["override"]:
-                            final_bias = funding_short_squeeze["bias"]
-                            final_reason = funding_short_squeeze["reason"]
-                            final_confidence = "ABSOLUTE"
-                            final_phase = "FUNDING_NEG_SHORT_LIQ_SQUEEZE"
-                            priority = funding_short_squeeze["priority"]
-                            prob_engine.add(funding_short_squeeze["bias"], 10.03)
+                        if not profit_reversal.get("override"):
+                            funding_short_squeeze = FundingNegativeShortLiqSqueeze.detect(
+                                funding_rate, liq["short_dist"], liq["long_dist"],
+                                up_energy, down_energy, rsi6, volume_ratio
+                            )
+                            if funding_short_squeeze["override"]:
+                                final_bias = funding_short_squeeze["bias"]
+                                final_reason = funding_short_squeeze["reason"]
+                                final_confidence = "ABSOLUTE"
+                                final_phase = "FUNDING_NEG_SHORT_LIQ_SQUEEZE"
+                                priority = funding_short_squeeze["priority"]
+                                prob_engine.add(funding_short_squeeze["bias"], 10.03)
 
                         # ===== PRIORITY -1102: MOMENTUM VOLUME SPIKE PROTECTION =====
-                        mom_vol_spike = MomentumVolumeSpikeProtection.detect(
-                            change_5m, latest_volume, volume_ma10,
-                            liq["short_dist"], liq["long_dist"],
-                            obv_trend, up_energy, down_energy
-                        )
-                        if mom_vol_spike["override"]:
-                            final_bias = mom_vol_spike["bias"]
-                            final_reason = mom_vol_spike["reason"]
-                            final_confidence = "ABSOLUTE"
-                            final_phase = "MOMENTUM_VOLUME_SPIKE_LOCK"
-                            priority = mom_vol_spike["priority"]
-                            prob_engine.add(mom_vol_spike["bias"], 10.015)
+                        if not profit_reversal.get("override"):
+                            mom_vol_spike = MomentumVolumeSpikeProtection.detect(
+                                change_5m, latest_volume, volume_ma10,
+                                liq["short_dist"], liq["long_dist"],
+                                obv_trend, up_energy, down_energy
+                            )
+                            if mom_vol_spike["override"]:
+                                final_bias = mom_vol_spike["bias"]
+                                final_reason = mom_vol_spike["reason"]
+                                final_confidence = "ABSOLUTE"
+                                final_phase = "MOMENTUM_VOLUME_SPIKE_LOCK"
+                                priority = mom_vol_spike["priority"]
+                                prob_engine.add(mom_vol_spike["bias"], 10.015)
 
                         # ===== PRIORITY -1102: MARK PRICE GAP DETECTOR =====
-                        mark_gap = MarkPriceGapDetector.detect(
-                            mark_price, price, funding_rate, change_5m
-                        )
-                        if mark_gap["override"]:
-                            final_bias = mark_gap["bias"]
-                            final_reason = mark_gap["reason"]
-                            final_confidence = "ABSOLUTE"
-                            final_phase = "MARK_PRICE_GAP"
-                            priority = mark_gap["priority"]
-                            prob_engine.add(mark_gap["bias"], 10.01)
+                        if not profit_reversal.get("override"):
+                            mark_gap = MarkPriceGapDetector.detect(
+                                mark_price, price, funding_rate, change_5m
+                            )
+                            if mark_gap["override"]:
+                                final_bias = mark_gap["bias"]
+                                final_reason = mark_gap["reason"]
+                                final_confidence = "ABSOLUTE"
+                                final_phase = "MARK_PRICE_GAP"
+                                priority = mark_gap["priority"]
+                                prob_engine.add(mark_gap["bias"], 10.01)
 
                         # ===== DEFINE EXTREME FUNDING BAN BEFORE USE =====
                         extreme_funding_ban = ExtremeFundingRateLongBan.detect(
@@ -6478,7 +6562,7 @@ class BinanceAnalyzer:
                         )
 
                         # ===== PRIORITY -1101: EXTREME FUNDING RATE LONG/SHORT BAN =====
-                        if extreme_funding_ban["override"]:
+                        if not profit_reversal.get("override") and extreme_funding_ban["override"]:
                             final_bias = extreme_funding_ban["bias"]
                             final_reason = extreme_funding_ban["reason"]
                             final_confidence = "ABSOLUTE"
