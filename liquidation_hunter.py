@@ -4447,6 +4447,58 @@ class FundingNegativeOBVPositiveSqueezeFirst:
         return {"override": False}
 
 
+class FundingNegativeShortLiqSqueeze:
+    """
+    🔥 SIRENUSDT FIX: Funding sangat negatif tapi short liq SANGAT DEKAT
+    
+    Funding negatif ekstrem = semua orang LONG (crowded).
+    Biasanya HFT akan dump untuk likuidasi long.
+    TAPI jika short liq lebih dekat (<1.5%), HFT akan PUMP dulu
+    untuk menyapu short stop sebelum dump.
+    
+    Priority: -1103 (di atas ExtremeFundingRateLongBan -1101)
+    """
+    @staticmethod
+    def detect(funding_rate: float, short_dist: float, long_dist: float,
+               up_energy: float, down_energy: float, rsi6: float,
+               volume_ratio: float) -> Dict:
+        
+        if funding_rate is None:
+            return {"override": False}
+        
+        # Funding negatif ekstrem + short liq sangat dekat = pump dulu
+        if (funding_rate < -0.005 and
+            short_dist < 1.5 and
+            short_dist < long_dist and
+            up_energy > 0.1 and
+            down_energy < 0.01 and
+            rsi6 < 80 and
+            volume_ratio < 0.8):
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": f"FUNDING NEGATIVE + SHORT LIQ SUPER CLOSE: funding={funding_rate:.4f} (crowded long), short liq {short_dist:.2f}% sangat dekat, up_energy={up_energy:.2f} → HFT sweep short stops FIRST before dump",
+                "priority": -1103
+            }
+        
+        # Mirror: funding positif ekstrem + long liq sangat dekat = dump dulu
+        if (funding_rate > 0.005 and
+            long_dist < 1.5 and
+            long_dist < short_dist and
+            down_energy > 0.1 and
+            up_energy < 0.01 and
+            rsi6 > 20 and
+            volume_ratio < 0.8):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"FUNDING POSITIVE + LONG LIQ SUPER CLOSE: funding={funding_rate:.4f} (crowded short), long liq {long_dist:.2f}% sangat dekat, down_energy={down_energy:.2f} → HFT sweep long stops FIRST before pump",
+                "priority": -1103
+            }
+        
+        return {"override": False}
+
+
 class FundingNegativeShortSqueezeOverride:
     """
     🔥 SIRENUSDT FIX: Funding sangat negatif + long_liq DEKAT = SHORT SQUEEZE
@@ -5500,6 +5552,19 @@ class BinanceAnalyzer:
                             final_phase = "EXTREME_RSI6_OVERBOUGHT_REVERSAL"
                             priority = extreme_rsi6_rev["priority"]
                             prob_engine.add(extreme_rsi6_rev["bias"], 10.02)
+
+                        # ===== PRIORITY -1103: FUNDING NEGATIVE + SHORT LIQ SUPER CLOSE =====
+                        funding_short_squeeze = FundingNegativeShortLiqSqueeze.detect(
+                            funding_rate, liq["short_dist"], liq["long_dist"],
+                            up_energy, down_energy, rsi6, volume_ratio
+                        )
+                        if funding_short_squeeze["override"]:
+                            final_bias = funding_short_squeeze["bias"]
+                            final_reason = funding_short_squeeze["reason"]
+                            final_confidence = "ABSOLUTE"
+                            final_phase = "FUNDING_NEG_SHORT_LIQ_SQUEEZE"
+                            priority = funding_short_squeeze["priority"]
+                            prob_engine.add(funding_short_squeeze["bias"], 10.03)
 
                         # ===== PRIORITY -1102: MOMENTUM VOLUME SPIKE PROTECTION =====
                         mom_vol_spike = MomentumVolumeSpikeProtection.detect(
