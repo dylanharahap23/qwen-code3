@@ -4163,6 +4163,530 @@ class OBVDistributionFundingTrap:
         return {"override": False}
 
 
+# ================================================================
+# 🏦 EXCHANGE RISK ENGINE - Binance Survival Perspective
+# ================================================================
+# Layer baru (dari priority tertinggi ke terendah):
+#   -1104 : GlobalPositionImbalance      ← "exchange akan biarkan market drop jika 80% user LONG"
+#   -1103 : FundingNegativeShortLiqSqueeze — JANGAN UBAH
+#   -1102 : MarkPriceGapDetector         ← "HFT main di gap mark vs last price"
+#   -1101 : ExtremeFundingRateLongBan — JANGAN UBAH
+#   -105  : InsuranceFundProtection      ← "exchange smooth/force cascade"
+#   -104  : ADLRiskScoring               ← "risiko posisi profit dipotong"
+#   -103  : ExchangeVolatilityControl    ← "exchange tidak mau chaotic, tidak mau sepi"
+#   0     : ExchangeRiskScore            ← composite score, dipakai sebagai bobot ke prob_engine
+# ================================================================
+
+class GlobalPositionImbalance:
+    """
+    🏦 BINANCE SURVIVAL LAYER #1: Global Crowd Positioning
+    
+    Binance lihat: berapa % user LONG vs SHORT secara total.
+    Jika 80%+ user LONG → sistem rawan jika harga naik
+    → exchange "biarkan" dump terjadi untuk likuidasi massal
+    
+    Data proxy: funding_rate adalah indikator crowd positioning
+    yang paling accessible tanpa akses internal Binance.
+    
+    Skala:
+    - funding > +0.002  → crowded LONG  (>60% user long)
+    - funding > +0.004  → very crowded  (>75% user long)
+    - funding < -0.002  → crowded SHORT (>60% user short)
+    - funding < -0.004  → very crowded  (>75% user short)
+    
+    Ditambah: open interest growth sebagai konfirmasi
+    (OI naik + funding positif = semakin banyak user buka LONG)
+    
+    Priority: -1104 (TERTINGGI ABSOLUT — di atas semua signal lain)
+    Karena ini perspektif exchange survival, bukan trading signal.
+    """
+    @staticmethod
+    def detect(funding_rate: float, oi_delta: float,
+               volume_ratio: float, change_5m: float,
+               short_dist: float, long_dist: float) -> dict:
+        
+        if funding_rate is None:
+            return {"override": False}
+        
+        # ============================================================
+        # CROWDED LONG → Exchange akan biarkan dump
+        # ============================================================
+        # Very crowded long + OI naik + harga belum dump
+        if (funding_rate > 0.004 and      # >75% user long
+            oi_delta > 1.0 and            # OI naik = makin banyak yang buka posisi
+            change_5m > -2.0 and          # belum dump
+            volume_ratio < 1.5):          # tidak ada kepanikan beli besar
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"GLOBAL POSITION IMBALANCE (EXCHANGE RISK): "
+                    f"funding={funding_rate:.4f} (>75% user LONG), "
+                    f"OI delta={oi_delta:.2f}% (posisi terus dibuka) → "
+                    f"Binance akan biarkan dump untuk likuidasi massa"
+                ),
+                "priority": -1104,
+                "exchange_risk_type": "CROWDED_LONG_SYSTEMIC"
+            }
+        
+        # Crowded long (moderat) + long liq sangat dekat
+        if (funding_rate > 0.003 and
+            long_dist < 2.0 and
+            oi_delta > 0.5):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"GLOBAL POSITION IMBALANCE: funding={funding_rate:.4f} crowded long, "
+                    f"long liq {long_dist:.2f}% sangat dekat, OI tumbuh → "
+                    f"exchange pathway: dump untuk sweep long stop"
+                ),
+                "priority": -1104,
+                "exchange_risk_type": "CROWDED_LONG_LIQ_CLOSE"
+            }
+        
+        # ============================================================
+        # CROWDED SHORT → Exchange akan biarkan pump
+        # ============================================================
+        if (funding_rate < -0.004 and     # >75% user short
+            oi_delta > 1.0 and
+            change_5m < 2.0 and
+            volume_ratio < 1.5):
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": (
+                    f"GLOBAL POSITION IMBALANCE (EXCHANGE RISK): "
+                    f"funding={funding_rate:.4f} (>75% user SHORT), "
+                    f"OI delta={oi_delta:.2f}% → "
+                    f"Binance akan biarkan pump untuk likuidasi short massa"
+                ),
+                "priority": -1104,
+                "exchange_risk_type": "CROWDED_SHORT_SYSTEMIC"
+            }
+        
+        if (funding_rate < -0.003 and
+            short_dist < 2.0 and
+            oi_delta > 0.5):
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": (
+                    f"GLOBAL POSITION IMBALANCE: funding={funding_rate:.4f} crowded short, "
+                    f"short liq {short_dist:.2f}% sangat dekat → "
+                    f"exchange pathway: pump untuk sweep short stop"
+                ),
+                "priority": -1104,
+                "exchange_risk_type": "CROWDED_SHORT_LIQ_CLOSE"
+            }
+        
+        return {"override": False}
+
+
+class MarkPriceGapDetector:
+    """
+    🏦 BINANCE SURVIVAL LAYER #2: Mark Price vs Last Price Gap
+    
+    Di Binance Futures:
+    - Liquidation menggunakan MARK PRICE (average dari multiple exchanges)
+    - Candle/harga yang kita lihat = LAST PRICE (harga transaksi terakhir)
+    
+    HFT tahu ini dan BERMAIN DI GAP ini:
+    - Jika last price > mark price (gap positif):
+      → last price "terlalu tinggi" vs mark
+      → mark price akan menarik last price turun
+      → bias: SHORT (reversion ke mark)
+    
+    - Jika last price < mark price (gap negatif):
+      → last price "terlalu rendah" vs mark
+      → mark price akan menarik last price naik
+      → bias: LONG (reversion ke mark)
+    
+    Priority: -1102 (di bawah GlobalPositionImbalance -1104)
+    """
+    @staticmethod
+    def detect(mark_price: float, last_price: float,
+               funding_rate: float, change_5m: float) -> dict:
+        
+        if mark_price is None or mark_price == 0 or last_price == 0:
+            return {"override": False}
+        
+        # Hitung gap: positif = last > mark, negatif = last < mark
+        gap_pct = ((last_price - mark_price) / mark_price) * 100
+        
+        # Gap signifikan: > 0.3%
+        if abs(gap_pct) < 0.3:
+            return {"override": False}
+        
+        # Last price terlalu tinggi dari mark → akan turun ke mark
+        if gap_pct > 0.5:
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"MARK PRICE GAP: last={last_price:.4f} > mark={mark_price:.4f} "
+                    f"(gap +{gap_pct:.2f}%) → last price akan revert ke mark, "
+                    f"liquidation threshold lebih rendah dari yang terlihat → SHORT"
+                ),
+                "priority": -1102,
+                "gap_pct": gap_pct,
+                "exchange_risk_type": "MARK_PRICE_REVERSION_DOWN"
+            }
+        
+        # Last price terlalu rendah dari mark → akan naik ke mark
+        if gap_pct < -0.5:
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": (
+                    f"MARK PRICE GAP: last={last_price:.4f} < mark={mark_price:.4f} "
+                    f"(gap {gap_pct:.2f}%) → last price akan revert ke mark, "
+                    f"liquidation threshold lebih tinggi dari yang terlihat → LONG"
+                ),
+                "priority": -1102,
+                "gap_pct": gap_pct,
+                "exchange_risk_type": "MARK_PRICE_REVERSION_UP"
+            }
+        
+        return {"override": False, "gap_pct": gap_pct}
+    
+    @staticmethod
+    def estimate_gap_from_proxy(funding_rate: float, change_5m: float,
+                                 volume_ratio: float) -> dict:
+        """
+        Proxy estimasi gap ketika mark price tidak tersedia.
+        Berdasarkan divergence antara funding rate dan price action.
+        """
+        if funding_rate is None:
+            return {"gap_estimated": 0, "direction": "NEUTRAL"}
+        
+        # Divergence: funding positif (crowded long) tapi harga turun
+        if funding_rate > 0.002 and change_5m < -2.0:
+            return {
+                "gap_estimated": funding_rate * 100,
+                "direction": "LAST_PREMIUM",
+                "bias_implication": "SHORT"
+            }
+        
+        # Divergence: funding negatif (crowded short) tapi harga naik
+        if funding_rate < -0.002 and change_5m > 2.0:
+            return {
+                "gap_estimated": abs(funding_rate) * 100,
+                "direction": "LAST_DISCOUNT",
+                "bias_implication": "LONG"
+            }
+        
+        return {"gap_estimated": 0, "direction": "NEUTRAL", "bias_implication": "NEUTRAL"}
+
+
+class InsuranceFundProtection:
+    """
+    🏦 BINANCE SURVIVAL LAYER #3: Insurance Fund Protection Logic
+    
+    Binance punya insurance fund untuk menutupi kerugian saat
+    bankrupt order tidak bisa diisi. Jika fund menipis:
+    → Exchange akan "smooth" gerakan (delay cascade)
+    → Atau "force cascade" untuk reset imbalance
+    
+    PROXY:
+    - Volatility (change_5m sangat besar)
+    - OI delta (tiba-tiba turun = mass liquidation terjadi)
+    - Volume spike (panic = cascade sedang berlangsung)
+    
+    Priority: -105 (lower priority, gunakan sebagai modifier)
+    """
+    @staticmethod
+    def detect(change_5m: float, volume_ratio: float,
+               oi_delta: float, funding_rate: float,
+               short_dist: float, long_dist: float) -> dict:
+        
+        # ============================================================
+        # CASCADE TERJADI: OI drop besar + volume spike
+        # → Insurance fund terpakai → exchange akan smooth bounce
+        # ============================================================
+        if (oi_delta < -3.0 and         # OI turun drastis = mass liq
+            volume_ratio > 3.0 and       # volume spike = panik
+            abs(change_5m) > 5.0):       # harga bergerak ekstrem
+            
+            # Jika harga baru saja dump keras
+            if change_5m < -5.0:
+                return {
+                    "override": True,
+                    "bias": "LONG",
+                    "reason": (
+                        f"INSURANCE FUND PROTECTION: OI drop {oi_delta:.2f}% "
+                        f"(mass liquidation), volume {volume_ratio:.2f}x, "
+                        f"price -{abs(change_5m):.1f}% → cascade terjadi, "
+                        f"exchange akan smooth bounce (insurance fund dipakai)"
+                    ),
+                    "priority": -105,
+                    "exchange_risk_type": "CASCADE_SMOOTHING_BOUNCE"
+                }
+            
+            # Jika harga baru saja pump keras
+            if change_5m > 5.0:
+                return {
+                    "override": True,
+                    "bias": "SHORT",
+                    "reason": (
+                        f"INSURANCE FUND PROTECTION: OI drop {oi_delta:.2f}% "
+                        f"(mass short liq), volume {volume_ratio:.2f}x, "
+                        f"price +{change_5m:.1f}% → short cascade, "
+                        f"exchange akan smooth setelah sweep"
+                    ),
+                    "priority": -105,
+                    "exchange_risk_type": "CASCADE_SMOOTHING_DUMP"
+                }
+        
+        # ============================================================
+        # VOLATILITY EKSTREM + OI MASIH TINGGI
+        # → Exchange belum selesai, mungkin akan force lebih lanjut
+        # ============================================================
+        if (abs(change_5m) > 8.0 and
+            oi_delta > 2.0 and      # OI masih naik = belum ada mass liq
+            volume_ratio > 2.0):    # volume tinggi = tekanan masih ada
+            
+            if change_5m > 8.0:
+                return {
+                    "override": True,
+                    "bias": "LONG",
+                    "reason": (
+                        f"INSURANCE FUND: extreme pump {change_5m:.1f}% + OI tumbuh "
+                        f"{oi_delta:.2f}% → shorts keep opening, squeeze belum selesai"
+                    ),
+                    "priority": -105,
+                    "exchange_risk_type": "ONGOING_SQUEEZE"
+                }
+        
+        return {"override": False}
+
+
+class ADLRiskScoring:
+    """
+    🏦 BINANCE SURVIVAL LAYER #4: Auto-Deleveraging (ADL) Risk
+    
+    ADL terjadi ketika:
+    1. Posisi bankrupt (modal habis)
+    2. Insurance fund tidak cukup untuk menutupi
+    3. → Binance POTONG posisi PROFIT trader lain untuk kompensasi
+    
+    Priority: -104
+    """
+    @staticmethod
+    def score(funding_rate: float, volume_ratio: float,
+              rsi6: float, change_5m: float,
+              short_dist: float, long_dist: float) -> dict:
+        
+        if funding_rate is None:
+            return {"adl_risk": 0, "override": False}
+        
+        adl_risk = 0
+        risk_factors = []
+        
+        # Factor 1: Funding sangat ekstrem
+        if abs(funding_rate) > 0.005:
+            adl_risk += 3
+            risk_factors.append(f"extreme_funding={funding_rate:.4f}")
+        elif abs(funding_rate) > 0.003:
+            adl_risk += 2
+            risk_factors.append(f"high_funding={funding_rate:.4f}")
+        
+        # Factor 2: Volume sangat rendah (tidak ada counterparty)
+        if volume_ratio < 0.3:
+            adl_risk += 2
+            risk_factors.append(f"very_low_volume={volume_ratio:.2f}x")
+        elif volume_ratio < 0.5:
+            adl_risk += 1
+            risk_factors.append(f"low_volume={volume_ratio:.2f}x")
+        
+        # Factor 3: RSI di zona ekstrem
+        if rsi6 > 90 or rsi6 < 10:
+            adl_risk += 2
+            risk_factors.append(f"extreme_rsi={rsi6:.1f}")
+        elif rsi6 > 80 or rsi6 < 20:
+            adl_risk += 1
+            risk_factors.append(f"high_rsi={rsi6:.1f}")
+        
+        # Factor 4: Likuiditas terlalu dekat (posisi banyak approaching margin call)
+        if min(short_dist, long_dist) < 1.0:
+            adl_risk += 2
+            risk_factors.append(f"ultra_close_liq={min(short_dist, long_dist):.2f}%")
+        
+        # Factor 5: Pergerakan ekstrem
+        if abs(change_5m) > 8.0:
+            adl_risk += 2
+            risk_factors.append(f"extreme_move={change_5m:.1f}%")
+        elif abs(change_5m) > 5.0:
+            adl_risk += 1
+            risk_factors.append(f"large_move={change_5m:.1f}%")
+        
+        # ADL Risk >= 6: Exchange akan prefer reversi ke zona aman
+        if adl_risk >= 6:
+            if funding_rate > 0:
+                safe_direction = "SHORT"
+            else:
+                safe_direction = "LONG"
+            
+            return {
+                "adl_risk": adl_risk,
+                "override": True,
+                "bias": safe_direction,
+                "reason": (
+                    f"ADL RISK HIGH ({adl_risk}/10): {', '.join(risk_factors)} → "
+                    f"exchange prefer {safe_direction} untuk mengurangi ADL exposure"
+                ),
+                "priority": -104,
+                "exchange_risk_type": "ADL_RISK_REVERSION"
+            }
+        
+        return {
+            "adl_risk": adl_risk,
+            "override": False,
+            "risk_factors": risk_factors
+        }
+
+
+class ExchangeVolatilityControl:
+    """
+    🏦 BINANCE SURVIVAL LAYER #5: Volatility Control Layer
+    
+    Exchange ingin:
+    ✅ Cukup volatil (volume, fee revenue)
+    ❌ Tidak terlalu chaotic (system crash, reputasi)
+    ❌ Tidak terlalu sepi (tidak ada fee)
+    
+    Priority: -103
+    """
+    @staticmethod
+    def detect(volume_ratio: float, change_5m: float,
+               short_dist: float, long_dist: float,
+               funding_rate: float, rsi6: float) -> dict:
+        
+        # ============================================================
+        # TERLALU CHAOTIC: Volume spike + gerakan besar
+        # → Exchange akan smooth (bias reversi)
+        # ============================================================
+        if volume_ratio > 5.0 and abs(change_5m) > 10.0:
+            reversal_bias = "SHORT" if change_5m > 0 else "LONG"
+            return {
+                "override": True,
+                "bias": reversal_bias,
+                "reason": (
+                    f"EXCHANGE VOLATILITY CONTROL (CHAOTIC): "
+                    f"volume {volume_ratio:.1f}x dengan move {change_5m:.1f}% → "
+                    f"market terlalu chaotic, exchange akan smooth → reversi ke {reversal_bias}"
+                ),
+                "priority": -103,
+                "exchange_risk_type": "VOLATILITY_SMOOTHING"
+            }
+        
+        # ============================================================
+        # TERLALU SEPI: Volume sangat rendah, range sempit
+        # → Likuiditas akan dirangsang ke arah terdekat
+        # ============================================================
+        if (volume_ratio < 0.2 and
+            abs(change_5m) < 0.5 and
+            (short_dist < 5.0 or long_dist < 5.0)):
+            
+            if short_dist < long_dist:
+                target_bias = "LONG"
+                target_liq = short_dist
+            else:
+                target_bias = "SHORT"
+                target_liq = long_dist
+            
+            return {
+                "override": True,
+                "bias": target_bias,
+                "reason": (
+                    f"EXCHANGE VOLATILITY CONTROL (TOO QUIET): "
+                    f"volume {volume_ratio:.2f}x, move hanya {change_5m:.2f}% → "
+                    f"market terlalu sepi, liq terdekat {target_liq:.2f}% akan di-rangsang → {target_bias}"
+                ),
+                "priority": -103,
+                "exchange_risk_type": "VOLATILITY_STIMULATION"
+            }
+        
+        return {"override": False}
+
+
+class ExchangeRiskScore:
+    """
+    🏦 COMPOSITE: Exchange Risk Score
+    
+    Ini adalah "composite score" yang menggabungkan semua faktor
+    exchange risk menjadi satu angka 0-10.
+    
+    Score ini digunakan sebagai:
+    1. Bobot tambahan ke prob_engine
+    2. Warning di output
+    3. Confidence modifier
+    """
+    @staticmethod
+    def calculate(funding_rate: float, short_dist: float, long_dist: float,
+                  volume_ratio: float, change_5m: float,
+                  oi_delta: float = 0.0) -> dict:
+        
+        risk_score = 0
+        risk_breakdown = {}
+        
+        if funding_rate is not None:
+            if abs(funding_rate) > 0.003:
+                risk_score += 2
+                risk_breakdown["funding"] = f"EXTREME ({funding_rate:.4f})"
+            elif abs(funding_rate) > 0.001:
+                risk_score += 1
+                risk_breakdown["funding"] = f"ELEVATED ({funding_rate:.4f})"
+            
+            if funding_rate > 0 and long_dist < short_dist:
+                risk_score += 2
+                risk_breakdown["position_bias"] = "DANGEROUS: crowded long + long liq close"
+            elif funding_rate < 0 and short_dist < long_dist:
+                risk_score += 2
+                risk_breakdown["position_bias"] = "DANGEROUS: crowded short + short liq close"
+        
+        if volume_ratio < 0.3:
+            risk_score += 2
+            risk_breakdown["volume"] = f"VERY LOW ({volume_ratio:.2f}x)"
+        elif volume_ratio < 0.5:
+            risk_score += 1
+            risk_breakdown["volume"] = f"LOW ({volume_ratio:.2f}x)"
+        
+        if abs(change_5m) > 5.0:
+            risk_score += 1
+            risk_breakdown["volatility"] = f"HIGH ({change_5m:.1f}%)"
+        
+        if short_dist < 2.0 and long_dist < 2.0:
+            risk_score += 3
+            risk_breakdown["imbalance"] = "EXTREME: both liq < 2%"
+        elif min(short_dist, long_dist) < 1.0:
+            risk_score += 2
+            risk_breakdown["imbalance"] = f"CRITICAL: liq {min(short_dist,long_dist):.2f}%"
+        
+        if oi_delta > 2.0 and abs(change_5m) > 3.0:
+            risk_score += 1
+            risk_breakdown["oi_growth"] = f"OI naik {oi_delta:.2f}% saat volatile"
+        
+        risk_score = min(risk_score, 10)
+        
+        safe_direction = "NEUTRAL"
+        if risk_score >= 5:
+            if funding_rate is not None and funding_rate > 0:
+                safe_direction = "SHORT"
+            elif funding_rate is not None and funding_rate < 0:
+                safe_direction = "LONG"
+        
+        return {
+            "risk_score": risk_score,
+            "risk_level": "CRITICAL" if risk_score >= 8 else "HIGH" if risk_score >= 5 else "MEDIUM" if risk_score >= 3 else "LOW",
+            "risk_breakdown": risk_breakdown,
+            "safe_direction": safe_direction,
+            "exchange_perspective": (
+                f"Exchange Risk Score: {risk_score}/10 ({', '.join(f'{k}={v}' for k, v in risk_breakdown.items())})"
+            )
+        }
+
+
 class OBVTrendFundingConsensus:
     """
     🔥 Ketika OBV trend dan funding rate menunjuk arah yang SAMA,
@@ -5189,6 +5713,20 @@ class BinanceFetcher:
             return rate
         return None
 
+    def get_mark_price(self) -> dict:
+        """
+        Fetch mark price from Binance premiumIndex endpoint.
+        Mark price digunakan untuk liquidation calculation.
+        """
+        data = self.fetch("/fapi/v1/premiumIndex", {"symbol": self.symbol})
+        if data:
+            return {
+                "mark_price": safe_float(data.get("markPrice")),
+                "index_price": safe_float(data.get("indexPrice")),
+                "last_funding_rate": safe_float(data.get("lastFundingRate"))
+            }
+        return {"mark_price": None, "index_price": None, "last_funding_rate": None}
+
     def calculate_wmi(self, short_dist: float, long_dist: float) -> float:
         if short_dist < 0.1 or long_dist < 0.1:
             return 0
@@ -5340,6 +5878,15 @@ class BinanceAnalyzer:
             oi = self.fetcher.get_open_interest()
             oi_history = self.fetcher.get_oi_history(2)
             funding_rate = self.fetcher.get_funding_rate()
+            
+            # Fetch mark price data untuk MarkPriceGapDetector
+            mark_data = self.fetcher.get_mark_price()
+            mark_price = mark_data.get("mark_price")
+            
+            # Exchange Risk Score (composite, dipakai sebagai info)
+            oi_delta = 0.0
+            if oi_history and len(oi_history) >= 2:
+                oi_delta = ((oi_history[-1] - oi_history[-2]) / oi_history[-2]) * 100 if oi_history[-2] != 0 else 0.0
 
             ws_trades = []
             ws_order_book = None
@@ -5541,6 +6088,19 @@ class BinanceAnalyzer:
 
                         # ===== HIGH PRIORITY OVERRIDES (cascading if-else) =====
 
+                        # ===== PRIORITY -1104: GLOBAL POSITION IMBALANCE =====
+                        global_imbalance = GlobalPositionImbalance.detect(
+                            funding_rate, oi_delta, volume_ratio,
+                            change_5m, liq["short_dist"], liq["long_dist"]
+                        )
+                        if global_imbalance["override"]:
+                            final_bias = global_imbalance["bias"]
+                            final_reason = global_imbalance["reason"]
+                            final_confidence = "ABSOLUTE"
+                            final_phase = "GLOBAL_POSITION_IMBALANCE"
+                            priority = global_imbalance["priority"]
+                            prob_engine.add(global_imbalance["bias"], 10.05)
+
                         # ===== PRIORITY -1103: EXTREME RSI6 OVERBOUGHT REVERSAL =====
                         extreme_rsi6_rev = ExtremeRsi6OverboughtReversal.detect(
                             rsi6, volume_ratio, ofi["bias"], up_energy
@@ -5579,6 +6139,18 @@ class BinanceAnalyzer:
                             final_phase = "MOMENTUM_VOLUME_SPIKE_LOCK"
                             priority = mom_vol_spike["priority"]
                             prob_engine.add(mom_vol_spike["bias"], 10.015)
+
+                        # ===== PRIORITY -1102: MARK PRICE GAP DETECTOR =====
+                        mark_gap = MarkPriceGapDetector.detect(
+                            mark_price, price, funding_rate, change_5m
+                        )
+                        if mark_gap["override"]:
+                            final_bias = mark_gap["bias"]
+                            final_reason = mark_gap["reason"]
+                            final_confidence = "ABSOLUTE"
+                            final_phase = "MARK_PRICE_GAP"
+                            priority = mark_gap["priority"]
+                            prob_engine.add(mark_gap["bias"], 10.01)
 
                         # ===== DEFINE EXTREME FUNDING BAN BEFORE USE =====
                         extreme_funding_ban = ExtremeFundingRateLongBan.detect(
@@ -6149,6 +6721,45 @@ class BinanceAnalyzer:
                             final_phase = "CASCADE_DUMP"
                             priority = cascade["priority"]
                             prob_engine.add(cascade["bias"], 5.0)
+
+                        # ===== PRIORITY -105: INSURANCE FUND PROTECTION =====
+                        insurance_signal = InsuranceFundProtection.detect(
+                            change_5m, volume_ratio, oi_delta, funding_rate,
+                            liq["short_dist"], liq["long_dist"]
+                        )
+                        if insurance_signal["override"]:
+                            final_bias = insurance_signal["bias"]
+                            final_reason = insurance_signal["reason"]
+                            final_confidence = "ABSOLUTE"
+                            final_phase = "INSURANCE_FUND_PROTECT"
+                            priority = insurance_signal["priority"]
+                            prob_engine.add(insurance_signal["bias"], 2.5)
+
+                        # ===== PRIORITY -104: ADL RISK SCORING =====
+                        adl_signal = ADLRiskScoring.score(
+                            funding_rate, volume_ratio, rsi6, change_5m,
+                            liq["short_dist"], liq["long_dist"]
+                        )
+                        if adl_signal.get("override"):
+                            final_bias = adl_signal["bias"]
+                            final_reason = adl_signal["reason"]
+                            final_confidence = "ABSOLUTE"
+                            final_phase = "ADL_RISK_SIGNAL"
+                            priority = adl_signal["priority"]
+                            prob_engine.add(adl_signal["bias"], 2.0)
+
+                        # ===== PRIORITY -103: EXCHANGE VOLATILITY CONTROL =====
+                        vol_control = ExchangeVolatilityControl.detect(
+                            volume_ratio, change_5m, liq["short_dist"], liq["long_dist"],
+                            funding_rate, rsi6
+                        )
+                        if vol_control["override"]:
+                            final_bias = vol_control["bias"]
+                            final_reason = vol_control["reason"]
+                            final_confidence = "ABSOLUTE"
+                            final_phase = "EXCHANGE_VOL_CONTROL"
+                            priority = vol_control["priority"]
+                            prob_engine.add(vol_control["bias"], 1.5)
 
                         # 8. LOW VOLUME CONTINUATION
                         elif LowVolumeContinuation.detect(
@@ -7152,6 +7763,11 @@ class BinanceAnalyzer:
                 self.state_mgr.update_position(final_bias, price)
 
             # Build result dictionary
+            exchange_risk = ExchangeRiskScore.calculate(
+                funding_rate, liq["short_dist"], liq["long_dist"],
+                volume_ratio, change_5m, oi_delta
+            )
+            
             result = {
                 "timestamp": datetime.now().strftime("%H:%M:%S.%f")[:-3],
                 "symbol": self.symbol,
@@ -7192,7 +7808,11 @@ class BinanceAnalyzer:
                 "bid_slope": round(bid_slope, 2),
                 "ask_slope": round(ask_slope, 2),
                 "predicted_price": round(predicted_price, 4),
-                "position_multiplier": round(position_multiplier, 2)
+                "position_multiplier": round(position_multiplier, 2),
+                # Exchange Risk Engine fields
+                "exchange_risk_score": exchange_risk["risk_score"],
+                "exchange_risk_level": exchange_risk["risk_level"],
+                "exchange_safe_direction": exchange_risk["safe_direction"]
             }
 
             # Stability filter (global anti‑flip)
