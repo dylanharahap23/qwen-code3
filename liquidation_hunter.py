@@ -4,19 +4,21 @@
 🎯 Integrated: Liquidity Magnet Continuation, OFI Absorption Squeeze, Velocity Decay Reversal
 🎯 Priority Ladder: MasterSqueezeRule (-1100) > LiquidityMagnet (-1000) > OFIAbsorption (-950) > VelocityDecay (-900) > EmptyBook (-850)
 🎯 Golden Rule: LONG UNTIL SHORT LIQ SWEPT / SHORT UNTIL LONG LIQ SWEPT
+🎯 Market Phase Detector: PREP (no trade) | BAIT (caution) | KILL (trade ok)
 """
 
 import requests
 from datetime import datetime
 import urllib3
 import numpy as np
-from typing import Optional, Dict, List, Tuple, Any
+from typing import Optional, Dict, List, Tuple, Any, Literal
 import time
 import json
 import threading
 import websocket
 import os
 from collections import deque
+from dataclasses import dataclass, field
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -60,6 +62,268 @@ LAST_BIAS_TIME = 0
 # ================= TIME DECAY GLOBAL =================
 LAST_SIGNAL = None
 LAST_SIGNAL_TIME = 0
+
+# ================= MARKET PHASE DETECTOR =================
+
+PhaseType = Literal["PREP", "BAIT", "KILL", "UNKNOWN"]
+BiasType = Literal["LONG", "SHORT", "NEUTRAL"]
+
+
+@dataclass
+class PhaseResult:
+    """Hasil deteksi fase market."""
+    phase: PhaseType
+    override: bool
+    bias: BiasType
+    confidence: str  # "BLOCK" | "CAUTION" | "PASS"
+    priority: int  # negatif = override kuat
+    reason: str
+    sub_signals: dict = field(default_factory=dict)
+
+
+def _check_prep_phase(data: dict) -> Optional[PhaseResult]:
+    """
+    Deteksi PREP phase = market lagi ngumpulin liquidity sebelum bergerak.
+    Ciri khas: flat, sepi, buyer masuk pelan, tidak ada seller.
+
+    Rule (semua harus terpenuhi):
+      • |change_5m|  < 0.5%      → market flat
+      • volume_ratio < 0.7       → volume kecil / sepi
+      • down_energy  == 0        → tidak ada tekanan jual
+      • ofi_bias     == "LONG"   → buyer masuk pelan-pelan
+      • 40 < rsi6 < 65           → RSI netral, bukan ekstrem
+    """
+    change_5m = abs(data.get("change_5m", 0.0))
+    volume_ratio = data.get("volume_ratio", 1.0)
+    down_energy = data.get("down_energy", 0.0)
+    ofi_bias = data.get("ofi_bias", "NEUTRAL")
+    rsi6 = data.get("rsi6", 50.0)
+
+    conditions = {
+        "flat_market": change_5m < 0.5,
+        "low_volume": volume_ratio < 0.7,
+        "no_seller": down_energy == 0,
+        "buyer_creeping": ofi_bias == "LONG",
+        "rsi_neutral": 40 < rsi6 < 65,
+    }
+
+    triggered = {k: v for k, v in conditions.items() if v}
+
+    if len(triggered) < 5:
+        return None
+
+    reason = (
+        f"NO TRADE ZONE — Pre-manipulation accumulation detected. "
+        f"Market flat ({change_5m:.2f}%), volume low ({volume_ratio:.2f}x), "
+        f"down_energy=0, OFI=LONG, RSI neutral ({rsi6:.1f}). "
+        f"Binance lagi ngumpulin korban, belum ada arah."
+    )
+
+    return PhaseResult(
+        phase="PREP",
+        override=True,
+        bias="NEUTRAL",
+        confidence="BLOCK",
+        priority=-2000,
+        reason=reason,
+        sub_signals=triggered,
+    )
+
+
+def _check_bait_phase(data: dict) -> Optional[PhaseResult]:
+    """
+    Deteksi BAIT phase = market bikin gerakan kecil palsu untuk jebak trader.
+    Ciri khas: ada gerakan, tapi volume masih rendah dan OBV tidak konfirmasi.
+
+    Rule (minimal 3 dari 4 harus terpenuhi):
+      • 0.5 <= |change_5m| < 2.0  → ada gerakan tapi kecil
+      • volume_ratio < 0.8        → volume tidak mendukung
+      • obv_trend == "NEUTRAL"    → OBV tidak konfirmasi arah
+      • up_energy > 0 AND down_energy == 0 (atau sebaliknya) → energy satu arah tapi sepi
+    """
+    change_5m = abs(data.get("change_5m", 0.0))
+    volume_ratio = data.get("volume_ratio", 1.0)
+    obv_trend = data.get("obv_trend", "NEUTRAL")
+    up_energy = data.get("up_energy", 0.0)
+    down_energy = data.get("down_energy", 0.0)
+
+    one_sided_energy = (up_energy > 0 and down_energy == 0) or \
+                       (down_energy > 0 and up_energy == 0)
+
+    conditions = {
+        "small_move": 0.5 <= change_5m < 2.0,
+        "low_volume": volume_ratio < 0.8,
+        "obv_not_confirming": obv_trend == "NEUTRAL",
+        "one_sided_energy": one_sided_energy,
+    }
+
+    triggered = {k: v for k, v in conditions.items() if v}
+
+    if len(triggered) < 3:
+        return None
+
+    reason = (
+        f"BAIT PHASE — Gerakan kecil ({change_5m:.2f}%) tanpa volume (ratio={volume_ratio:.2f}x). "
+        f"OBV tidak konfirmasi ({obv_trend}). Kemungkinan fake move untuk jebak posisi. "
+        f"Signals: {list(triggered.keys())}"
+    )
+
+    return PhaseResult(
+        phase="BAIT",
+        override=False,
+        bias="NEUTRAL",
+        confidence="CAUTION",
+        priority=-500,
+        reason=reason,
+        sub_signals=triggered,
+    )
+
+
+def _check_kill_phase(data: dict) -> Optional[PhaseResult]:
+    """
+    Deteksi KILL phase = market sudah siap bergerak besar, arah jelas.
+    Ciri khas: OBV ekstrem, volume tinggi, ada energy besar satu arah.
+
+    Rule (minimal 3 dari 5 harus terpenuhi):
+      • |change_5m|  >= 0.8                   → ada momentum nyata
+      • volume_ratio >= 0.9                   → volume mendukung
+      • obv_trend in EXTREME                  → OBV konfirmasi kuat
+      • max(up_energy, down_energy) >= 2.0    → energy besar
+      • rsi6 > 70 atau rsi6 < 30              → momentum ekstrem
+    """
+    change_5m = abs(data.get("change_5m", 0.0))
+    volume_ratio = data.get("volume_ratio", 1.0)
+    obv_trend = data.get("obv_trend", "NEUTRAL")
+    up_energy = data.get("up_energy", 0.0)
+    down_energy = data.get("down_energy", 0.0)
+    rsi6 = data.get("rsi6", 50.0)
+
+    obv_extreme = obv_trend in ("POSITIVE_EXTREME", "NEGATIVE_EXTREME",
+                                "POSITIVE", "NEGATIVE")
+    max_energy = max(up_energy, down_energy)
+
+    conditions = {
+        "strong_move": change_5m >= 0.8,
+        "good_volume": volume_ratio >= 0.9,
+        "obv_extreme": obv_extreme,
+        "high_energy": max_energy >= 2.0,
+        "rsi_momentum": rsi6 > 70 or rsi6 < 30,
+    }
+
+    triggered = {k: v for k, v in conditions.items() if v}
+
+    if len(triggered) < 3:
+        return None
+
+    reason = (
+        f"KILL PHASE — Move nyata ({change_5m:.2f}%), volume={volume_ratio:.2f}x, "
+        f"OBV={obv_trend}, energy={max_energy:.2f}, RSI={rsi6:.1f}. "
+        f"Market sudah siap bergerak besar. Signals: {list(triggered.keys())}"
+    )
+
+    return PhaseResult(
+        phase="KILL",
+        override=False,
+        bias="NEUTRAL",
+        confidence="PASS",
+        priority=0,
+        reason=reason,
+        sub_signals=triggered,
+    )
+
+
+def detect_market_phase(data: dict) -> PhaseResult:
+    """
+    Fungsi utama. Panggil ini SEBELUM logika bias utama lo.
+
+    Parameter
+    ---------
+    data : dict
+        Dictionary signal lo. Keys yang dipakai:
+          change_5m, volume_ratio, down_energy, up_energy,
+          ofi_bias, rsi6, obv_trend
+
+    Returns
+    -------
+    PhaseResult
+        .phase      → "PREP" | "BAIT" | "KILL" | "UNKNOWN"
+        .override   → True kalau harus di-block (PREP phase)
+        .bias       → "NEUTRAL" kalau override, else biarkan bias original
+        .confidence → "BLOCK" | "CAUTION" | "PASS"
+        .priority   → integer, negatif = override lebih kuat
+        .reason     → string penjelasan
+        .sub_signals→ dict kondisi yang triggered
+    """
+    result = _check_prep_phase(data)
+    if result:
+        return result
+
+    result = _check_bait_phase(data)
+    if result:
+        return result
+
+    result = _check_kill_phase(data)
+    if result:
+        return result
+
+    return PhaseResult(
+        phase="UNKNOWN",
+        override=False,
+        bias="NEUTRAL",
+        confidence="PASS",
+        priority=0,
+        reason="Phase tidak terdeteksi. Lanjut logika normal.",
+        sub_signals={},
+    )
+
+
+def apply_phase_override(original_result: dict, phase_result: PhaseResult) -> dict:
+    """
+    Merge phase_result ke result bias lo yang sudah ada.
+
+    Parameter
+    ---------
+    original_result : dict
+        Output dict dari logika bias lo yang sudah jalan
+        (minimal punya keys: "bias", "reason", "confidence", "priority_level")
+
+    phase_result : PhaseResult
+        Dari detect_market_phase()
+
+    Returns
+    -------
+    dict
+        original_result yang sudah di-patch dengan info fase
+    """
+    result = original_result.copy()
+
+    result["market_phase"] = phase_result.phase
+    result["phase_sub_signals"] = phase_result.sub_signals
+    result["phase_reason"] = phase_result.reason
+
+    if phase_result.override:
+        result["bias"] = "NEUTRAL"
+        result["confidence"] = "BLOCK"
+        result["priority_level"] = phase_result.priority
+        result["reason"] = (
+            f"[PHASE OVERRIDE — {phase_result.phase}] "
+            + phase_result.reason
+            + " | Original reason: "
+            + original_result.get("reason", "")
+        )
+
+    elif phase_result.confidence == "CAUTION":
+        result["reason"] = (
+            f"[PHASE CAUTION — {phase_result.phase}] "
+            + phase_result.reason
+            + " | Original: "
+            + original_result.get("reason", "")
+        )
+        if result.get("confidence") == "ABSOLUTE":
+            result["confidence"] = "HIGH"
+
+    return result
+
 
 # ================= HELPER FUNCTIONS =================
 
@@ -8306,6 +8570,19 @@ class BinanceAnalyzer:
             if result["bias"] in ["LONG", "SHORT"]:
                 LAST_BIAS = result["bias"]
                 LAST_BIAS_TIME = now
+
+            # ========== MARKET PHASE DETECTOR INTEGRATION ==========
+            phase_data = {
+                "change_5m": change_5m,
+                "volume_ratio": volume_ratio,
+                "down_energy": down_energy,
+                "up_energy": up_energy,
+                "ofi_bias": ofi["bias"],
+                "rsi6": rsi6,
+                "obv_trend": obv_trend,
+            }
+            phase_result = detect_market_phase(phase_data)
+            result = apply_phase_override(result, phase_result)
 
             return result
 
