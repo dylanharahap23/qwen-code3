@@ -4245,6 +4245,215 @@ class FundingNegativeOBVPositiveSqueezeFirst:
         return {"override": False}
 
 
+class FundingNegativeShortSqueezeOverride:
+    """
+    🔥 SIRENUSDT FIX: Funding sangat negatif + long_liq DEKAT = SHORT SQUEEZE
+    
+    Funding negatif ekstrem berarti semua orang sudah SHORT.
+    Jika long_liq juga dekat (< 2%), HFT akan PUMP untuk:
+    1. Sweep long liq (likuidasi long yang ada)
+    2. Squeeze semua short yang terperangkap
+    
+    Ini BERBEDA dari CUSDT (funding negatif + RSI_5m 97 + long_liq jauh = dump).
+    
+    Rule: funding < -0.005 AND long_liq < 2.5% AND RSI6 < 40 AND down_energy = 0
+    → LONG (short squeeze)
+    
+    Priority: -1102 (TERTINGGI — override funding ban!)
+    Karena liquidity target yang sangat dekat override funding signal.
+    """
+    @staticmethod
+    def detect(funding_rate: float, long_dist: float, short_dist: float,
+               rsi6: float, down_energy: float, up_energy: float,
+               rsi6_5m: float, obv_trend: str) -> Dict:
+        
+        if funding_rate is None:
+            return {"override": False}
+        
+        # Funding negatif ekstrem + long_liq sangat dekat + oversold = short squeeze
+        if (funding_rate < -0.005 and
+            long_dist < 2.5 and           # target dekat
+            long_dist < short_dist and    # long lebih dekat dari short
+            rsi6 < 45 and                 # tidak overbought
+            rsi6_5m < 65 and              # 5m tidak overbought
+            down_energy < 0.1):           # tidak ada seller aktif
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": f"Funding negative short squeeze: funding={funding_rate:.4f} (crowded short), long liq {long_dist:.2f}% SANGAT dekat, RSI {rsi6:.1f} oversold, no sellers → HFT sweep long liq DULU sebelum dump lebih lanjut",
+                "priority": -1102
+            }
+        
+        # Mirror: funding positif + short_liq dekat + overbought = long squeeze
+        if (funding_rate > 0.005 and
+            short_dist < 2.5 and
+            short_dist < long_dist and
+            rsi6 > 55 and
+            rsi6_5m > 35 and
+            up_energy < 0.1):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"Funding positive long squeeze: funding={funding_rate:.4f} (crowded long), short liq {short_dist:.2f}% SANGAT dekat → HFT sweep short liq DULU",
+                "priority": -1102
+            }
+        
+        return {"override": False}
+
+
+class OFISpoofingDetector:
+    """
+    🔥 RLSUSDT PATTERN: OFI SHORT 1.00 tapi sebenarnya LONG
+    
+    HFT teknik spoofing:
+    - Pasang order sell besar di order book → OFI bias SHORT
+    - Tapi 90%+ trades sebenarnya BUY (agg tinggi)
+    - Ini artinya: wall sell besar = inducement untuk short retail
+    - Setelah short terisi → HFT tarik order → PUMP
+    
+    Deteksi: OFI SHORT kuat TAPI agg > 0.6 (mayoritas trades BUY)
+    = OFI sedang di-spoof, percaya agg bukan OFI
+    
+    Priority: -1098.5 (antara BlowOffTop dan AbsoluteAgg)
+    """
+    @staticmethod
+    def detect(ofi_bias: str, ofi_strength: float, agg: float,
+               up_energy: float, down_energy: float,
+               short_dist: float, long_dist: float,
+               volume_ratio: float) -> Dict:
+        
+        # OFI SHORT tapi agg tinggi (trades mayoritas BUY) = spoof
+        if (ofi_bias == "SHORT" and
+            ofi_strength > 0.7 and
+            agg > 0.6 and                    # mayoritas trades BUY
+            up_energy > 0 and
+            down_energy < 0.01 and           # tidak ada seller nyata
+            volume_ratio < 0.7):             # volume rendah = lebih mudah dispoof
+            
+            # Tentukan arah dari liquidity
+            if short_dist < long_dist and short_dist < 5.0:
+                target = "LONG"
+                reason_liq = f"short liq {short_dist:.2f}% lebih dekat"
+            else:
+                # Default LONG karena agg menunjukkan buy pressure nyata
+                target = "LONG"
+                reason_liq = "agg menunjukkan buy pressure nyata"
+            
+            return {
+                "override": True,
+                "bias": target,
+                "reason": f"OFI SPOOFING detected: OFI SHORT {ofi_strength:.2f} tapi agg={agg:.2f} (trades mayoritas BUY), down_energy=0 → HFT induced short trap, {reason_liq} → forced {target}",
+                "priority": -1099
+            }
+        
+        # Mirror: OFI LONG tapi agg rendah = spoof untuk induce LONG
+        if (ofi_bias == "LONG" and
+            ofi_strength > 0.7 and
+            agg < 0.4 and                    # mayoritas trades SELL
+            down_energy > 0 and
+            up_energy < 0.01 and
+            volume_ratio < 0.7):
+            
+            if long_dist < short_dist and long_dist < 5.0:
+                target = "SHORT"
+                reason_liq = f"long liq {long_dist:.2f}% lebih dekat"
+            else:
+                target = "SHORT"
+                reason_liq = "agg menunjukkan sell pressure nyata"
+            
+            return {
+                "override": True,
+                "bias": target,
+                "reason": f"OFI SPOOFING detected: OFI LONG {ofi_strength:.2f} tapi agg={agg:.2f} (trades mayoritas SELL), up_energy=0 → HFT induced long trap, {reason_liq} → forced {target}",
+                "priority": -1099
+            }
+        
+        return {"override": False}
+
+
+class LiquidityAmbiguityResolver:
+    """
+    🔥 POLA LICIK HFT: Liquidity Ambiguity / Inducement Phase
+    
+    HFT sengaja membuat sinyal ambiguous:
+    - OFI SHORT tapi agg tinggi (spoof sell wall)
+    - Funding negatif tapi long_liq dekat (bikin orang takut long)
+    - RSI overbought tapi short_liq dekat (bikin orang masuk short)
+    
+    Resolver: ketika ada konflik sinyal yang jelas,
+    percaya LIQUIDITY PROXIMITY sebagai ground truth.
+    
+    Ground truth hierarchy:
+    1. Liquidity yang LEBIH DEKAT = arah HFT (tidak bisa dispoof)
+    2. down_energy/up_energy = tekanan nyata di book
+    3. agg = bukti transaksi nyata (lebih sulit dispoof dari OFI)
+    4. OFI = bisa dispoof oleh order besar yang ditarik
+    5. Funding = lagging indicator, bukan real-time
+    
+    Priority: -1097.5 (antara OFISpoofing dan AbsoluteAgg)
+    """
+    @staticmethod
+    def detect(short_dist: float, long_dist: float,
+               ofi_bias: str, agg: float,
+               down_energy: float, up_energy: float,
+               funding_rate: float,
+               rsi6: float, rsi6_5m: float) -> Dict:
+        
+        if funding_rate is None:
+            funding_rate = 0.0
+        
+        # Hitung skor konflik
+        liq_direction = "LONG" if short_dist < long_dist else "SHORT"
+        ofi_direction = ofi_bias if ofi_bias != "NEUTRAL" else liq_direction
+        agg_direction = "LONG" if agg > 0.5 else "SHORT"
+        energy_direction = "LONG" if up_energy >= down_energy else "SHORT"
+        
+        # Hitung consensus dari sinyal yang tidak bisa dispoof
+        trusted_signals = [liq_direction, agg_direction, energy_direction]
+        long_count = trusted_signals.count("LONG")
+        short_count = trusted_signals.count("SHORT")
+        
+        # Jika OFI berlawanan dengan consensus trusted signals = inducement
+        ofi_conflicts = (ofi_direction != liq_direction and 
+                        long_count >= 2 and ofi_direction == "SHORT")
+        ofi_conflicts_short = (ofi_direction != liq_direction and
+                              short_count >= 2 and ofi_direction == "LONG")
+        
+        # Ambiguity: sinyal utama saling bertentangan
+        is_ambiguous = (
+            (short_dist < 5.0 or long_dist < 5.0) and  # ada liq target dekat
+            abs(short_dist - long_dist) < 3.0 and        # kedua liq relatif dekat
+            LiquidityAmbiguityResolver._volume_ratio_implied_low(agg, up_energy, down_energy)  # volume rendah
+        )
+        
+        # Jika OFI spoof terdeteksi, ikuti trusted consensus
+        if ofi_conflicts and long_count >= 2:
+            closer_liq = min(short_dist, long_dist)
+            if short_dist <= long_dist:
+                return {
+                    "override": True,
+                    "bias": "LONG",
+                    "reason": f"Liquidity ambiguity resolved: OFI SHORT tapi liq={short_dist:.2f}% closer, agg={agg:.2f}, energy={energy_direction} → trusted signals say LONG",
+                    "priority": -1097
+                }
+        
+        if ofi_conflicts_short and short_count >= 2:
+            if long_dist <= short_dist:
+                return {
+                    "override": True,
+                    "bias": "SHORT",
+                    "reason": f"Liquidity ambiguity resolved: OFI LONG tapi liq={long_dist:.2f}% closer, agg={agg:.2f}, energy={energy_direction} → trusted signals say SHORT",
+                    "priority": -1097
+                }
+        
+        return {"override": False}
+    
+    @staticmethod
+    def _volume_ratio_implied_low(agg, up_energy, down_energy):
+        """Helper: apakah kondisi menunjukkan volume efektif rendah"""
+        return down_energy < 0.1 or up_energy < 0.1
+
+
 class AlgoTypeAnalyzer:
     @staticmethod
     def analyze(order_book: Dict, trades: List[Dict], price: float,
@@ -6364,6 +6573,69 @@ class BinanceAnalyzer:
                     final_phase = "OVERBOUGHT_FALSE_BOUNCE"
                     priority = overbought_false_bounce["priority"]
 
+            # ========== NEW DETECTORS: Funding Squeeze, OFI Spoofing, Liquidity Ambiguity ==========
+            # Priority Lock System: kumpulkan semua kandidat dan pilih yang prioritas tertinggi
+            
+            candidates = []  # list of (priority, bias, reason, phase)
+            
+            # 1. Funding Negative Short Squeeze Override (Priority -1102)
+            funding_squeeze = FundingNegativeShortSqueezeOverride.detect(
+                funding_rate, liq["long_dist"], liq["short_dist"],
+                rsi6, down_energy, up_energy, rsi6_5m, obv_trend
+            )
+            if funding_squeeze["override"]:
+                candidates.append((
+                    funding_squeeze["priority"],
+                    funding_squeeze["bias"],
+                    funding_squeeze["reason"],
+                    "FUNDING_SHORT_SQUEEZE"
+                ))
+            
+            # 2. OFI Spoofing Detector (Priority -1099)
+            ofi_spoof = OFISpoofingDetector.detect(
+                ofi["bias"], ofi["strength"], agg,
+                up_energy, down_energy,
+                liq["short_dist"], liq["long_dist"],
+                volume_ratio
+            )
+            if ofi_spoof["override"]:
+                candidates.append((
+                    ofi_spoof["priority"],
+                    ofi_spoof["bias"],
+                    ofi_spoof["reason"],
+                    "OFI_SPOOFING"
+                ))
+            
+            # 3. Liquidity Ambiguity Resolver (Priority -1097)
+            liq_ambiguity = LiquidityAmbiguityResolver.detect(
+                liq["short_dist"], liq["long_dist"],
+                ofi["bias"], agg,
+                down_energy, up_energy,
+                funding_rate,
+                rsi6, rsi6_5m
+            )
+            if liq_ambiguity["override"]:
+                candidates.append((
+                    liq_ambiguity["priority"],
+                    liq_ambiguity["bias"],
+                    liq_ambiguity["reason"],
+                    "LIQUIDITY_AMBIGUITY"
+                ))
+            
+            # Pilih kandidat dengan priority paling tinggi (paling negatif)
+            if candidates:
+                candidates.sort(key=lambda x: x[0])  # sort ascending (paling negatif dulu)
+                best = candidates[0]
+                
+                # Hanya override jika priority kandidat lebih tinggi dari current priority
+                current_priority = locals().get('priority', 0)
+                if best[0] < current_priority:
+                    final_bias = best[1]
+                    final_reason = best[2]
+                    final_confidence = "ABSOLUTE"
+                    final_phase = best[3]
+                    priority = best[0]
+
             # ========== OFI DOMINANCE OVERRIDE (Priority -145) ==========
             # 🔥 Jika volume rendah dan OFI sangat kuat (>0.7), paksa arah OFI
             
@@ -6382,15 +6654,26 @@ class BinanceAnalyzer:
                     # Jangan paksa LONG, biarkan sinyal lain yang menentukan
                     final_reason += f" | OFI dominance blocked by HFT-liquidity conflict"
                 else:
-                    if ofi["bias"] == "LONG":
-                        final_bias = "LONG"
-                        final_reason = f"OFI dominance: {ofi['strength']:.2f} with low volume → forcing LONG"
-                    elif ofi["bias"] == "SHORT":
-                        final_bias = "SHORT"
-                        final_reason = f"OFI dominance: {ofi['strength']:.2f} with low volume → forcing SHORT"
-                    final_confidence = "ABSOLUTE"
-                    final_phase = "OFI_DOMINANCE"
-                    priority = -145
+                    # 🔥 TAMBAH: validasi OFI vs agg sebelum dominance
+                    ofi_is_spoofed = (
+                        ofi["bias"] == "SHORT" and agg > 0.65 and down_energy < 0.01
+                    ) or (
+                        ofi["bias"] == "LONG" and agg < 0.35 and up_energy < 0.01
+                    )
+                    
+                    if ofi_is_spoofed:
+                        final_reason += f" | OFI dominance blocked (agg={agg:.2f} contradicts OFI {ofi['bias']})"
+                    else:
+                        # Apply dominance
+                        if ofi["bias"] == "LONG":
+                            final_bias = "LONG"
+                            final_reason = f"OFI dominance: {ofi['strength']:.2f} with low volume → forcing LONG"
+                        elif ofi["bias"] == "SHORT":
+                            final_bias = "SHORT"
+                            final_reason = f"OFI dominance: {ofi['strength']:.2f} with low volume → forcing SHORT"
+                        final_confidence = "ABSOLUTE"
+                        final_phase = "OFI_DOMINANCE"
+                        priority = -145
 
             # ========== MACD DUEL OVERRIDE (WITH LECTURER'S SARAN FILTER) ==========
             if macd_decision["action"] != "NONE":
