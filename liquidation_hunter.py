@@ -1226,7 +1226,22 @@ class AbsoluteAggOverride:
     @staticmethod
     def detect(agg: float, down_energy: float, ofi_bias: str,
                ofi_strength: float, up_energy: float,
-               funding_rate: float) -> Dict:
+               funding_rate: float,
+               long_dist: float = 99.0,    # ← TAMBAH
+               short_dist: float = 99.0,   # ← TAMBAH
+               obv_value: float = 0.0) -> Dict:  # ← TAMBAH
+        
+        # 🔥 PATCH JCTUSDT: Jika long_liq < short_liq, agg = 1.00 bisa jadi spoofed
+        # HFT spoof agg dengan trade kecil semua BUY tapi order book distribusi
+        # Guard: jika long_liq lebih dekat, jangan paksa LONG meski agg=1.00
+        if long_dist < short_dist and long_dist < 3.0:
+            return {"override": False}  # long_liq lebih dekat = akan dump
+        
+        # 🔥 PATCH: OBV sangat besar positif tapi agg=1.00 dengan long_liq dekat
+        # = distribusi dengan spoof agg
+        if obv_value > 500_000_000 and long_dist < short_dist:
+            return {"override": False}
+        
         if (agg >= 0.95
                 and down_energy < 0.01
                 and ofi_bias == "LONG"
@@ -3792,11 +3807,82 @@ class MultiTimeframeConfirmation:
         return current_confidence, current_reason
 
 
+class MomentumVolumeSpikeProtection:
+    """
+    🔥 PIPPINUSDT KILLER: Saat harga pump >8% dalam 5m dengan volume spike >4x,
+    JANGAN PERNAH output SHORT sampai short_liq tersapu.
+    
+    Ini adalah squeeze yang sedang berjalan — semua sinyal reversal harus diabaikan.
+    
+    Rule:
+    - change_5m > 8% AND volume spike > 4x AND short_liq < 2% → LOCK LONG
+    - change_5m < -8% AND volume spike > 4x AND long_liq < 2% → LOCK SHORT
+    
+    Priority: -1102 (TERTINGGI ABSOLUT — di atas funding ban!)
+    Karena momentum volume spike aktif = squeeze sedang berlangsung,
+    tidak ada yang bisa stop ini.
+    """
+    @staticmethod
+    def detect(change_5m: float, latest_volume: float, volume_ma10: float,
+               short_dist: float, long_dist: float,
+               obv_trend: str, up_energy: float, down_energy: float) -> Dict:
+        
+        if volume_ma10 <= 0:
+            return {"override": False}
+        
+        vol_spike = latest_volume / volume_ma10
+        
+        # LONG LOCK: pump besar + volume spike raksasa + short liq dekat
+        if (change_5m > 8.0 and
+            vol_spike > 4.0 and
+            short_dist < 2.5 and
+            short_dist < long_dist and
+            down_energy < 0.1):
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": f"MOMENTUM VOLUME SPIKE LOCK: price up {change_5m:.1f}%, volume {vol_spike:.1f}x MA10, short liq {short_dist:.2f}% < {long_dist:.2f}%, no sellers → active short squeeze, LOCK LONG until short liq swept",
+                "priority": -1102
+            }
+        
+        # SHORT LOCK: dump besar + volume spike + long liq dekat
+        if (change_5m < -8.0 and
+            vol_spike > 4.0 and
+            long_dist < 2.5 and
+            long_dist < short_dist and
+            up_energy < 0.1):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"MOMENTUM VOLUME SPIKE LOCK: price down {change_5m:.1f}%, volume {vol_spike:.1f}x MA10, long liq {long_dist:.2f}% < {short_dist:.2f}%, no buyers → active long squeeze, LOCK SHORT until long liq swept",
+                "priority": -1102
+            }
+        
+        return {"override": False}
+
+
 class OBVStochasticReversal:
     @staticmethod
     def apply(obv_trend: str, obv_value: float, stoch_k: float, stoch_d: float,
               current_bias: str, current_reason: str, volume_ratio: float,
-              rsi6: float, rsi6_5m: float) -> Tuple[str, str]:
+              rsi6: float, rsi6_5m: float,
+              change_5m: float = 0.0, short_dist: float = 99.0, long_dist: float = 99.0,
+              latest_volume: float = 0.0, volume_ma10: float = 1.0) -> Tuple[str, str]:
+        
+        # 🔥 PATCH PIPPINUSDT: Jangan reverse saat squeeze aktif
+        # Kondisi: momentum besar + short/long liq dekat + volume spike
+        vol_spike = latest_volume / volume_ma10 if volume_ma10 > 0 else 1.0
+        
+        if abs(change_5m) > 5.0 and vol_spike > 3.0:
+            if change_5m > 0 and short_dist < 3.0:
+                return current_bias, f"{current_reason} | OBV reversal BLOCKED (active squeeze: {change_5m:.1f}% pump, vol {vol_spike:.1f}x, short liq {short_dist:.2f}%)"
+            if change_5m < 0 and long_dist < 3.0:
+                return current_bias, f"{current_reason} | OBV reversal BLOCKED (active squeeze: {change_5m:.1f}% dump, vol {vol_spike:.1f}x, long liq {long_dist:.2f}%)"
+        
+        # 🔥 PATCH 2: Jangan reverse saat change_5m sangat ekstrem (>8%)
+        if abs(change_5m) > 8.0:
+            return current_bias, f"{current_reason} | OBV reversal BLOCKED (extreme momentum {change_5m:.1f}% override)"
+        
         stoch_j = 3 * stoch_k - 2 * stoch_d
         obv_magnitude_strong = abs(obv_value) > 10_000_000
 
@@ -3822,6 +3908,74 @@ class OBVStochasticReversal:
                 return new_bias, f"{current_reason} | OBV+ (val={obv_value:,.0f}) & K<J → reversal to {new_bias}"
 
         return current_bias, f"{current_reason} | OBV magnitude {abs(obv_value):,.0f} (not strong enough for reversal)"
+
+
+class LiquidityDirectionAbsolutePriority:
+    """
+    🔥 JCTUSDT FIX: Jika long_liq LEBIH DEKAT dari short_liq,
+    HFT PASTI akan dump dulu untuk sweep long stop.
+    Ini harus override AbsoluteAggOverride (-1098).
+    
+    Logika:
+    - long_liq < short_liq → HFT path: dump → sweep long stop → pump (mungkin)
+    - short_liq < long_liq → HFT path: pump → sweep short stop → dump (mungkin)
+    
+    Jika selisih > 0.5% dan salah satu liq < 3%, ini bukan kebetulan.
+    
+    Priority: -1099.5 (antara BlowOffTop -1099 dan AbsoluteAgg -1098)
+    Karena liquidity proximity adalah fakta fisik market, 
+    lebih fundamental dari agg yang bisa di-spoof.
+    """
+    @staticmethod
+    def detect(short_dist: float, long_dist: float,
+               agg: float, ofi_bias: str, ofi_strength: float,
+               obv_trend: str, change_5m: float,
+               down_energy: float, up_energy: float) -> Dict:
+        
+        diff = abs(short_dist - long_dist)
+        
+        # Long liq jauh lebih dekat → HFT dump dulu
+        if (long_dist < short_dist and
+            long_dist < 3.0 and
+            diff > 0.3):
+            
+            # Konfirmasi: ada sell pressure atau momentum turun
+            sell_confirmed = (
+                ofi_bias == "SHORT" or
+                down_energy > up_energy or
+                change_5m < 0 or
+                (obv_trend in ["NEGATIVE_EXTREME", "NEGATIVE"] and agg < 0.7)
+            )
+            
+            if sell_confirmed:
+                return {
+                    "override": True,
+                    "bias": "SHORT",
+                    "reason": f"Liquidity direction priority: long liq {long_dist:.2f}% << short liq {short_dist:.2f}% (diff {diff:.2f}%), HFT akan dump ke long stop dulu",
+                    "priority": -1099
+                }
+        
+        # Short liq jauh lebih dekat → HFT pump dulu
+        if (short_dist < long_dist and
+            short_dist < 3.0 and
+            diff > 0.3):
+            
+            buy_confirmed = (
+                ofi_bias == "LONG" or
+                up_energy > down_energy or
+                change_5m > 0 or
+                (obv_trend in ["POSITIVE_EXTREME", "POSITIVE"] and agg > 0.3)
+            )
+            
+            if buy_confirmed:
+                return {
+                    "override": True,
+                    "bias": "LONG",
+                    "reason": f"Liquidity direction priority: short liq {short_dist:.2f}% << long liq {long_dist:.2f}% (diff {diff:.2f}%), HFT akan pump ke short stop dulu",
+                    "priority": -1099
+                }
+        
+        return {"override": False}
 
 
 class VolumeTrapDetector:
@@ -3917,6 +4071,54 @@ class LiquidationHeatMap:
         return {"bias": "NEUTRAL"}
 
 
+class OBVPriceVolumeDivergence:
+    """
+    🔥 JCTUSDT PATTERN: OBV sangat besar tapi harga tidak naik proporsional.
+    
+    OBV 1.1 miliar = volume transaksi akumulatif sangat besar.
+    Jika harga hanya +1.3% sementara OBV sudah besar,
+    ini artinya: smart money beli → harga naik sedikit → distribusi diam-diam.
+    
+    Logika:
+    - Jika obv_value > 500 juta DAN change_5m < 3% DAN long_liq < short_liq
+    → distribusi → SHORT
+    
+    Priority: -212 (di atas EnergyGapTrap -215)
+    """
+    @staticmethod
+    def detect(obv_value: float, change_5m: float,
+               long_dist: float, short_dist: float,
+               agg: float, volume_ratio: float) -> Dict:
+        
+        # OBV sangat besar tapi harga tidak naik proporsional = distribusi
+        if (obv_value > 500_000_000 and      # OBV raksasa
+            0 < change_5m < 3.0 and          # harga naik sedikit
+            long_dist < short_dist and        # long liq lebih dekat
+            long_dist < 3.0 and
+            volume_ratio < 0.8):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"OBV-Price divergence: OBV={obv_value:,.0f} raksasa tapi price hanya +{change_5m:.1f}%, long liq {long_dist:.2f}% lebih dekat → smart money distribusi diam-diam, dump imminent",
+                "priority": -212
+            }
+        
+        # Mirror: OBV sangat negatif tapi harga tidak turun proporsional = akumulasi
+        if (obv_value < -500_000_000 and
+            -3.0 < change_5m < 0 and
+            short_dist < long_dist and
+            short_dist < 3.0 and
+            volume_ratio < 0.8):
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": f"OBV-Price divergence: OBV={obv_value:,.0f} sangat negatif tapi price hanya {change_5m:.1f}%, short liq {short_dist:.2f}% lebih dekat → smart money akumulasi diam-diam, pump imminent",
+                "priority": -212
+            }
+        
+        return {"override": False}
+
+
 class QuantCrowdednessDetector:
     @staticmethod
     def detect(volume_ratio: float, volatility: float, open_interest_growth: float) -> Dict:
@@ -3936,6 +4138,66 @@ class QuantCrowdednessDetector:
                 "priority": 0
             }
         return {"crowded": False, "position_multiplier": 1.0, "priority": 0}
+
+
+class FundingNegativeOBVPositiveSqueezeFirst:
+    """
+    🔥 PUFFERUSDT PATTERN: Funding negatif + OBV POSITIVE EXTREME + short_liq dekat
+    
+    Ini adalah setup "squeeze dulu, dump belakangan":
+    1. Funding negatif = crowded short (banyak yang short)
+    2. OBV positif ekstrem = ada akumulasi nyata  
+    3. Short_liq dekat = target sweep ada di dekat
+    
+    HFT akan PUMP dulu untuk liquidasi semua short (sweep short stop),
+    BARU KEMUDIAN dump. Jadi bias jangka pendek = LONG.
+    
+    Bedanya dengan CUSDT:
+    - CUSDT: OBV NEUTRAL + RSI_5m=97 → sudah terlalu tinggi, langsung dump
+    - PUFFERUSDT: OBV POSITIVE EXTREME + RSI_5m=62 → masih ada ruang pump
+    
+    Priority: -1088 (antara ExtremeFundingBan -1085 dan ExtremeOversoldIgnore -1080)
+    """
+    @staticmethod
+    def detect(funding_rate: float, obv_trend: str, obv_value: float,
+               short_dist: float, long_dist: float,
+               rsi6_5m: float, down_energy: float,
+               change_5m: float) -> Dict:
+        
+        if funding_rate is None:
+            return {"override": False}
+        
+        # Funding negatif + OBV positif + short_liq dekat = sweep short dulu
+        if (funding_rate < -0.003 and          # crowded short
+            obv_trend == "POSITIVE_EXTREME" and # ada akumulasi
+            obv_value > 50_000_000 and
+            short_dist < 3.0 and               # target sweep dekat
+            short_dist < long_dist and
+            rsi6_5m < 80 and                   # belum blow-off top
+            down_energy < 0.1):                # tidak ada seller aktif
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": f"Funding negative + OBV positive + short liq close: funding={funding_rate:.4f} (crowded short), OBV={obv_value:,.0f} positive extreme, short liq {short_dist:.2f}% → HFT sweep short stops FIRST before dump",
+                "priority": -1088
+            }
+        
+        # Mirror: Funding positif + OBV negatif + long liq dekat = sweep long dulu
+        if (funding_rate > 0.003 and
+            obv_trend == "NEGATIVE_EXTREME" and
+            obv_value < -50_000_000 and
+            long_dist < 3.0 and
+            long_dist < short_dist and
+            rsi6_5m > 20 and
+            up_energy < 0.1):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"Funding positive + OBV negative + long liq close: funding={funding_rate:.4f} (crowded long), OBV={obv_value:,.0f} negative extreme, long liq {long_dist:.2f}% → HFT sweep long stops FIRST before pump",
+                "priority": -1088
+            }
+        
+        return {"override": False}
 
 
 class AlgoTypeAnalyzer:
@@ -4811,10 +5073,12 @@ class BinanceAnalyzer:
                         # 1.01. ABSOLUTE AGG OVERRIDE (Priority -1098)
                         elif AbsoluteAggOverride.detect(
                                 agg, down_energy, ofi["bias"], ofi["strength"],
-                                up_energy, funding_rate or 0)["override"]:
+                                up_energy, funding_rate or 0,
+                                liq["long_dist"], liq["short_dist"], obv_value)["override"]:
                             absolute_agg = AbsoluteAggOverride.detect(
                                 agg, down_energy, ofi["bias"], ofi["strength"],
-                                up_energy, funding_rate or 0
+                                up_energy, funding_rate or 0,
+                                liq["long_dist"], liq["short_dist"], obv_value
                             )
                             final_bias = absolute_agg["bias"]
                             final_reason = absolute_agg["reason"]
@@ -6075,7 +6339,9 @@ class BinanceAnalyzer:
                     final_confidence, final_reason = MultiTimeframeConfirmation.check(rsi6, rsi6_5m, final_confidence, final_reason)
                 final_bias, final_reason = OBVStochasticReversal.apply(
                     obv_trend, obv_value, stoch_k, stoch_d, final_bias, final_reason,
-                    volume_ratio, rsi6, rsi6_5m
+                    volume_ratio, rsi6, rsi6_5m,
+                    change_5m, liq["short_dist"], liq["long_dist"],
+                    latest_volume, volume_ma10
                 )
 
             volume_trap = VolumeTrapDetector.detect(volume_ratio, change_5m, final_bias)
@@ -6269,7 +6535,9 @@ class BinanceAnalyzer:
                 final_confidence, final_reason = MultiTimeframeConfirmation.check(rsi6, rsi6_5m, final_confidence, final_reason)
             final_bias, final_reason = OBVStochasticReversal.apply(
                 obv_trend, obv_value, stoch_k, stoch_d, final_bias, final_reason,
-                volume_ratio, rsi6, rsi6_5m
+                volume_ratio, rsi6, rsi6_5m,
+                change_5m, liq["short_dist"], liq["long_dist"],
+                latest_volume or 0.0, volume_ma10 or 1.0
             )
 
         volume_trap = VolumeTrapDetector.detect(volume_ratio, change_5m, final_bias)
