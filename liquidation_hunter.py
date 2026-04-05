@@ -412,6 +412,77 @@ def _check_bias_kill_conflict(data: dict, final_bias: str) -> dict:
     }
 
 
+# ========== NEW DETECTORS FROM LECTURER FEEDBACK ==========
+
+class BullishOrderFlowDivergence:
+    """
+    Detector: Bullish Order Flow Divergence (Distribution Trap)
+    
+    Kondisi:
+    - agg > 0.75 (atau ofi_bias == "LONG" dengan strength > 0.7)
+    - change_5m < -0.3% (harga turun atau flat)
+    - volume_ratio < 0.8 (volume rendah – tipikal distribusi diam-diam)
+    - greeks_kill_direction != "LONG" (opsional, untuk konfirmasi)
+    
+    Priority: -1101 (antara -1102 dan -1100)
+    Bias: SHORT
+    """
+    @staticmethod
+    def detect(agg: float, ofi_bias: str, ofi_strength: float,
+               change_5m: float, volume_ratio: float,
+               greeks_kill_direction: str) -> Dict:
+        # Divergensi: order flow bullish tapi harga turun
+        if (agg > 0.75 and change_5m < -0.3 and volume_ratio < 0.8):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"Bullish order flow divergence: agg={agg:.2f} (buy dominant) tapi price turun {change_5m:.1f}%, volume rendah {volume_ratio:.2f}x → smart money distributing, forced SHORT",
+                "priority": -1101
+            }
+        # Cek juga dengan ofi_bias
+        if (ofi_bias == "LONG" and ofi_strength > 0.7 and change_5m < -0.3 and volume_ratio < 0.8):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"Bullish OFI divergence: ofi_bias={ofi_bias} (strength={ofi_strength:.2f}) tapi price turun {change_5m:.1f}%, volume rendah {volume_ratio:.2f}x → smart money distributing, forced SHORT",
+                "priority": -1101
+            }
+        return {"override": False}
+
+
+class KillLiquidityConflict:
+    """
+    Detector: Kill Direction vs Liquidity Proximity Conflict
+    
+    Kondisi:
+    - short_liq < long_liq (short lebih dekat) DAN greeks_kill_direction == "SHORT"
+    - ATAU long_liq < short_liq DAN greeks_kill_direction == "LONG"
+    
+    Jika konflik, ikuti greeks_kill_direction (karena Greeks lebih akurat untuk jangka pendek)
+    TAPI turunkan confidence atau tambahkan warning.
+    
+    Priority: -1100 (di atas Vega spike)
+    """
+    @staticmethod
+    def detect(short_dist: float, long_dist: float,
+               kill_dir: str, gamma_executing: bool) -> Dict:
+        if kill_dir == "SHORT" and short_dist < long_dist and short_dist < 3.0:
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"KILL-LIQUIDITY CONFLICT: kill_dir={kill_dir} tapi short liq={short_dist:.2f}% lebih dekat. Greeks override liquidity → SHORT",
+                "priority": -1100
+            }
+        if kill_dir == "LONG" and long_dist < short_dist and long_dist < 3.0:
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": f"KILL-LIQUIDITY CONFLICT: kill_dir={kill_dir} tapi long liq={long_dist:.2f}% lebih dekat. Greeks override liquidity → LONG",
+                "priority": -1100
+            }
+        return {"override": False}
+
+
 def detect_market_phase(data: dict) -> PhaseResult:
     """
     Fungsi utama. Panggil ini SEBELUM logika bias utama lo.
@@ -907,6 +978,16 @@ def _greeks_absolute_score(
 
     if vega["active"] and gamma_intensity in ("LOW", "MODERATE"):
         fade_direction = "SHORT" if vega["bait_direction"] == "UP" else "LONG"
+        # Cek konflik dengan kill direction
+        if kill_direction != "NEUTRAL" and fade_direction != kill_direction:
+            # Abaikan Vega, ikuti kill direction
+            return {
+                "final_bias": kill_direction,
+                "override": True,
+                "confidence": "ABSOLUTE",
+                "priority": -9991.5,
+                "score_reason": f"VEGA-KILL CONFLICT: Vega fade={fade_direction} tapi kill={kill_direction} → ikuti kill direction (Greeks lebih akurat)"
+            }
         return {
             "final_bias":   fade_direction,
             "override":     True,
@@ -7834,7 +7915,38 @@ class BinanceAnalyzer:
         bias_conflict = _check_bias_kill_conflict(result, result.get("bias", "NEUTRAL"))
         result["bias_kill_conflict"] = bias_conflict
 
-        # 5. Apply semua ke entry_allowed
+        # 5. NEW DETECTORS FROM LECTURER FEEDBACK
+        # 5a. Bullish Order Flow Divergence Detector
+        agg = result.get("agg", 0.0)
+        ofi_bias = result.get("ofi_bias", "")
+        ofi_strength = result.get("ofi_strength", 0.0)
+        change_5m = result.get("change_5m", 0.0)
+        volume_ratio = result.get("volume_ratio", 1.0)
+        
+        divergence_result = BullishOrderFlowDivergence.detect(
+            agg=agg,
+            ofi_bias=ofi_bias,
+            ofi_strength=ofi_strength,
+            change_5m=change_5m,
+            volume_ratio=volume_ratio,
+            greeks_kill_direction=kill_dir
+        )
+        result["bullish_orderflow_divergence"] = divergence_result
+        
+        # 5b. Kill-Liquidity Conflict Detector
+        short_liq = result.get("short_liq", 99.0)
+        long_liq = result.get("long_liq", 99.0)
+        gamma_executing = result.get("greeks_gamma_executing", False)
+        
+        kill_liq_result = KillLiquidityConflict.detect(
+            short_dist=short_liq,
+            long_dist=long_liq,
+            kill_dir=kill_dir,
+            gamma_executing=gamma_executing
+        )
+        result["kill_liquidity_conflict"] = kill_liq_result
+
+        # 6. Apply semua ke entry_allowed
         if result.get("entry_allowed", True):  # hanya block jika belum di-block
             
             if dual_trap["dual_liq_trap"]:
@@ -7851,6 +7963,18 @@ class BinanceAnalyzer:
                 # Koreksi bias ke arah yang benar
                 result["bias_corrected"] = bias_conflict["correct_direction"]
                 result["reason"] = f"[BIAS CORRECTED → {bias_conflict['correct_direction']}] " + result.get("reason", "")
+            
+            elif divergence_result.get("override", False):
+                # Override dari Bullish Order Flow Divergence
+                result["bias"] = divergence_result["bias"]
+                result["reason"] = f"[ORDERFLOW DIVERGENCE] {divergence_result['reason']} | " + result.get("reason", "")
+                result["priority_level"] = divergence_result.get("priority", -1101)
+            
+            elif kill_liq_result.get("override", False):
+                # Override dari Kill-Liquidity Conflict
+                result["bias"] = kill_liq_result["bias"]
+                result["reason"] = f"[KILL-LIQUIDITY CONFLICT] {kill_liq_result['reason']} | " + result.get("reason", "")
+                result["priority_level"] = kill_liq_result.get("priority", -1100)
         
         return result
 
