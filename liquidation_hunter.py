@@ -1118,23 +1118,27 @@ def _greeks_absolute_score(
         
         # VEGA OVERRIDE GUARD (Priority -9991.8)
         # Guard: jika short liq super dekat + buy pressure, override Vega ke LONG
-        agg = data.get("agg", 0.0)
-        if short_dist < 1.0 and agg > 0.7 and change_5m > 0:
+        short_liq_val = data.get("short_liq", 99.0)
+        long_liq_val = data.get("long_liq", 99.0)
+        agg_val = data.get("agg", 0.0)
+        change_5m_val = data.get("change_5m", 0.0)
+        
+        if short_liq_val < 1.0 and agg_val > 0.7 and change_5m_val > 0:
             return {
                 "final_bias": "LONG",
                 "override": True,
                 "confidence": "ABSOLUTE",
                 "priority": -9991.8,
-                "score_reason": f"VEGA OVERRIDDEN: short liq {short_dist:.2f}% super close, agg={agg:.2f} buy dominant → prioritize squeeze over fake move"
+                "score_reason": f"VEGA OVERRIDDEN: short liq {short_liq_val:.2f}% super close, agg={agg_val:.2f} buy dominant → prioritize squeeze over fake move"
             }
         # Guard: jika long liq super dekat + sell pressure, override Vega ke SHORT
-        if long_dist < 1.0 and agg < 0.3 and change_5m < 0:
+        if long_liq_val < 1.0 and agg_val < 0.3 and change_5m_val < 0:
             return {
                 "final_bias": "SHORT",
                 "override": True,
                 "confidence": "ABSOLUTE",
                 "priority": -9991.8,
-                "score_reason": f"VEGA OVERRIDDEN: long liq {long_dist:.2f}% super close, agg={agg:.2f} sell dominant → prioritize squeeze over fake move"
+                "score_reason": f"VEGA OVERRIDDEN: long liq {long_liq_val:.2f}% super close, agg={agg_val:.2f} sell dominant → prioritize squeeze over fake move"
             }
         
         # Cek konflik dengan kill direction
