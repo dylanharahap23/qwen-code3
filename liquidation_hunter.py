@@ -5,6 +5,7 @@
 🎯 Priority Ladder: MasterSqueezeRule (-1100) > LiquidityMagnet (-1000) > OFIAbsorption (-950) > VelocityDecay (-900) > EmptyBook (-850)
 🎯 Golden Rule: LONG UNTIL SHORT LIQ SWEPT / SHORT UNTIL LONG LIQ SWEPT
 🎯 Market Phase Detector: PREP (no trade) | BAIT (caution) | KILL (trade ok)
+🎯 Greeks Final Screener: Theta (Prep) | Vega (Bait) | Delta+Gamma (Kill) — 7% Rule
 """
 
 import requests
@@ -323,6 +324,610 @@ def apply_phase_override(original_result: dict, phase_result: PhaseResult) -> di
             result["confidence"] = "HIGH"
 
     return result
+
+
+# ================= GREEKS FINAL SCREENER =================
+
+BiasTypeGreeks = Literal["LONG", "SHORT", "NEUTRAL"]
+
+
+@dataclass
+class GreeksResult:
+    """Output dari Greeks Final Screener."""
+    greeks_bias:       BiasTypeGreeks    # bias final dari Greeks analysis
+    override:          bool              # True = paksa override result sebelumnya
+    confidence:        str               # selalu "ABSOLUTE"
+    priority:          int               # -9999 = tertinggi mutlak
+    liq_target:        str               # "LONG_7PCT" | "SHORT_7PCT" | "BOTH" | "NONE"
+    kill_direction:    BiasTypeGreeks    # arah yang akan "dibunuh" (posisi yang di-liquidate)
+    who_dies_first:    str               # "LONG_TRADERS" | "SHORT_TRADERS" | "UNCLEAR"
+    delta_exposure:    float             # estimasi dollar exposure massa
+    gamma_acceleration: float            # kecepatan accelerasi kill
+    theta_decay_active: bool             # apakah Theta sedang bekerja (Prep phase)
+    vega_spike_active:  bool             # apakah Vega/IV spike sedang terjadi (Bait)
+    reason:            str
+    sub_signals:       dict = field(default_factory=dict)
+
+
+def _theta_check(data: dict) -> dict:
+    """
+    Theta = time decay yang menghabiskan extrinsic value trader.
+    
+    Binance menggunakan sideways untuk:
+    1. Membuat trader lelah (stop loss hit karena boredom)
+    2. Menguras modal trader yang pakai leverage (funding cost)
+    3. Reset bias retail sebelum actual move
+
+    Sinyal Theta aktif:
+    - change_5m flat (< 0.3%)
+    - volume sangat rendah (< 0.5x)
+    - funding rate negatif (retail yang long sedang bayar funding = modal terkuras)
+    - RSI netral (40-60) = tidak ada momentum jelas
+    - agg netral (0.4-0.6) = tidak ada dominasi buyer/seller
+    """
+    change_5m    = abs(data.get("change_5m", 0.0))
+    volume_ratio = data.get("volume_ratio", 1.0)
+    funding_rate = data.get("funding_rate") or 0.0
+    rsi6         = data.get("rsi6", 50.0)
+    agg          = data.get("agg", 0.5)
+    down_energy  = data.get("down_energy", 0.0)
+    up_energy    = data.get("up_energy", 0.0)
+
+    theta_conditions = {
+        "flat_price":      change_5m < 0.3,
+        "low_volume":      volume_ratio < 0.5,
+        "funding_draining": funding_rate < -0.001,
+        "rsi_neutral":     38 < rsi6 < 62,
+        "agg_neutral":     0.38 < agg < 0.62,
+        "no_dominant_energy": max(up_energy, down_energy) < 0.5,
+    }
+
+    triggered = {k: v for k, v in theta_conditions.items() if v}
+    score = len(triggered)
+
+    return {
+        "active": score >= 4,
+        "score": score,
+        "max_score": 6,
+        "triggered": triggered,
+        "funding_drain_rate": abs(funding_rate) * 100,
+        "reason": (
+            f"Theta aktif ({score}/6): pasar sideways, funding drain "
+            f"{abs(funding_rate)*100:.4f}%/8h, retail terkuras sebelum move besar"
+        ) if score >= 4 else "Theta tidak aktif"
+    }
+
+
+def _vega_check(data: dict) -> dict:
+    """
+    Vega = sensitivitas terhadap perubahan Implied Volatility (IV).
+    
+    Binance menggunakan IV spike untuk:
+    1. Membuat harga kontrak terlihat "mahal" → memancing retail masuk posisi
+    2. Menciptakan FOMO: "harga bergerak! harus masuk sekarang!"
+    3. Setelah posisi retail terisi → IV collapse → harga balik
+
+    Sinyal Vega/IV spike aktif:
+    - change_5m moderate (1-4%) — cukup besar untuk menarik perhatian
+    - volume rendah (< 0.7x) — gerakan tidak didukung volume nyata
+    - RSI mulai overbought/oversold tapi belum ekstrem
+    - OBV tidak konfirmasi arah (NEUTRAL) — smart money tidak ikut
+    - OFI tidak searah — order book tidak mendukung arah harga
+    """
+    change_5m    = abs(data.get("change_5m", 0.0))
+    volume_ratio = data.get("volume_ratio", 1.0)
+    rsi6         = data.get("rsi6", 50.0)
+    obv_trend    = data.get("obv_trend", "NEUTRAL")
+    ofi_bias     = data.get("ofi_bias", "NEUTRAL")
+    agg          = data.get("agg", 0.5)
+    funding_rate = data.get("funding_rate") or 0.0
+    up_energy    = data.get("up_energy", 0.0)
+    down_energy  = data.get("down_energy", 0.0)
+
+    price_direction = "UP" if data.get("change_5m", 0.0) > 0 else "DOWN"
+
+    vega_conditions = {
+        "moderate_move":        1.0 <= change_5m < 4.5,
+        "low_supporting_volume": volume_ratio < 0.7,
+        "obv_not_confirming":   obv_trend == "NEUTRAL",
+        "ofi_diverging":        (
+            (price_direction == "UP" and ofi_bias == "SHORT") or
+            (price_direction == "DOWN" and ofi_bias == "LONG") or
+            ofi_bias == "NEUTRAL"
+        ),
+        "rsi_moved_not_extreme": (
+            (55 < rsi6 < 75 and price_direction == "UP") or
+            (25 < rsi6 < 45 and price_direction == "DOWN")
+        ),
+        "agg_mismatch":         (
+            (price_direction == "UP" and agg < 0.6) or
+            (price_direction == "DOWN" and agg > 0.4)
+        ),
+    }
+
+    triggered = {k: v for k, v in vega_conditions.items() if v}
+    score = len(triggered)
+
+    if score >= 4:
+        bait_direction = price_direction
+        trap_direction = "SHORT" if bait_direction == "UP" else "LONG"
+        reason = (
+            f"Vega/IV spike aktif ({score}/6): fake {bait_direction.lower()} "
+            f"{change_5m:.1f}% tanpa konfirmasi volume ({volume_ratio:.2f}x), "
+            f"OBV={obv_trend}, OFI={ofi_bias} → retail dipancing {bait_direction}, "
+            f"setelah penuh akan dibalik ke {trap_direction}"
+        )
+    else:
+        trap_direction = "NEUTRAL"
+        reason = "Vega/IV spike tidak aktif"
+
+    return {
+        "active": score >= 4,
+        "score": score,
+        "max_score": 6,
+        "triggered": triggered,
+        "bait_direction": price_direction if score >= 4 else "NEUTRAL",
+        "trap_direction": trap_direction,
+        "reason": reason
+    }
+
+
+def _delta_calculate(data: dict) -> dict:
+    """
+    Delta = "Share Equivalency" dari posisi massa.
+    
+    Jika massa melakukan Long banyak dengan Delta 0.50,
+    Binance melihat ini sebagai beban besar yang harus "dibersihkan".
+    
+    Untuk menghancurkan posisi Long dengan Delta tinggi:
+    → Binance hanya perlu dump sampai margin call terpicu
+    → Dengan leverage 10x: 7-8% drop = LIQUIDASI
+    
+    Logic:
+    - Siapa yang lebih banyak posisi terbuka (proxy: funding rate + OFI)
+    - Berapa % price move yang dibutuhkan untuk mencapai liq point
+    - short_liq dan long_liq dari result = jarak ke titik kehancuran massa
+
+    Output:
+    - who_is_crowded: "LONG" atau "SHORT" (siapa yang lebih banyak posisi)
+    - delta_long: estimasi exposure posisi long massa (0-1 scale)
+    - delta_short: estimasi exposure posisi short massa (0-1 scale)
+    - liq_7pct_touch: siapa yang kena 7% duluan
+    """
+    short_liq    = data.get("short_liq", 99.0)
+    long_liq     = data.get("long_liq", 99.0)
+    funding_rate = data.get("funding_rate") or 0.0
+    ofi_bias     = data.get("ofi_bias", "NEUTRAL")
+    ofi_strength = data.get("ofi_strength", 0.0)
+    agg          = data.get("agg", 0.5)
+    rsi6         = data.get("rsi6", 50.0)
+    volume_ratio = data.get("volume_ratio", 1.0)
+    up_energy    = data.get("up_energy", 0.0)
+    down_energy  = data.get("down_energy", 0.0)
+    change_5m    = data.get("change_5m", 0.0)
+
+    LEVERAGE_KILL_PCT = 7.0
+
+    funding_long_pressure = max(0.0, -funding_rate * 100)
+    funding_short_pressure = max(0.0, funding_rate * 100)
+
+    ofi_long_add  = ofi_strength if ofi_bias == "LONG" else 0.0
+    ofi_short_add = ofi_strength if ofi_bias == "SHORT" else 0.0
+
+    agg_long_pressure  = max(0.0, agg - 0.5) * 2
+    agg_short_pressure = max(0.0, 0.5 - agg) * 2
+
+    rsi_long  = max(0.0, (rsi6 - 50) / 50) if rsi6 > 50 else 0.0
+    rsi_short = max(0.0, (50 - rsi6) / 50) if rsi6 < 50 else 0.0
+
+    raw_delta_long  = (
+        funding_long_pressure * 0.35 +
+        ofi_long_add          * 0.25 +
+        agg_long_pressure     * 0.20 +
+        rsi_long              * 0.20
+    )
+    raw_delta_short = (
+        funding_short_pressure * 0.35 +
+        ofi_short_add          * 0.25 +
+        agg_short_pressure     * 0.20 +
+        rsi_short              * 0.20
+    )
+
+    total = raw_delta_long + raw_delta_short
+    if total > 0:
+        delta_long  = raw_delta_long / total
+        delta_short = raw_delta_short / total
+    else:
+        delta_long = delta_short = 0.5
+
+    short_dies_at  = short_liq
+    long_dies_at   = long_liq
+
+    if short_dies_at <= LEVERAGE_KILL_PCT and long_dies_at > LEVERAGE_KILL_PCT:
+        liq_7pct_touch = "SHORT_TRADERS_DIE"
+        kill_direction = "LONG"
+        who_dies_first = "SHORT_TRADERS"
+    elif long_dies_at <= LEVERAGE_KILL_PCT and short_dies_at > LEVERAGE_KILL_PCT:
+        liq_7pct_touch = "LONG_TRADERS_DIE"
+        kill_direction = "SHORT"
+        who_dies_first = "LONG_TRADERS"
+    elif short_dies_at <= LEVERAGE_KILL_PCT and long_dies_at <= LEVERAGE_KILL_PCT:
+        liq_7pct_touch = "BOTH"
+        kill_direction = "SHORT" if delta_long > delta_short else "LONG"
+        who_dies_first = "BOTH_POSSIBLE"
+    else:
+        liq_7pct_touch = "NONE_IN_RANGE"
+        kill_direction = "SHORT" if delta_long > delta_short else "LONG"
+        who_dies_first = "LONG_TRADERS" if delta_long > delta_short else "SHORT_TRADERS"
+
+    who_is_crowded = "LONG" if delta_long > delta_short else "SHORT"
+
+    liq_pressure_short = max(0.0, 10.0 - short_dies_at) / 10.0
+    liq_pressure_long  = max(0.0, 10.0 - long_dies_at)  / 10.0
+    delta_exposure = max(liq_pressure_short, liq_pressure_long)
+
+    return {
+        "delta_long":      round(delta_long, 3),
+        "delta_short":     round(delta_short, 3),
+        "who_is_crowded":  who_is_crowded,
+        "kill_direction":  kill_direction,
+        "who_dies_first":  who_dies_first,
+        "liq_7pct_touch":  liq_7pct_touch,
+        "delta_exposure":  round(delta_exposure, 3),
+        "short_dies_at":   short_dies_at,
+        "long_dies_at":    long_dies_at,
+        "reason": (
+            f"Delta: Long exposure {delta_long:.2f} vs Short {delta_short:.2f}. "
+            f"Crowded: {who_is_crowded}. Short dies at +{short_dies_at:.2f}%, "
+            f"Long dies at -{long_dies_at:.2f}%. "
+            f"7% kill zone: {liq_7pct_touch}. Kill arah: {kill_direction}"
+        )
+    }
+
+
+def _gamma_calculate(data: dict, delta_data: dict) -> dict:
+    """
+    Gamma = akselerasi Delta saat harga mendekati liq point.
+    
+    Saat harga mendekati titik likuidasi massa:
+    → Gamma membuat Delta posisi melonjak
+    → Kerugian bertambah LEBIH CEPAT dari penurunan harga
+    → Ini "bola salju" — semakin dekat liq, semakin cepat hancur
+
+    Binance tahu ini dan menggunakannya:
+    → Cukup bergerak sedikit saat dekat liq zone → Gamma yang lakukan sisanya
+
+    Proxy Gamma dari data kita:
+    - Semakin dekat ke liq zone = Gamma semakin tinggi
+    - up_energy / down_energy = energi yang tersedia untuk akselerasi
+    - Volume spike = Gamma executor (tanda HFT sudah mulai akselerasi)
+
+    Formula approximation:
+    Gamma_effect = (1 / distance_to_liq)^2 * available_energy
+    """
+    short_liq    = data.get("short_liq", 99.0)
+    long_liq     = data.get("long_liq", 99.0)
+    up_energy    = data.get("up_energy", 0.0)
+    down_energy  = data.get("down_energy", 0.0)
+    volume_ratio = data.get("volume_ratio", 1.0)
+    change_5m    = data.get("change_5m", 0.0)
+    latest_volume = data.get("latest_volume", 0.0)
+    volume_ma10   = data.get("volume_ma10", 1.0)
+
+    kill_direction = delta_data.get("kill_direction", "NEUTRAL")
+    who_dies_first = delta_data.get("who_dies_first", "UNCLEAR")
+
+    def gamma_from_distance(distance: float, energy: float) -> float:
+        """Semakin dekat (distance kecil) = Gamma semakin tinggi."""
+        if distance <= 0:
+            return 10.0
+        base_gamma = min(10.0, 1.0 / (distance ** 1.5))
+        energy_boost = 1.0 + min(energy, 5.0) * 0.3
+        return round(base_gamma * energy_boost, 3)
+
+    if kill_direction == "LONG":
+        gamma_active = gamma_from_distance(short_liq, up_energy)
+        distance_to_kill = short_liq
+        energy_for_kill = up_energy
+    elif kill_direction == "SHORT":
+        gamma_active = gamma_from_distance(long_liq, down_energy)
+        distance_to_kill = long_liq
+        energy_for_kill = down_energy
+    else:
+        gamma_active = 0.0
+        distance_to_kill = min(short_liq, long_liq)
+        energy_for_kill = max(up_energy, down_energy)
+
+    vol_spike_ratio = latest_volume / volume_ma10 if volume_ma10 > 0 else 1.0
+    gamma_executing = vol_spike_ratio > 2.0 and abs(change_5m) > 1.5
+
+    if gamma_active >= 3.0:
+        intensity = "EXTREME"
+        description = f"Gamma EXTREME: {distance_to_kill:.2f}% dari kill zone, akselerasi brutal"
+    elif gamma_active >= 1.0:
+        intensity = "HIGH"
+        description = f"Gamma HIGH: {distance_to_kill:.2f}% dari kill zone, akselerasi kuat"
+    elif gamma_active >= 0.3:
+        intensity = "MODERATE"
+        description = f"Gamma MODERATE: {distance_to_kill:.2f}% dari kill zone, mulai akselerasi"
+    else:
+        intensity = "LOW"
+        description = f"Gamma LOW: {distance_to_kill:.2f}% dari kill zone, belum akselerasi"
+
+    kill_speed = min(10.0, gamma_active * 2.0 + (vol_spike_ratio - 1.0) * 0.5)
+
+    return {
+        "gamma_value":      gamma_active,
+        "gamma_intensity":  intensity,
+        "kill_speed":       round(kill_speed, 2),
+        "distance_to_kill": distance_to_kill,
+        "energy_for_kill":  energy_for_kill,
+        "gamma_executing":  gamma_executing,
+        "vol_spike_ratio":  round(vol_spike_ratio, 2),
+        "reason": (
+            f"Gamma {intensity}: jarak ke kill zone {distance_to_kill:.2f}%, "
+            f"kill speed {kill_speed:.1f}/10, "
+            f"{'SEDANG DIEKSEKUSI HFT' if gamma_executing else 'belum eksekusi'}"
+        )
+    }
+
+
+def _greeks_absolute_score(
+    theta:  dict,
+    vega:   dict,
+    delta:  dict,
+    gamma:  dict,
+    data:   dict
+) -> dict:
+    """
+    Gabungkan semua Greeks menjadi satu scoring.
+    
+    Rules:
+    1. Theta aktif = PREP phase → NO TRADE (confidence tetap ABSOLUTE)
+    2. Vega aktif = BAIT phase → fade the move (masuk arah berlawanan)
+    3. Delta + Gamma = KILL phase → ikuti arah kill
+    
+    Priority system:
+    - Jika Theta aktif saja → NEUTRAL ABSOLUTE (pasar belum siap)
+    - Jika Vega aktif → bias = fade direction (kebalikan bait)
+    - Jika Delta menunjuk jelas → bias = kill_direction
+    - Jika Gamma EXTREME → lock bias = kill_direction ABSOLUTE
+
+    7% Rule (inti dari semua ini):
+    "Siapa yang menyentuh 7% duluan = siapa yang dimakan Binance"
+    """
+    short_liq    = data.get("short_liq", 99.0)
+    long_liq     = data.get("long_liq", 99.0)
+    change_5m    = data.get("change_5m", 0.0)
+    rsi6         = data.get("rsi6", 50.0)
+    volume_ratio = data.get("volume_ratio", 1.0)
+    funding_rate = data.get("funding_rate") or 0.0
+
+    KILL_THRESHOLD_PCT = 7.0
+
+    kill_direction  = delta.get("kill_direction", "NEUTRAL")
+    who_dies_first  = delta.get("who_dies_first", "UNCLEAR")
+    liq_7pct        = delta.get("liq_7pct_touch", "NONE_IN_RANGE")
+    delta_exposure  = delta.get("delta_exposure", 0.0)
+    gamma_intensity = gamma.get("gamma_intensity", "LOW")
+    gamma_executing = gamma.get("gamma_executing", False)
+    kill_speed      = gamma.get("kill_speed", 0.0)
+
+    if theta["active"] and not vega["active"] and gamma_intensity == "LOW":
+        return {
+            "final_bias":   "NEUTRAL",
+            "override":     True,
+            "confidence":   "ABSOLUTE",
+            "priority":     -9990,
+            "score_reason": (
+                f"GREEKS: Theta aktif ({theta['score']}/6) — PREP phase. "
+                f"Funding drain {theta['funding_drain_rate']:.4f}%/8h. "
+                f"Pasar sideways menguras trader sebelum move. NO TRADE."
+            )
+        }
+
+    if vega["active"] and gamma_intensity in ("LOW", "MODERATE"):
+        fade_direction = "SHORT" if vega["bait_direction"] == "UP" else "LONG"
+        return {
+            "final_bias":   fade_direction,
+            "override":     True,
+            "confidence":   "ABSOLUTE",
+            "priority":     -9991,
+            "score_reason": (
+                f"GREEKS: Vega/IV spike aktif ({vega['score']}/6) — BAIT phase. "
+                f"Fake {vega['bait_direction']} {abs(change_5m):.1f}% tanpa volume. "
+                f"Retail dipancing {vega['bait_direction']}, fade ke {fade_direction}."
+            )
+        }
+
+    if gamma_intensity == "EXTREME" or (gamma_executing and kill_speed >= 5.0):
+        return {
+            "final_bias":   kill_direction,
+            "override":     True,
+            "confidence":   "ABSOLUTE",
+            "priority":     -9999,
+            "score_reason": (
+                f"GREEKS GAMMA EXTREME: kill speed {kill_speed:.1f}/10, "
+                f"{who_dies_first} sedang dieksekusi. "
+                f"Arah: {kill_direction}. LOCK ABSOLUTE."
+            )
+        }
+
+    if liq_7pct in ("SHORT_TRADERS_DIE", "LONG_TRADERS_DIE"):
+        return {
+            "final_bias":   kill_direction,
+            "override":     True,
+            "confidence":   "ABSOLUTE",
+            "priority":     -9995,
+            "score_reason": (
+                f"GREEKS DELTA: {liq_7pct} — {who_dies_first} menyentuh 7% kill zone. "
+                f"Short liq {short_liq:.2f}%, Long liq {long_liq:.2f}%. "
+                f"Binance eksekusi {kill_direction}. ABSOLUTE."
+            )
+        }
+
+    if delta_exposure >= 0.6 and gamma_intensity == "HIGH":
+        return {
+            "final_bias":   kill_direction,
+            "override":     True,
+            "confidence":   "ABSOLUTE",
+            "priority":     -9993,
+            "score_reason": (
+                f"GREEKS DELTA+GAMMA: exposure {delta_exposure:.2f}, "
+                f"Gamma HIGH, {who_dies_first} dalam danger zone. "
+                f"Kill arah: {kill_direction}. ABSOLUTE."
+            )
+        }
+
+    if theta["active"] and vega["active"]:
+        trap_target = vega.get("trap_direction", "NEUTRAL")
+        if trap_target != "NEUTRAL":
+            return {
+                "final_bias":   trap_target,
+                "override":     True,
+                "confidence":   "ABSOLUTE",
+                "priority":     -9992,
+                "score_reason": (
+                    f"GREEKS THETA+VEGA: sideways (Theta {theta['score']}/6) "
+                    f"+ fake move (Vega {vega['score']}/6). "
+                    f"Setup klasik: retail sudah ditipu {vega['bait_direction']}, "
+                    f"kill akan ke {trap_target}. ABSOLUTE."
+                )
+            }
+
+    if delta_exposure >= 0.4 and kill_direction != "NEUTRAL":
+        return {
+            "final_bias":   kill_direction,
+            "override":     False,
+            "confidence":   "ABSOLUTE",
+            "priority":     -9980,
+            "score_reason": (
+                f"GREEKS DELTA: exposure {delta_exposure:.2f}, "
+                f"crowded: {delta.get('who_is_crowded')}. "
+                f"Kill arah {kill_direction}. Reinforcing existing bias."
+            )
+        }
+
+    return {
+        "final_bias":   "NEUTRAL",
+        "override":     False,
+        "confidence":   "ABSOLUTE",
+        "priority":     -9970,
+        "score_reason": (
+            f"GREEKS: Tidak ada sinyal kuat. "
+            f"Theta {theta['score']}/6, Vega {vega['score']}/6, "
+            f"Delta exposure {delta_exposure:.2f}, Gamma {gamma_intensity}. "
+            f"Biarkan sinyal sebelumnya."
+        )
+    }
+
+
+def greeks_final_screen(result: dict) -> dict:
+    """
+    Layer terakhir — dipanggil setelah semua logika selesai.
+    
+    Parameter
+    ---------
+    result : dict
+        Output dict dari analyzer.analyze() + apply_phase_override().
+        Keys yang dipakai:
+          change_5m, volume_ratio, funding_rate, rsi6, agg, ofi_bias,
+          ofi_strength, short_liq, long_liq, up_energy, down_energy,
+          obv_trend, latest_volume, volume_ma10, bias (existing)
+
+    Returns
+    -------
+    dict
+        result yang sudah di-patch dengan Greeks analysis.
+        Keys tambahan:
+          greeks_bias, greeks_override, greeks_confidence, greeks_priority
+          greeks_theta_active, greeks_vega_active, greeks_delta_exposure
+          greeks_gamma_intensity, greeks_gamma_executing, greeks_kill_speed
+          greeks_who_dies_first, greeks_liq_7pct, greeks_reason
+
+    Contoh integrate:
+        result = analyzer.analyze()
+        result = apply_phase_override(result, phase_result)
+        result = greeks_final_screen(result)  # ← tambahkan ini
+        
+        # Output formatter lo akan otomatis punya field baru:
+        # result["greeks_bias"], result["greeks_who_dies_first"], dll
+    """
+    output = result.copy()
+
+    theta = _theta_check(result)
+    vega  = _vega_check(result)
+    delta = _delta_calculate(result)
+    gamma = _gamma_calculate(result, delta)
+
+    score = _greeks_absolute_score(theta, vega, delta, gamma, result)
+
+    output["greeks_bias"]             = score["final_bias"]
+    output["greeks_override"]         = score["override"]
+    output["greeks_confidence"]       = score["confidence"]
+    output["greeks_priority"]         = score["priority"]
+    output["greeks_reason"]           = score["score_reason"]
+    output["greeks_theta_active"]     = theta["active"]
+    output["greeks_theta_score"]      = theta["score"]
+    output["greeks_vega_active"]      = vega["active"]
+    output["greeks_vega_score"]       = vega["score"]
+    output["greeks_delta_exposure"]   = delta["delta_exposure"]
+    output["greeks_delta_crowded"]    = delta["who_is_crowded"]
+    output["greeks_gamma_intensity"]  = gamma["gamma_intensity"]
+    output["greeks_gamma_executing"]  = gamma["gamma_executing"]
+    output["greeks_kill_speed"]       = gamma["kill_speed"]
+    output["greeks_who_dies_first"]   = delta["who_dies_first"]
+    output["greeks_liq_7pct"]         = delta["liq_7pct_touch"]
+    output["greeks_kill_direction"]   = delta["kill_direction"]
+
+    if score["override"]:
+        output["bias"]       = score["final_bias"]
+        output["confidence"] = "ABSOLUTE"
+        output["reason"]     = (
+            f"[GREEKS OVERRIDE] {score['score_reason']} "
+            f"| Original: {result.get('reason', '')}"
+        )
+        output["priority_level"] = score["priority"]
+
+    elif score["final_bias"] == result.get("bias") and score["final_bias"] != "NEUTRAL":
+        output["reason"] = (
+            result.get("reason", "") +
+            f" | GREEKS CONFIRM: {score['score_reason']}"
+        )
+        output["confidence"] = "ABSOLUTE"
+
+    else:
+        output["greeks_summary"] = (
+            f"Theta {theta['score']}/6 | Vega {vega['score']}/6 | "
+            f"Delta {delta['delta_exposure']:.2f} ({delta['who_is_crowded']} crowded) | "
+            f"Gamma {gamma['gamma_intensity']} speed {gamma['kill_speed']:.1f}/10 | "
+            f"7% kill: {delta['liq_7pct_touch']} → {delta['kill_direction']}"
+        )
+
+    return output
+
+
+def print_greeks_section(result: dict):
+    """
+    Tambahkan ini ke OutputFormatter.print_signal() lo.
+    
+    Contoh:
+        OutputFormatter.print_signal(result)
+        print_greeks_section(result)
+    """
+    print("\n" + "="*40)
+    print("🧬 GREEKS FINAL SCREENER:")
+    print(f"   Kill direction : {result.get('greeks_kill_direction', 'N/A')}")
+    print(f"   Who dies first : {result.get('greeks_who_dies_first', 'N/A')}")
+    print(f"   7% liq touch   : {result.get('greeks_liq_7pct', 'N/A')}")
+    print(f"   Delta exposure : {result.get('greeks_delta_exposure', 0):.3f}")
+    print(f"   Gamma          : {result.get('greeks_gamma_intensity', 'N/A')} (speed {result.get('greeks_kill_speed', 0):.1f}/10)")
+    print(f"   Theta active   : {result.get('greeks_theta_active', False)} ({result.get('greeks_theta_score', 0)}/6)")
+    print(f"   Vega active    : {result.get('greeks_vega_active', False)} ({result.get('greeks_vega_score', 0)}/6)")
+    print(f"   Greeks bias    : {result.get('greeks_bias', 'N/A')}")
+    print(f"   Override       : {result.get('greeks_override', False)}")
+    if result.get("greeks_reason"):
+        print(f"   Reason         : {result['greeks_reason']}")
 
 
 # ================= HELPER FUNCTIONS =================
@@ -8654,6 +9259,9 @@ class BinanceAnalyzer:
             phase_result = detect_market_phase(phase_data)
             result = apply_phase_override(result, phase_result)
 
+            # ========== GREEKS FINAL SCREENER INTEGRATION ==========
+            result = greeks_final_screen(result)
+
             return result
 
         except Exception as e:
@@ -8891,6 +9499,7 @@ def main():
 
     if result:
         OutputFormatter.print_signal(result)
+        print_greeks_section(result)
 
     if len(sys.argv) > 2 and sys.argv[2] == "--loop":
         print("\n🔄 Auto-refresh every 10 seconds. Press Ctrl+C to stop.\n")
