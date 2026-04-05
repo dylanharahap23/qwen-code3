@@ -1267,6 +1267,94 @@ class LowVolumeDistributionContinuation:
         return {"override": False}
 
 
+class GammaLiquidityAlignment:
+    """
+    🔥 GAMMA SPOOFING DETECTOR: Gamma EXTREME tapi liquidity proximity bertentangan
+    
+    TRIAUSDT CASE:
+    - Gamma EXTREME kill_direction = SHORT
+    - Tapi long_liq = 0.36% (sangat dekat) vs short_liq = 3.62% (jauh)
+    - agg = 0.9 (90% buy), ofi = LONG
+    - Gamma executing = false → ini sinyal palsu
+    
+    Rule:
+    Jika Gamma EXTREME dan kill_direction bertentangan dengan liquidity proximity
+    (misal: kill SHORT tapi long_liq lebih dekat), maka override ke arah liquidity.
+    
+    Priority: -10000 (di atas Gamma EXTREME -9999)
+    """
+    @staticmethod
+    def detect(gamma_intensity: str, kill_direction: str,
+               short_liq: float, long_liq: float,
+               gamma_executing: bool, volume_ratio: float,
+               market_phase: str = "UNKNOWN") -> Dict:
+        
+        if gamma_intensity != "EXTREME":
+            return {"override": False}
+        
+        # Kasus A: Gamma bilang SHORT tapi long_liq lebih dekat (harusnya LONG)
+        if (kill_direction == "SHORT" and
+            long_liq < short_liq and
+            long_liq < 1.5):
+            
+            # Jika Gamma tidak executing dan volume rendah → ini spoof
+            if not gamma_executing and volume_ratio < 0.8:
+                return {
+                    "override": True,
+                    "bias": "LONG",
+                    "reason": (
+                        f"GAMMA SPOOFING DETECTED: Gamma EXTREME kill={kill_direction} "
+                        f"tapi long_liq={long_liq:.2f}% << short_liq={short_liq:.2f}%, "
+                        f"gamma_executing={gamma_executing}, volume={volume_ratio:.2f}x. "
+                        f"HFT memancing SHORT, sebenarnya akan PUMP untuk sweep long stop."
+                    ),
+                    "priority": -10000
+                }
+            # Jika Gamma executing tapi masih kontradiksi, tetap ikuti liquidity
+            elif long_liq < short_liq * 0.5:
+                return {
+                    "override": True,
+                    "bias": "LONG",
+                    "reason": (
+                        f"GAMMA-LIQUIDITY CONFLICT: Gamma kill={kill_direction} "
+                        f"tapi long_liq={long_liq:.2f}% jauh lebih dekat dari short_liq={short_liq:.2f}%. "
+                        f"Ikuti liquidity → LONG"
+                    ),
+                    "priority": -10000
+                }
+        
+        # Kasus B: Gamma bilang LONG tapi short_liq lebih dekat (harusnya SHORT)
+        if (kill_direction == "LONG" and
+            short_liq < long_liq and
+            short_liq < 1.5):
+            
+            if not gamma_executing and volume_ratio < 0.8:
+                return {
+                    "override": True,
+                    "bias": "SHORT",
+                    "reason": (
+                        f"GAMMA SPOOFING DETECTED: Gamma EXTREME kill={kill_direction} "
+                        f"tapi short_liq={short_liq:.2f}% << long_liq={long_liq:.2f}%, "
+                        f"gamma_executing={gamma_executing}, volume={volume_ratio:.2f}x. "
+                        f"HFT memancing LONG, sebenarnya akan DUMP untuk sweep short stop."
+                    ),
+                    "priority": -10000
+                }
+            elif short_liq < long_liq * 0.5:
+                return {
+                    "override": True,
+                    "bias": "SHORT",
+                    "reason": (
+                        f"GAMMA-LIQUIDITY CONFLICT: Gamma kill={kill_direction} "
+                        f"tapi short_liq={short_liq:.2f}% jauh lebih dekat dari long_liq={long_liq:.2f}%. "
+                        f"Ikuti liquidity → SHORT"
+                    ),
+                    "priority": -10000
+                }
+        
+        return {"override": False}
+
+
 class LowVolumeContinuation:
     @staticmethod
     def detect(volume_ratio: float, obv_trend: str, price: float,
@@ -7606,6 +7694,23 @@ class BinanceAnalyzer:
 
                         # ===== HIGH PRIORITY OVERRIDES (cascading if-else) =====
 
+                        # ===== PRIORITY -10000: GAMMA LIQUIDITY ALIGNMENT (SPOOFING DETECTOR) =====
+                        gamma_spoof = GammaLiquidityAlignment.detect(
+                            result.get("greeks_gamma_intensity", "LOW"),
+                            result.get("greeks_kill_direction", "NEUTRAL"),
+                            liq["short_dist"], liq["long_dist"],
+                            result.get("greeks_gamma_executing", False),
+                            volume_ratio,
+                            "UNKNOWN"  # market_phase dihitung di akhir, gunakan default
+                        )
+                        if gamma_spoof["override"]:
+                            final_bias = gamma_spoof["bias"]
+                            final_reason = gamma_spoof["reason"]
+                            final_confidence = "ABSOLUTE"
+                            final_phase = "GAMMA_LIQUIDITY_ALIGNMENT"
+                            priority = gamma_spoof["priority"]
+                            prob_engine.add(gamma_spoof["bias"], 10.08)
+
                         # ===== PRIORITY -1106: LOW VOLUME DISTRIBUTION CONTINUATION =====
                         low_vol_dist = LowVolumeDistributionContinuation.detect(
                             change_5m, rsi6,
@@ -7613,7 +7718,7 @@ class BinanceAnalyzer:
                             obv_trend, volume_ratio,
                             down_energy, up_energy
                         )
-                        if low_vol_dist["override"]:
+                        if not gamma_spoof.get("override") and low_vol_dist["override"]:
                             final_bias = low_vol_dist["bias"]
                             final_reason = low_vol_dist["reason"]
                             final_confidence = "ABSOLUTE"
@@ -7628,7 +7733,7 @@ class BinanceAnalyzer:
                             liq["long_dist"], liq["short_dist"],
                             volume_ratio
                         )
-                        if not low_vol_dist.get("override") and profit_reversal["override"]:
+                        if not gamma_spoof.get("override") and not low_vol_dist.get("override") and profit_reversal["override"]:
                             final_bias = profit_reversal["bias"]
                             final_reason = profit_reversal["reason"]
                             final_confidence = "ABSOLUTE"
@@ -7643,7 +7748,7 @@ class BinanceAnalyzer:
                             obv_trend, obv_value, volume_ratio,
                             agg, ofi["bias"]
                         )
-                        if not low_vol_dist.get("override") and not profit_reversal.get("override") and oversold_dist["override"]:
+                        if not gamma_spoof.get("override") and not low_vol_dist.get("override") and not profit_reversal.get("override") and oversold_dist["override"]:
                             final_bias = oversold_dist["bias"]
                             final_reason = oversold_dist["reason"]
                             final_confidence = "ABSOLUTE"
@@ -7656,7 +7761,7 @@ class BinanceAnalyzer:
                             funding_rate, oi_delta, volume_ratio,
                             change_5m, liq["short_dist"], liq["long_dist"]
                         )
-                        if not profit_reversal.get("override") and not oversold_dist.get("override") and global_imbalance["override"]:
+                        if not gamma_spoof.get("override") and not profit_reversal.get("override") and not oversold_dist.get("override") and global_imbalance["override"]:
                             final_bias = global_imbalance["bias"]
                             final_reason = global_imbalance["reason"]
                             final_confidence = "ABSOLUTE"
@@ -7667,7 +7772,7 @@ class BinanceAnalyzer:
                         # ===== PRIORITY -1104/-1100/-1075: ASYMMETRIC LIQUIDITY MAX PAIN =====
                         # FIX DUSDT: long_liq 34% vs short_liq 6% = ratio 5.8x → SHORT
                         # Market menuju liquidity TERBESAR, bukan terdekat
-                        if not global_imbalance.get("override") and not profit_reversal.get("override") and not oversold_dist.get("override"):  # hanya jika GPI, Profit Reversal, dan Oversold Dist tidak trigger
+                        if not gamma_spoof.get("override") and not global_imbalance.get("override") and not profit_reversal.get("override") and not oversold_dist.get("override"):  # hanya jika GPI, Profit Reversal, dan Oversold Dist tidak trigger
                             asym_liq = AsymmetricLiquidityMaxPain.detect(
                                 liq["short_dist"], liq["long_dist"],
                                 volume_ratio, change_5m,
@@ -7686,7 +7791,7 @@ class BinanceAnalyzer:
                                 prob_engine.add(asym_liq["bias"], asym_liq["weight"])
 
                         # ===== PRIORITY -1103: EXTREME RSI6 OVERBOUGHT REVERSAL =====
-                        if not profit_reversal.get("override") and not oversold_dist.get("override"):
+                        if not gamma_spoof.get("override") and not profit_reversal.get("override") and not oversold_dist.get("override"):
                             extreme_rsi6_rev = ExtremeRsi6OverboughtReversal.detect(
                                 rsi6, volume_ratio, ofi["bias"], up_energy
                             )
@@ -7699,7 +7804,7 @@ class BinanceAnalyzer:
                                 prob_engine.add(extreme_rsi6_rev["bias"], 10.02)
 
                         # ===== PRIORITY -1103: FUNDING NEGATIVE + SHORT LIQ SUPER CLOSE =====
-                        if not profit_reversal.get("override") and not oversold_dist.get("override"):
+                        if not gamma_spoof.get("override") and not profit_reversal.get("override") and not oversold_dist.get("override"):
                             funding_short_squeeze = FundingNegativeShortLiqSqueeze.detect(
                                 funding_rate, liq["short_dist"], liq["long_dist"],
                                 up_energy, down_energy, rsi6, volume_ratio
@@ -7713,7 +7818,7 @@ class BinanceAnalyzer:
                                 prob_engine.add(funding_short_squeeze["bias"], 10.03)
 
                         # ===== PRIORITY -1102: MOMENTUM VOLUME SPIKE PROTECTION =====
-                        if not profit_reversal.get("override") and not oversold_dist.get("override"):
+                        if not gamma_spoof.get("override") and not profit_reversal.get("override") and not oversold_dist.get("override"):
                             mom_vol_spike = MomentumVolumeSpikeProtection.detect(
                                 change_5m, latest_volume, volume_ma10,
                                 liq["short_dist"], liq["long_dist"],
@@ -7728,7 +7833,7 @@ class BinanceAnalyzer:
                                 prob_engine.add(mom_vol_spike["bias"], 10.015)
 
                         # ===== PRIORITY -1102: MARK PRICE GAP DETECTOR =====
-                        if not profit_reversal.get("override") and not oversold_dist.get("override"):
+                        if not gamma_spoof.get("override") and not profit_reversal.get("override") and not oversold_dist.get("override"):
                             mark_gap = MarkPriceGapDetector.detect(
                                 mark_price, price, funding_rate, change_5m
                             )
@@ -7746,7 +7851,7 @@ class BinanceAnalyzer:
                         )
 
                         # ===== PRIORITY -1101: EXTREME FUNDING RATE LONG/SHORT BAN =====
-                        if not profit_reversal.get("override") and not oversold_dist.get("override") and extreme_funding_ban["override"]:
+                        if not gamma_spoof.get("override") and not profit_reversal.get("override") and not oversold_dist.get("override") and extreme_funding_ban["override"]:
                             final_bias = extreme_funding_ban["bias"]
                             final_reason = extreme_funding_ban["reason"]
                             final_confidence = "ABSOLUTE"
