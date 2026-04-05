@@ -537,6 +537,61 @@ class BinanceWebSocket:
 
 # ================= NEW DETECTOR MODULES =================
 
+class OversoldDistributionContinuation:
+    """
+    🔥 FALLING KNIFE DETECTOR: Oversold + OBV negative extreme + long liq close = masih akan dump
+    
+    PLAYUSDT CASE: harga turun -3.39%, RSI 11, long liq 0.3%, tapi OBV NEGATIVE_EXTREME
+    → smart money masih distribusi, harga akan terus turun untuk sapu long stop.
+    
+    Priority: -1104 (di atas GlobalPositionImbalance -1104? sejajar, tapi kita beri nilai -1104.5 agar lebih tinggi)
+    Karena kondisi ini sangat berbahaya – jebakan bounce.
+    """
+    @staticmethod
+    def detect(change_5m: float, rsi6: float, long_liq: float, short_liq: float = 99.0,
+               obv_trend: str = "NEUTRAL", obv_value: float = 0.0, volume_ratio: float = 1.0,
+               agg: float = 0.5, ofi_bias: str = "NEUTRAL") -> Dict:
+        
+        # Kasus SHORT: oversold tapi OBV negatif ekstrem → masih dump
+        if (change_5m < -2.0 and
+            rsi6 < 30 and
+            long_liq < 2.0 and
+            obv_trend in ["NEGATIVE_EXTREME", "NEGATIVE"] and
+            volume_ratio >= 0.7 and
+            agg < 0.8):   # tidak terlalu buy dominant (bisa jadi retail beli di bottom)
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"OVERSOLD DISTRIBUTION CONTINUATION: price down {change_5m:.1f}%, "
+                    f"RSI {rsi6:.1f} oversold, long liq {long_liq:.2f}% dekat, "
+                    f"tapi OBV {obv_trend} (value={obv_value:,.0f}) menunjukkan distribusi aktif, "
+                    f"volume {volume_ratio:.2f}x → smart money masih jual, dump lanjut untuk sweep long stop"
+                ),
+                "priority": -1104
+            }
+        
+        # Mirror: overbought tapi OBV positif ekstrem → masih pump
+        if (change_5m > 2.0 and
+            rsi6 > 70 and
+            short_liq < 2.0 and
+            obv_trend in ["POSITIVE_EXTREME", "POSITIVE"] and
+            volume_ratio >= 0.7 and
+            agg > 0.2):
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": (
+                    f"OVERBOUGHT ACCUMULATION CONTINUATION: price up {change_5m:.1f}%, "
+                    f"RSI {rsi6:.1f} overbought, short liq {short_liq:.2f}% dekat, "
+                    f"OBV {obv_trend} menunjukkan akumulasi aktif → pump lanjut"
+                ),
+                "priority": -1104
+            }
+        
+        return {"override": False}
+
+
 class LowVolumeContinuation:
     @staticmethod
     def detect(volume_ratio: float, obv_trend: str, price: float,
@@ -6794,12 +6849,27 @@ class BinanceAnalyzer:
                             priority = profit_reversal["priority"]
                             prob_engine.add(profit_reversal["bias"], 10.06)
 
+                        # ===== PRIORITY -1104: OVERSOLD DISTRIBUTION CONTINUATION =====
+                        oversold_dist = OversoldDistributionContinuation.detect(
+                            change_5m, rsi6,
+                            liq["long_dist"], liq["short_dist"],
+                            obv_trend, obv_value, volume_ratio,
+                            agg, ofi["bias"]
+                        )
+                        if not profit_reversal.get("override") and oversold_dist["override"]:
+                            final_bias = oversold_dist["bias"]
+                            final_reason = oversold_dist["reason"]
+                            final_confidence = "ABSOLUTE"
+                            final_phase = "OVERSOLD_DISTRIBUTION_CONT"
+                            priority = oversold_dist["priority"]
+                            prob_engine.add(oversold_dist["bias"], 10.04)
+
                         # ===== PRIORITY -1104: GLOBAL POSITION IMBALANCE =====
                         global_imbalance = GlobalPositionImbalance.detect(
                             funding_rate, oi_delta, volume_ratio,
                             change_5m, liq["short_dist"], liq["long_dist"]
                         )
-                        if not profit_reversal.get("override") and global_imbalance["override"]:
+                        if not profit_reversal.get("override") and not oversold_dist.get("override") and global_imbalance["override"]:
                             final_bias = global_imbalance["bias"]
                             final_reason = global_imbalance["reason"]
                             final_confidence = "ABSOLUTE"
@@ -6810,7 +6880,7 @@ class BinanceAnalyzer:
                         # ===== PRIORITY -1104/-1100/-1075: ASYMMETRIC LIQUIDITY MAX PAIN =====
                         # FIX DUSDT: long_liq 34% vs short_liq 6% = ratio 5.8x → SHORT
                         # Market menuju liquidity TERBESAR, bukan terdekat
-                        if not global_imbalance.get("override") and not profit_reversal.get("override"):  # hanya jika GPI dan Profit Reversal tidak trigger
+                        if not global_imbalance.get("override") and not profit_reversal.get("override") and not oversold_dist.get("override"):  # hanya jika GPI, Profit Reversal, dan Oversold Dist tidak trigger
                             asym_liq = AsymmetricLiquidityMaxPain.detect(
                                 liq["short_dist"], liq["long_dist"],
                                 volume_ratio, change_5m,
@@ -6829,7 +6899,7 @@ class BinanceAnalyzer:
                                 prob_engine.add(asym_liq["bias"], asym_liq["weight"])
 
                         # ===== PRIORITY -1103: EXTREME RSI6 OVERBOUGHT REVERSAL =====
-                        if not profit_reversal.get("override"):
+                        if not profit_reversal.get("override") and not oversold_dist.get("override"):
                             extreme_rsi6_rev = ExtremeRsi6OverboughtReversal.detect(
                                 rsi6, volume_ratio, ofi["bias"], up_energy
                             )
@@ -6842,7 +6912,7 @@ class BinanceAnalyzer:
                                 prob_engine.add(extreme_rsi6_rev["bias"], 10.02)
 
                         # ===== PRIORITY -1103: FUNDING NEGATIVE + SHORT LIQ SUPER CLOSE =====
-                        if not profit_reversal.get("override"):
+                        if not profit_reversal.get("override") and not oversold_dist.get("override"):
                             funding_short_squeeze = FundingNegativeShortLiqSqueeze.detect(
                                 funding_rate, liq["short_dist"], liq["long_dist"],
                                 up_energy, down_energy, rsi6, volume_ratio
@@ -6856,7 +6926,7 @@ class BinanceAnalyzer:
                                 prob_engine.add(funding_short_squeeze["bias"], 10.03)
 
                         # ===== PRIORITY -1102: MOMENTUM VOLUME SPIKE PROTECTION =====
-                        if not profit_reversal.get("override"):
+                        if not profit_reversal.get("override") and not oversold_dist.get("override"):
                             mom_vol_spike = MomentumVolumeSpikeProtection.detect(
                                 change_5m, latest_volume, volume_ma10,
                                 liq["short_dist"], liq["long_dist"],
@@ -6871,7 +6941,7 @@ class BinanceAnalyzer:
                                 prob_engine.add(mom_vol_spike["bias"], 10.015)
 
                         # ===== PRIORITY -1102: MARK PRICE GAP DETECTOR =====
-                        if not profit_reversal.get("override"):
+                        if not profit_reversal.get("override") and not oversold_dist.get("override"):
                             mark_gap = MarkPriceGapDetector.detect(
                                 mark_price, price, funding_rate, change_5m
                             )
@@ -6889,7 +6959,7 @@ class BinanceAnalyzer:
                         )
 
                         # ===== PRIORITY -1101: EXTREME FUNDING RATE LONG/SHORT BAN =====
-                        if not profit_reversal.get("override") and extreme_funding_ban["override"]:
+                        if not profit_reversal.get("override") and not oversold_dist.get("override") and extreme_funding_ban["override"]:
                             final_bias = extreme_funding_ban["bias"]
                             final_reason = extreme_funding_ban["reason"]
                             final_confidence = "ABSOLUTE"
@@ -6898,7 +6968,7 @@ class BinanceAnalyzer:
                             prob_engine.add(extreme_funding_ban["bias"], 10.01)
 
                         # 1. MASTER SQUEEZE RULE (Priority -1100)
-                        elif master_squeeze["override"]:
+                        elif not oversold_dist.get("override") and master_squeeze["override"]:
                             final_bias = master_squeeze["bias"]
                             final_reason = master_squeeze["reason"]
                             final_confidence = "ABSOLUTE"
@@ -6907,7 +6977,7 @@ class BinanceAnalyzer:
                             prob_engine.add(master_squeeze["bias"], 10.0)
 
                         # 1.006. OBV DISTRIBUTION FUNDING TRAP (Priority -1100)
-                        elif OBVDistributionFundingTrap.detect(
+                        elif not oversold_dist.get("override") and OBVDistributionFundingTrap.detect(
                                 obv_trend, obv_value,
                                 funding_rate or 0.0, rsi6, rsi6_5m,
                                 liq["long_dist"], liq["short_dist"],
@@ -6928,7 +6998,7 @@ class BinanceAnalyzer:
                             prob_engine.add(obv_fund_trap["bias"], 10.0)
 
                         # 1.005. BLOW-OFF TOP DETECTOR (Priority -1099)
-                        elif BlowOffTopDetector.detect(
+                        elif not oversold_dist.get("override") and BlowOffTopDetector.detect(
                                 rsi6_5m, rsi14, volume_ratio,
                                 funding_rate or 0, change_5m,
                                 liq["short_dist"], up_energy)["override"]:
