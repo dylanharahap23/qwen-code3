@@ -7373,7 +7373,10 @@ class BinanceAnalyzer:
         greeks_override = result.get("greeks_override", False)
         
         # ========== FILTER 4: Gamma Delay ==========
-        if gamma_intensity == "EXTREME" and delta_exposure < 0.95:
+        # Jangan delay jika sudah ada override dari Gamma spoofing (priority -10000)
+        is_gamma_spoof_override = result.get("phase") == "GAMMA_LIQUIDITY_ALIGNMENT"
+        
+        if gamma_intensity == "EXTREME" and delta_exposure < 0.95 and not is_gamma_spoof_override:
             # Gamma fake: belum cukup crowded, tunda override
             if greeks_override:
                 result["reason"] += f" | GAMMA DELAY: intensity EXTREME but delta_exposure={delta_exposure:.3f}<0.95 → hold"
