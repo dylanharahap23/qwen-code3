@@ -483,6 +483,74 @@ class KillLiquidityConflict:
         return {"override": False}
 
 
+class BlowOffTopShortLiqTrap:
+    """
+    Detector: Blow-Off Top Short Liquidity Trap (Priority -1102)
+    
+    Kondisi:
+    - change_5m > 1.5% (harga sudah naik signifikan)
+    - short_dist < 2.5% (short liquidity dekat)
+    - rsi6_5m > 85 (overbought ekstrem di timeframe 5m)
+    - volume_ratio < 0.8 (volume rendah – distribusi diam-diam)
+    - ofi_bias == "SHORT" (order flow institusi SHORT)
+    - agg > 0.6 (agresifitas buy tinggi – bisa jadi spoofing)
+    
+    Priority: -1102 (lebih tinggi dari VEGA-KILL CONFLICT -9991.5)
+    Bias: SHORT
+    """
+    @staticmethod
+    def detect(change_5m: float, short_dist: float, rsi6_5m: float,
+               volume_ratio: float, ofi_bias: str, agg: float) -> Dict:
+        # Blow-off top: harga sudah naik, short liq dekat, tapi overbought ekstrem
+        if (change_5m > 1.5 and
+            short_dist < 2.5 and
+            rsi6_5m > 85 and
+            volume_ratio < 0.8 and
+            ofi_bias == "SHORT" and
+            agg > 0.6):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"BLOW-OFF TOP TRAP: price up {change_5m:.1f}%, short liq {short_dist:.2f}% dekat, tapi RSI5m {rsi6_5m:.1f} overbought extreme, OFI SHORT {ofi_bias}, agg={agg:.2f} → distribution at peak, dump incoming",
+                "priority": -1102
+            }
+        return {"override": False}
+
+
+class VolumeDryUpReversal:
+    """
+    Detector: Volume Dry-Up Reversal (Priority -1080)
+    
+    Kondisi:
+    - abs(change_5m) > 2.0% (pergerakan harga besar)
+    - volume_ratio < 0.6 (volume mengering)
+    
+    Jika harga naik besar dengan volume kering + RSI overbought → SHORT reversal
+    Jika harga turun besar dengan volume kering + RSI oversold → LONG reversal
+    
+    Priority: -1080
+    """
+    @staticmethod
+    def detect(change_5m: float, volume_ratio: float, rsi6_5m: float) -> Dict:
+        # Volume mengering setelah pergerakan besar → reversal
+        if abs(change_5m) > 2.0 and volume_ratio < 0.6:
+            if change_5m > 0 and rsi6_5m > 75:
+                return {
+                    "override": True,
+                    "bias": "SHORT",
+                    "reason": f"Volume dry-up reversal: price up {change_5m:.1f}% with volume {volume_ratio:.2f}x, RSI5m {rsi6_5m:.1f} overbought → reversal down",
+                    "priority": -1080
+                }
+            if change_5m < 0 and rsi6_5m < 25:
+                return {
+                    "override": True,
+                    "bias": "LONG",
+                    "reason": f"Volume dry-up reversal: price down {abs(change_5m):.1f}% with volume {volume_ratio:.2f}x, RSI5m {rsi6_5m:.1f} oversold → reversal up",
+                    "priority": -1080
+                }
+        return {"override": False}
+
+
 def detect_market_phase(data: dict) -> PhaseResult:
     """
     Fungsi utama. Panggil ini SEBELUM logika bias utama lo.
@@ -5153,6 +5221,10 @@ class OverboughtLiquidityTrap:
                ofi_bias: str, ofi_strength: float, volume_ratio: float, funding_rate: float) -> Dict:
         CLOSE_LIQ = 1.5
 
+        # GUARD: Jika kondisi ekstrem overbought + volume kering, biarkan BlowOffTopShortLiqTrap yang handle
+        if rsi6 > 85 and volume_ratio < 0.7:
+            return {"override": False}  # Jangan paksa LONG, biarkan blow-off detector handle
+        
         if volume_ratio < 0.6:
             return {"override": False, "priority": 0}
         if rsi6 > 90 and volume_ratio < 0.9:
@@ -7946,12 +8018,45 @@ class BinanceAnalyzer:
         )
         result["kill_liquidity_conflict"] = kill_liq_result
 
-        # 6. Apply semua ke entry_allowed
+        # 5c. BlowOffTopShortLiqTrap Detector (Priority -1102)
+        rsi6_5m = result.get("rsi6_5m", 50.0)
+        blowoff_result = BlowOffTopShortLiqTrap.detect(
+            change_5m=change_5m,
+            short_dist=short_liq,
+            rsi6_5m=rsi6_5m,
+            volume_ratio=volume_ratio,
+            ofi_bias=ofi_bias,
+            agg=agg
+        )
+        result["blowoff_top_trap"] = blowoff_result
+
+        # 5d. VolumeDryUpReversal Detector (Priority -1080)
+        volume_dryup_result = VolumeDryUpReversal.detect(
+            change_5m=change_5m,
+            volume_ratio=volume_ratio,
+            rsi6_5m=rsi6_5m
+        )
+        result["volume_dryup_reversal"] = volume_dryup_result
+
+        # 6. Apply semua ke entry_allowed dengan priority ladder
         if result.get("entry_allowed", True):  # hanya block jika belum di-block
             
-            if dual_trap["dual_liq_trap"]:
+            # Priority -1102: BlowOffTopShortLiqTrap (tertinggi)
+            if blowoff_result.get("override", False):
+                result["bias"] = blowoff_result["bias"]
+                result["reason"] = f"[BLOW-OFF TOP TRAP] {blowoff_result['reason']} | " + result.get("reason", "")
+                result["priority_level"] = blowoff_result.get("priority", -1102)
+            
+            elif dual_trap["dual_liq_trap"]:
                 result["entry_allowed"] = False
                 result["entry_reason"] = f"DUAL LIQ TRAP ({dual_trap['trap_score']}/5) — {dual_trap['reason']}"
+            
+            # Kill Instability Block: Jika kill direction tidak stabil DAN dual liq trap, force NEUTRAL
+            elif dir_stability.get("danger") and dual_trap.get("dual_liq_trap"):
+                result["bias"] = "NEUTRAL"
+                result["entry_allowed"] = False
+                result["reason"] = f"[KILL INSTABILITY BLOCK] {dir_stability.get('reason')} + dual liq trap → NO TRADE"
+                result["priority_level"] = -1100.5
             
             elif dir_stability["danger"]:
                 result["entry_allowed"] = False
@@ -7965,16 +8070,22 @@ class BinanceAnalyzer:
                 result["reason"] = f"[BIAS CORRECTED → {bias_conflict['correct_direction']}] " + result.get("reason", "")
             
             elif divergence_result.get("override", False):
-                # Override dari Bullish Order Flow Divergence
+                # Override dari Bullish Order Flow Divergence (Priority -1101)
                 result["bias"] = divergence_result["bias"]
                 result["reason"] = f"[ORDERFLOW DIVERGENCE] {divergence_result['reason']} | " + result.get("reason", "")
                 result["priority_level"] = divergence_result.get("priority", -1101)
             
             elif kill_liq_result.get("override", False):
-                # Override dari Kill-Liquidity Conflict
+                # Override dari Kill-Liquidity Conflict (Priority -1100)
                 result["bias"] = kill_liq_result["bias"]
                 result["reason"] = f"[KILL-LIQUIDITY CONFLICT] {kill_liq_result['reason']} | " + result.get("reason", "")
                 result["priority_level"] = kill_liq_result.get("priority", -1100)
+            
+            elif volume_dryup_result.get("override", False):
+                # Override dari Volume Dry-Up Reversal (Priority -1080)
+                result["bias"] = volume_dryup_result["bias"]
+                result["reason"] = f"[VOLUME DRY-UP REVERSAL] {volume_dryup_result['reason']} | " + result.get("reason", "")
+                result["priority_level"] = volume_dryup_result.get("priority", -1080)
         
         return result
 
