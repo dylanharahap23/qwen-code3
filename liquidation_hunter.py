@@ -7818,7 +7818,7 @@ class BinanceAnalyzer:
         
         # ===== NEW: KILL-ZONE FLIP TRAP DETECTION INTEGRATION =====
         # 1. Track kill direction history
-        symbol = data.get("symbol", result.get("symbol", "UNKNOWN"))
+        symbol = self.symbol
         kill_dir = result.get("greeks_kill_direction", "")
         _track_kill_direction(symbol, kill_dir)
 
