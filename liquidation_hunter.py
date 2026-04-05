@@ -450,6 +450,75 @@ class BullishOrderFlowDivergence:
         return {"override": False}
 
 
+class ExtremeShortLiqSqueezeOverride:
+    """
+    Detector: Extreme Short Liquidity Squeeze Override (Priority -1103)
+    
+    Kondisi:
+    - short_dist < 1.0% (short liq super dekat)
+    - short_dist < long_dist (short lebih dekat dari long)
+    - agg > 0.7 (buy pressure dominant)
+    - up_energy == 0 (tidak ada resistance di atas)
+    - change_5m > 0 (harga sedang naik)
+    
+    Priority: -1103 (tertinggi di priority ladder)
+    Bias: LONG
+    
+    Logika: Short liq super dekat + buy pressure + tidak ada resistance → 
+    HFT akan sweep short stops terlepas dari RSI/vega
+    """
+    @staticmethod
+    def detect(short_dist: float, long_dist: float, agg: float, 
+               up_energy: float, change_5m: float) -> Dict:
+        # Short liq super dekat + buy pressure + tidak ada resistance
+        if (short_dist < 1.0 and 
+            short_dist < long_dist and
+            agg > 0.7 and 
+            up_energy == 0 and 
+            change_5m > 0):
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": f"EXTREME SHORT LIQ SQUEEZE: short liq {short_dist:.2f}% super close, agg={agg:.2f} buy dominant, up_energy=0 (no resistance) → HFT will sweep short stops regardless of RSI/vega",
+                "priority": -1103
+            }
+        return {"override": False}
+
+
+class EmptyBookSqueezeContinuation:
+    """
+    Detector: Empty Book Squeeze Continuation (Priority -1102)
+    
+    Kondisi:
+    - up_energy == 0 AND down_energy == 0 (order book kosong dua sisi)
+    - short_dist < 1.5% OR long_dist < 1.5% (target likuiditas dekat)
+    - abs(change_5m) > 0.5 (harga sudah bergerak)
+    - agg > 0.6 (ada agresi)
+    
+    Priority: -1102
+    Bias: LONG jika short_dist < long_dist, else SHORT
+    
+    Logika: Order book kosong dua sisi + target dekat + harga bergerak → 
+    vacuum ke arah target likuiditas
+    """
+    @staticmethod
+    def detect(up_energy: float, down_energy: float, short_dist: float,
+               long_dist: float, change_5m: float, agg: float) -> Dict:
+        # Order book kosong dua sisi + target dekat + harga bergerak
+        if (up_energy == 0 and down_energy == 0 and
+            (short_dist < 1.5 or long_dist < 1.5) and
+            abs(change_5m) > 0.5 and
+            agg > 0.6):
+            bias = "LONG" if short_dist < long_dist else "SHORT"
+            return {
+                "override": True,
+                "bias": bias,
+                "reason": f"EMPTY BOOK SQUEEZE: no orders on both sides, liq target {short_dist if bias=='LONG' else long_dist:.2f}% close, price moving → vacuum to {bias}",
+                "priority": -1102
+            }
+        return {"override": False}
+
+
 class KillLiquidityConflict:
     """
     Detector: Kill Direction vs Liquidity Proximity Conflict
@@ -1046,6 +1115,28 @@ def _greeks_absolute_score(
 
     if vega["active"] and gamma_intensity in ("LOW", "MODERATE"):
         fade_direction = "SHORT" if vega["bait_direction"] == "UP" else "LONG"
+        
+        # VEGA OVERRIDE GUARD (Priority -9991.8)
+        # Guard: jika short liq super dekat + buy pressure, override Vega ke LONG
+        agg = data.get("agg", 0.0)
+        if short_dist < 1.0 and agg > 0.7 and change_5m > 0:
+            return {
+                "final_bias": "LONG",
+                "override": True,
+                "confidence": "ABSOLUTE",
+                "priority": -9991.8,
+                "score_reason": f"VEGA OVERRIDDEN: short liq {short_dist:.2f}% super close, agg={agg:.2f} buy dominant → prioritize squeeze over fake move"
+            }
+        # Guard: jika long liq super dekat + sell pressure, override Vega ke SHORT
+        if long_dist < 1.0 and agg < 0.3 and change_5m < 0:
+            return {
+                "final_bias": "SHORT",
+                "override": True,
+                "confidence": "ABSOLUTE",
+                "priority": -9991.8,
+                "score_reason": f"VEGA OVERRIDDEN: long liq {long_dist:.2f}% super close, agg={agg:.2f} sell dominant → prioritize squeeze over fake move"
+            }
+        
         # Cek konflik dengan kill direction
         if kill_direction != "NEUTRAL" and fade_direction != kill_direction:
             # Abaikan Vega, ikuti kill direction
@@ -8038,18 +8129,63 @@ class BinanceAnalyzer:
         )
         result["volume_dryup_reversal"] = volume_dryup_result
 
+        # 5e. ExtremeShortLiqSqueezeOverride Detector (Priority -1103) - HIGHEST PRIORITY
+        up_energy = result.get("up_energy", 0.0)
+        extreme_short_squeeze_result = ExtremeShortLiqSqueezeOverride.detect(
+            short_dist=short_liq,
+            long_dist=long_liq,
+            agg=agg,
+            up_energy=up_energy,
+            change_5m=change_5m
+        )
+        result["extreme_short_liq_squeeze"] = extreme_short_squeeze_result
+
+        # 5f. EmptyBookSqueezeContinuation Detector (Priority -1102)
+        down_energy = result.get("down_energy", 0.0)
+        empty_book_squeeze_result = EmptyBookSqueezeContinuation.detect(
+            up_energy=up_energy,
+            down_energy=down_energy,
+            short_dist=short_liq,
+            long_dist=long_liq,
+            change_5m=change_5m,
+            agg=agg
+        )
+        result["empty_book_squeeze"] = empty_book_squeeze_result
+
         # 6. Apply semua ke entry_allowed dengan priority ladder
         if result.get("entry_allowed", True):  # hanya block jika belum di-block
             
-            # Priority -1102: BlowOffTopShortLiqTrap (tertinggi)
-            if blowoff_result.get("override", False):
+            # Priority -1103: ExtremeShortLiqSqueezeOverride (HIGHEST PRIORITY)
+            if extreme_short_squeeze_result.get("override", False):
+                result["bias"] = extreme_short_squeeze_result["bias"]
+                result["reason"] = f"[EXTREME SHORT LIQ SQUEEZE] {extreme_short_squeeze_result['reason']} | " + result.get("reason", "")
+                result["priority_level"] = extreme_short_squeeze_result.get("priority", -1103)
+            
+            # Priority -1102: EmptyBookSqueezeContinuation
+            elif empty_book_squeeze_result.get("override", False):
+                result["bias"] = empty_book_squeeze_result["bias"]
+                result["reason"] = f"[EMPTY BOOK SQUEEZE] {empty_book_squeeze_result['reason']} | " + result.get("reason", "")
+                result["priority_level"] = empty_book_squeeze_result.get("priority", -1102)
+            
+            # Priority -1102: BlowOffTopShortLiqTrap
+            elif blowoff_result.get("override", False):
                 result["bias"] = blowoff_result["bias"]
                 result["reason"] = f"[BLOW-OFF TOP TRAP] {blowoff_result['reason']} | " + result.get("reason", "")
                 result["priority_level"] = blowoff_result.get("priority", -1102)
             
             elif dual_trap["dual_liq_trap"]:
-                result["entry_allowed"] = False
-                result["entry_reason"] = f"DUAL LIQ TRAP ({dual_trap['trap_score']}/5) — {dual_trap['reason']}"
+                # DUAL LIQ TRAP EXCEPTION: override jika short_liq < 1.0% dan ada buy signal
+                if short_liq < 1.0 and agg > 0.7 and change_5m > 0:
+                    result["entry_allowed"] = True
+                    result["entry_reason"] = f"TRAP OVERRIDE: extreme short liq ({short_liq:.2f}%) supersedes dual trap"
+                    result["bias"] = "LONG"
+                elif long_liq < 1.0 and agg < 0.3 and change_5m < 0:
+                    result["entry_allowed"] = True
+                    result["entry_reason"] = f"TRAP OVERRIDE: extreme long liq ({long_liq:.2f}%) supersedes dual trap"
+                    result["bias"] = "SHORT"
+                else:
+                    result["entry_allowed"] = False
+                    result["entry_reason"] = f"DUAL LIQ TRAP ({dual_trap['trap_score']}/5) — {dual_trap['reason']}"
             
             # Kill Instability Block: Jika kill direction tidak stabil DAN dual liq trap, force NEUTRAL
             elif dir_stability.get("danger") and dual_trap.get("dual_liq_trap"):
