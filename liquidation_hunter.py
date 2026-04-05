@@ -1026,7 +1026,66 @@ def _gamma_calculate(data: dict, delta_data: dict) -> dict:
         energy_for_kill = max(up_energy, down_energy)
 
     vol_spike_ratio = latest_volume / volume_ma10 if volume_ma10 > 0 else 1.0
-    gamma_executing = vol_spike_ratio > 2.0 and abs(change_5m) > 1.5
+    
+    # ===== UPGRADE: MULTI-DIMENSIONAL GAMMA EXECUTION SCORE =====
+    gamma_exec_score = 0
+    gamma_exec_signals = []
+    
+    # Signal 1: Volume spike (existing, tapi lebih sensitif)
+    if vol_spike_ratio > 2.0:
+        gamma_exec_score += 2
+        gamma_exec_signals.append(f"vol_spike={vol_spike_ratio:.1f}x")
+    elif vol_spike_ratio > 1.3:  # NEW: threshold lebih rendah
+        gamma_exec_score += 1
+        gamma_exec_signals.append(f"vol_mild_spike={vol_spike_ratio:.1f}x")
+    
+    # Signal 2: Price momentum vs energy mismatch
+    # HFT execute dengan energy kecil tapi price move besar = thin book execution
+    if abs(change_5m) > 1.5 and max(up_energy, down_energy) < 0.5:
+        gamma_exec_score += 2
+        gamma_exec_signals.append(
+            f"thin_book_move: change={change_5m:.1f}% energy={max(up_energy, down_energy):.2f}"
+        )
+    
+    # Signal 3: Proximity acceleration — harga mendekati kill zone dengan CEPAT
+    # Jika distance_to_kill < 2% DAN abs(change_5m) > 0.8% = akselerasi nyata
+    if distance_to_kill < 2.0 and abs(change_5m) > 0.8:
+        gamma_exec_score += 1
+        gamma_exec_signals.append(
+            f"proximity_accel: dist={distance_to_kill:.2f}% change={change_5m:.1f}%"
+        )
+    
+    # Signal 4: Kill direction consistency dengan price direction
+    # Jika kill_direction = LONG dan change_5m > 0 (atau sebaliknya) = aligned execution
+    price_aligned = (
+        (kill_direction == "LONG" and change_5m > 0.5) or
+        (kill_direction == "SHORT" and change_5m < -0.5)
+    )
+    if price_aligned and distance_to_kill < 3.0:
+        gamma_exec_score += 1
+        gamma_exec_signals.append(
+            f"kill_aligned: dir={kill_direction} change={change_5m:.1f}%"
+        )
+    
+    # Signal 5: OBV confirmation — OBV harus searah dengan move
+    obv_trend = data.get("obv_trend", "NEUTRAL")
+    obv_confirms = (
+        (change_5m > 0 and obv_trend in ["POSITIVE", "POSITIVE_EXTREME"]) or
+        (change_5m < 0 and obv_trend in ["NEGATIVE", "NEGATIVE_EXTREME"])
+    )
+    if obv_confirms and abs(change_5m) > 1.0:
+        gamma_exec_score += 1
+        gamma_exec_signals.append(f"obv_confirm={obv_trend}")
+    
+    # BAIT PHASE PENALTY: Jika market_phase = BAIT, kurangi score
+    # Ini kunci utama untuk fix DUSDT/PLAYUSDT case
+    market_phase = data.get("market_phase", "UNKNOWN")
+    if market_phase == "BAIT":
+        gamma_exec_score = max(0, gamma_exec_score - 2)
+        gamma_exec_signals.append("BAIT_PENALTY(-2)")
+    
+    # Final: butuh score >= 3 untuk dianggap executing
+    gamma_executing = gamma_exec_score >= 3
 
     if gamma_active >= 3.0:
         intensity = "EXTREME"
@@ -1050,11 +1109,15 @@ def _gamma_calculate(data: dict, delta_data: dict) -> dict:
         "distance_to_kill": distance_to_kill,
         "energy_for_kill":  energy_for_kill,
         "gamma_executing":  gamma_executing,
+        "gamma_exec_score": gamma_exec_score,
+        "gamma_exec_signals": gamma_exec_signals,
         "vol_spike_ratio":  round(vol_spike_ratio, 2),
         "reason": (
             f"Gamma {intensity}: jarak ke kill zone {distance_to_kill:.2f}%, "
             f"kill speed {kill_speed:.1f}/10, "
-            f"{'SEDANG DIEKSEKUSI HFT' if gamma_executing else 'belum eksekusi'}"
+            f"exec_score={gamma_exec_score}/7 "
+            f"({'SEDANG DIEKSEKUSI HFT' if gamma_executing else 'belum eksekusi'}) "
+            f"| signals: {', '.join(gamma_exec_signals) if gamma_exec_signals else 'none'}"
         )
     }
 
@@ -1298,6 +1361,8 @@ def greeks_final_screen(result: dict) -> dict:
     output["greeks_delta_crowded"]    = delta["who_is_crowded"]
     output["greeks_gamma_intensity"]  = gamma["gamma_intensity"]
     output["greeks_gamma_executing"]  = gamma["gamma_executing"]
+    output["greeks_gamma_exec_score"] = gamma.get("gamma_exec_score", 0)    # NEW
+    output["greeks_gamma_exec_signals"] = gamma.get("gamma_exec_signals", []) # NEW
     output["greeks_kill_speed"]       = gamma["kill_speed"]
     output["greeks_who_dies_first"]   = delta["who_dies_first"]
     output["greeks_liq_7pct"]         = delta["liq_7pct_touch"]
@@ -1345,23 +1410,24 @@ def _check_kill_confirmation(data: dict) -> dict:
     kill_speed = data.get("greeks_kill_speed", 0)
     volume_ratio = data.get("volume_ratio", 0)
     change_5m = abs(data.get("change_5m", 0))
+    gamma_exec_score = data.get("gamma_exec_score", 0)  # NEW
     
-    # Cek apakah kill sudah dimulai
-    kill_started = (
-        gamma_executing == True and
-        abs(kill_speed) >= 3.0 and      # speed minimal 3/10
-        volume_ratio >= 0.85 and         # volume mulai naik
-        change_5m >= 1.5                 # price mulai bergerak nyata
-    )
+    # UPGRADE: score-based confirmation
+    kill_score = sum([
+        gamma_executing,                    # boolean → 0 atau 1
+        abs(kill_speed) >= 3.0,
+        volume_ratio >= 0.85,
+        change_5m >= 1.5,
+        gamma_exec_score >= 3,             # NEW signal
+    ])
+    
+    # Butuh 3 dari 5 (turun dari 4) karena sekarang ada signal baru
+    kill_started = kill_score >= 3
     
     return {
         "kill_confirmed": kill_started,
-        "kill_score": sum([
-            gamma_executing,
-            abs(kill_speed) >= 3.0,
-            volume_ratio >= 0.85,
-            change_5m >= 1.5,
-        ]),
+        "kill_score": kill_score,
+        "gamma_exec_score": gamma_exec_score,
         "reason": "KILL CONFIRMED" if kill_started else "KILL NOT YET — tunggu execution"
     }
 
@@ -1379,10 +1445,16 @@ def _should_block_greeks_override(data: dict, phase: str) -> bool:
     gamma_executing = data.get("greeks_gamma_executing", False)
     kill_speed = abs(data.get("greeks_kill_speed", 0))
     volume_ratio = data.get("volume_ratio", 1.0)
+    gamma_exec_score = data.get("gamma_exec_score", 0)  # NEW
     
-    # Hard block: BAIT + gamma belum jalan + volume lemah
-    if not gamma_executing and kill_speed < 3.0 and volume_ratio < 0.8:
-        return True  # BLOCK override
+    # UPGRADE: gunakan exec_score, bukan hanya boolean
+    # Block jika score < 3 (tidak cukup bukti execution nyata)
+    if not gamma_executing and gamma_exec_score < 3:
+        return True
+    
+    # Block jika speed rendah DAN volume lemah
+    if kill_speed < 3.0 and volume_ratio < 0.8:
+        return True
     
     return False
 
@@ -7183,6 +7255,52 @@ class ProfitImbalanceReversal:
         return {"override": False}
 
 
+class ProximityContinuationOverride:
+    """
+    🔥 DUSDT PATTERN: Harga sudah bergerak searah dengan target likuiditas dekat,
+    volume kering, tidak ada resistance → HFT lanjutkan arah.
+    
+    Kondisi LONG:
+    - short_liq < 2.5% (target dekat)
+    - change_5m > 1.0% (harga naik)
+    - volume_ratio < 0.8 (volume kering)
+    - down_energy < 0.1 (tidak ada seller)
+    - agg > 0.6 atau ofi_bias == "LONG" (konfirmasi order flow)
+    
+    Kondisi SHORT:
+    - long_liq < 2.5% (target dekat)
+    - change_5m < -1.0% (harga turun)
+    - volume_ratio < 0.8 (volume kering)
+    - up_energy < 0.1 (tidak ada buyer)
+    - agg < 0.4 atau ofi_bias == "SHORT" (konfirmasi order flow)
+    
+    Priority: -1105 (sama dengan ProfitImbalanceReversal)
+    """
+    @staticmethod
+    def detect(short_liq: float, long_liq: float, change_5m: float,
+               volume_ratio: float, down_energy: float, up_energy: float,
+               agg: float, ofi_bias: str) -> Dict:
+        # CASE LONG: harga naik, short liq dekat, no sellers
+        if (short_liq < 2.5 and change_5m > 1.0 and volume_ratio < 0.8 and down_energy < 0.1):
+            if agg > 0.6 or ofi_bias == "LONG":
+                return {
+                    "override": True,
+                    "bias": "LONG",
+                    "reason": f"PROXIMITY CONTINUATION: price up {change_5m:.1f}%, short liq {short_liq:.2f}% close, volume dry, no sellers → HFT sweep short stops, continue LONG",
+                    "priority": -1105
+                }
+        # CASE SHORT: harga turun, long liq dekat, no buyers
+        if (long_liq < 2.5 and change_5m < -1.0 and volume_ratio < 0.8 and up_energy < 0.1):
+            if agg < 0.4 or ofi_bias == "SHORT":
+                return {
+                    "override": True,
+                    "bias": "SHORT",
+                    "reason": f"PROXIMITY CONTINUATION: price down {change_5m:.1f}%, long liq {long_liq:.2f}% close, volume dry, no buyers → HFT sweep long stops, continue SHORT",
+                    "priority": -1105
+                }
+        return {"override": False}
+
+
 class OversoldLongLiqBounceReversal:
     """
     🔥 PLAYUSDT PATTERN: Oversold + long liq sangat dekat + harga sudah turun
@@ -8587,6 +8705,21 @@ class BinanceAnalyzer:
                             priority = profit_reversal["priority"]
                             prob_engine.add(profit_reversal["bias"], 10.06)
 
+                        # ===== PRIORITY -1105: PROXIMITY CONTINUATION (DUSDT PATTERN) =====
+                        proximity_cont = ProximityContinuationOverride.detect(
+                            short_liq=liq["short_dist"], long_liq=liq["long_dist"],
+                            change_5m=change_5m, volume_ratio=volume_ratio,
+                            down_energy=down_energy, up_energy=up_energy,
+                            agg=agg, ofi_bias=ofi["bias"]
+                        )
+                        if not post_squeeze.get("override") and not low_vol_dist.get("override") and not profit_reversal.get("override") and proximity_cont["override"]:
+                            final_bias = proximity_cont["bias"]
+                            final_reason = proximity_cont["reason"]
+                            final_confidence = "ABSOLUTE"
+                            final_phase = "PROXIMITY_CONTINUATION"
+                            priority = proximity_cont["priority"]
+                            prob_engine.add(proximity_cont["bias"], 10.07)
+
                         # ===== PRIORITY -1104: OVERSOLD LONG LIQ BOUNCE REVERSAL =====
                         oversold_bounce = OversoldLongLiqBounceReversal.detect(
                             long_liq=liq.get("long_dist", 99.0),
@@ -8595,7 +8728,7 @@ class BinanceAnalyzer:
                             volume_ratio=volume_ratio,
                             down_energy=down_energy
                         )
-                        if not post_squeeze.get("override") and not low_vol_dist.get("override") and not profit_reversal.get("override") and oversold_bounce["override"]:
+                        if not post_squeeze.get("override") and not low_vol_dist.get("override") and not profit_reversal.get("override") and not proximity_cont.get("override") and oversold_bounce["override"]:
                             final_bias = oversold_bounce["bias"]
                             final_reason = oversold_bounce["reason"]
                             final_confidence = "ABSOLUTE"
@@ -8611,7 +8744,7 @@ class BinanceAnalyzer:
                             volume_ratio=volume_ratio,
                             up_energy=up_energy
                         )
-                        if not post_squeeze.get("override") and not low_vol_dist.get("override") and not profit_reversal.get("override") and not oversold_bounce.get("override") and overbought_dump["override"]:
+                        if not post_squeeze.get("override") and not low_vol_dist.get("override") and not profit_reversal.get("override") and not proximity_cont.get("override") and not oversold_bounce.get("override") and overbought_dump["override"]:
                             final_bias = overbought_dump["bias"]
                             final_reason = overbought_dump["reason"]
                             final_confidence = "ABSOLUTE"
