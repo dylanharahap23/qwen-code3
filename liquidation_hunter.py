@@ -1197,6 +1197,76 @@ class OversoldDistributionContinuation:
         return {"override": False}
 
 
+class LowVolumeDistributionContinuation:
+    """
+    🔥 STOUSDT FIX: Oversold + OBV negative extreme + volume sangat rendah + long liq dekat = masih dump
+    
+    Volume rendah menunjukkan tidak ada buyer yang masuk. OBV negatif ekstrem menunjukkan distribusi aktif.
+    Ini bukan fake move, tapi kelanjutan dump untuk sapu long stop.
+    
+    Kondisi SHORT:
+    - change_5m < -2.0   (sudah turun)
+    - rsi6 < 30          (oversold)
+    - long_liq < 2.0     (target dekat)
+    - obv_trend = NEGATIVE_EXTREME/NEGATIVE (distribusi aktif)
+    - volume_ratio < 0.7 (tidak ada volume beli)
+    - down_energy < 0.1  (tidak ada tekanan beli)
+    
+    Kondisi LONG (mirror):
+    - change_5m > 2.0    (sudah naik)
+    - rsi6 > 70          (overbought)
+    - short_liq < 2.0    (target dekat)
+    - obv_trend = POSITIVE_EXTREME/POSITIVE (akumulasi aktif)
+    - volume_ratio < 0.7 (tidak ada volume jual)
+    - up_energy < 0.1    (tidak ada tekanan jual)
+    
+    Priority: -1106 (di atas ProfitImbalanceReversal -1105)
+    """
+    @staticmethod
+    def detect(change_5m: float, rsi6: float,
+               long_liq: float = 99.0, short_liq: float = 99.0,
+               obv_trend: str = "NEUTRAL", volume_ratio: float = 1.0,
+               down_energy: float = 0.0, up_energy: float = 0.0) -> Dict:
+        
+        # SHORT: dump lanjut
+        if (change_5m < -2.0 and
+            rsi6 < 30 and
+            long_liq < 2.0 and
+            obv_trend in ["NEGATIVE_EXTREME", "NEGATIVE"] and
+            volume_ratio < 0.7 and
+            down_energy < 0.1):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"LOW VOLUME DISTRIBUTION CONTINUATION: price down {change_5m:.1f}%, "
+                    f"RSI {rsi6:.1f} oversold, long liq {long_liq:.2f}% dekat, "
+                    f"OBV {obv_trend} (distribusi), volume {volume_ratio:.2f}x rendah → dump lanjut"
+                ),
+                "priority": -1106
+            }
+        
+        # LONG: pump lanjut
+        if (change_5m > 2.0 and
+            rsi6 > 70 and
+            short_liq < 2.0 and
+            obv_trend in ["POSITIVE_EXTREME", "POSITIVE"] and
+            volume_ratio < 0.7 and
+            up_energy < 0.1):
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": (
+                    f"LOW VOLUME ACCUMULATION CONTINUATION: price up {change_5m:.1f}%, "
+                    f"RSI {rsi6:.1f} overbought, short liq {short_liq:.2f}% dekat, "
+                    f"OBV {obv_trend} (akumulasi), volume {volume_ratio:.2f}x rendah → pump lanjut"
+                ),
+                "priority": -1106
+            }
+        
+        return {"override": False}
+
+
 class LowVolumeContinuation:
     @staticmethod
     def detect(volume_ratio: float, obv_trend: str, price: float,
@@ -7439,6 +7509,21 @@ class BinanceAnalyzer:
 
                         # ===== HIGH PRIORITY OVERRIDES (cascading if-else) =====
 
+                        # ===== PRIORITY -1106: LOW VOLUME DISTRIBUTION CONTINUATION =====
+                        low_vol_dist = LowVolumeDistributionContinuation.detect(
+                            change_5m, rsi6,
+                            liq["long_dist"], liq["short_dist"],
+                            obv_trend, volume_ratio,
+                            down_energy, up_energy
+                        )
+                        if low_vol_dist["override"]:
+                            final_bias = low_vol_dist["bias"]
+                            final_reason = low_vol_dist["reason"]
+                            final_confidence = "ABSOLUTE"
+                            final_phase = "LOW_VOL_DISTRIBUTION_CONT"
+                            priority = low_vol_dist["priority"]
+                            prob_engine.add(low_vol_dist["bias"], 10.07)
+
                         # ===== PRIORITY -1105: PROFIT IMBALANCE REVERSAL (EXCHANGE NEUTRALIZATION) =====
                         # TERTINGGI - di atas semua detector lain karena ini adalah kebijakan exchange level tertinggi
                         profit_reversal = ProfitImbalanceReversal.detect(
@@ -7446,7 +7531,7 @@ class BinanceAnalyzer:
                             liq["long_dist"], liq["short_dist"],
                             volume_ratio
                         )
-                        if profit_reversal["override"]:
+                        if not low_vol_dist.get("override") and profit_reversal["override"]:
                             final_bias = profit_reversal["bias"]
                             final_reason = profit_reversal["reason"]
                             final_confidence = "ABSOLUTE"
@@ -7461,7 +7546,7 @@ class BinanceAnalyzer:
                             obv_trend, obv_value, volume_ratio,
                             agg, ofi["bias"]
                         )
-                        if not profit_reversal.get("override") and oversold_dist["override"]:
+                        if not low_vol_dist.get("override") and not profit_reversal.get("override") and oversold_dist["override"]:
                             final_bias = oversold_dist["bias"]
                             final_reason = oversold_dist["reason"]
                             final_confidence = "ABSOLUTE"
