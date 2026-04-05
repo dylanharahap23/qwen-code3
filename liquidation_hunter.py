@@ -907,6 +907,116 @@ def greeks_final_screen(result: dict) -> dict:
     return output
 
 
+# ================= LECTURER'S SARAN LOGIC =================
+
+# Global tracker untuk delayed entry system
+_bait_detected_symbols: Dict[str, float] = {}  # {symbol: timestamp_bait_detected}
+
+
+def _check_kill_confirmation(data: dict) -> dict:
+    """
+    Konfirmasi bahwa HFT sudah BENAR-BENAR mulai execute.
+    Harus semua terpenuhi sebelum entry diizinkan dari BAIT phase.
+    """
+    gamma_executing = data.get("greeks_gamma_executing", False)
+    kill_speed = data.get("greeks_kill_speed", 0)
+    volume_ratio = data.get("volume_ratio", 0)
+    change_5m = abs(data.get("change_5m", 0))
+    
+    # Cek apakah kill sudah dimulai
+    kill_started = (
+        gamma_executing == True and
+        abs(kill_speed) >= 3.0 and      # speed minimal 3/10
+        volume_ratio >= 0.85 and         # volume mulai naik
+        change_5m >= 1.5                 # price mulai bergerak nyata
+    )
+    
+    return {
+        "kill_confirmed": kill_started,
+        "kill_score": sum([
+            gamma_executing,
+            abs(kill_speed) >= 3.0,
+            volume_ratio >= 0.85,
+            change_5m >= 1.5,
+        ]),
+        "reason": "KILL CONFIRMED" if kill_started else "KILL NOT YET — tunggu execution"
+    }
+
+
+def _should_block_greeks_override(data: dict, phase: str) -> bool:
+    """
+    Block greeks override jika:
+    - Fase masih BAIT, DAN
+    - Gamma belum executing, DAN
+    - Kill speed masih rendah
+    """
+    if phase != "BAIT":
+        return False
+    
+    gamma_executing = data.get("greeks_gamma_executing", False)
+    kill_speed = abs(data.get("greeks_kill_speed", 0))
+    volume_ratio = data.get("volume_ratio", 1.0)
+    
+    # Hard block: BAIT + gamma belum jalan + volume lemah
+    if not gamma_executing and kill_speed < 3.0 and volume_ratio < 0.8:
+        return True  # BLOCK override
+    
+    return False
+
+
+def _check_obv_conflict(data: dict, bias: str) -> bool:
+    """
+    Return True jika OBV bertentangan keras dengan bias.
+    Ini tanda bahaya — kemungkinan FAKE signal.
+    """
+    obv_trend = data.get("obv_trend", "NEUTRAL")
+    
+    if bias == "LONG" and obv_trend == "NEGATIVE_EXTREME":
+        return True  # OBV konfirmasi dump, tapi lo mau LONG → BAHAYA
+    if bias == "SHORT" and obv_trend == "POSITIVE_EXTREME":
+        return True  # OBV konfirmasi pump, tapi lo mau SHORT → BAHAYA
+    
+    return False
+
+
+def _apply_delayed_entry_logic(symbol: str, data: dict, bias: str) -> dict:
+    """
+    Jika BAIT terdeteksi, catat waktu.
+    Entry hanya boleh jika:
+    - BAIT sudah terdeteksi sebelumnya (ada di history), DAN
+    - Sekarang kill_confirmation = True
+    """
+    now = time.time()
+    phase = data.get("market_phase", "UNKNOWN")
+    kill_check = _check_kill_confirmation(data)
+    
+    if phase == "BAIT":
+        _bait_detected_symbols[symbol] = now
+        return {
+            "entry_allowed": False,
+            "entry_reason": "BAIT detected — waiting for kill execution to start"
+        }
+    
+    # Cek apakah sebelumnya ada BAIT
+    bait_time = _bait_detected_symbols.get(symbol)
+    bait_age_sec = (now - bait_time) if bait_time else 9999
+    
+    if bait_time and bait_age_sec < 300:  # dalam 5 menit terakhir ada BAIT
+        if kill_check["kill_confirmed"]:
+            # Bait sudah ada, kill sudah mulai → ENTRY ALLOWED
+            return {
+                "entry_allowed": True,
+                "entry_reason": f"BAIT→KILL confirmed (bait was {bait_age_sec:.0f}s ago)"
+            }
+        else:
+            return {
+                "entry_allowed": False,
+                "entry_reason": f"BAIT seen {bait_age_sec:.0f}s ago — kill not confirmed yet"
+            }
+    
+    return {"entry_allowed": True, "entry_reason": "No recent BAIT — normal entry"}
+
+
 def print_greeks_section(result: dict):
     """
     Tambahkan ini ke OutputFormatter.print_signal() lo.
@@ -7444,8 +7554,14 @@ class BinanceAnalyzer:
                 result["confidence"] = "HIGH"
                 result["greeks_override"] = False  # batalkan override
         
-        # ========== FILTER 2: Phase Lock ==========
-        if market_phase == "BAIT" and greeks_override and gamma_intensity != "EXTREME":
+        # ========== FILTER 2: Phase Lock + Greeks Override Blocker ==========
+        # Hard block dari lecturer: block greeks override jika BAIT + gamma belum jalan
+        if _should_block_greeks_override(result, market_phase):
+            result["reason"] += f" | GREEKS OVERRIDE BLOCKED: BAIT phase + gamma not executing"
+            result["greeks_override"] = False
+            new_bias = self.last_confirmed_bias if self.last_confirmed_bias != "NEUTRAL" else result["bias"]
+            result["confidence"] = "HIGH"
+        elif market_phase == "BAIT" and greeks_override and gamma_intensity != "EXTREME":
             # Di BAIT phase, hanya Gamma EXTREME yang boleh override
             result["reason"] += f" | PHASE LOCK: BAIT phase, greeks override blocked (gamma={gamma_intensity})"
             result["greeks_override"] = False
@@ -7482,8 +7598,19 @@ class BinanceAnalyzer:
         # Terapkan bias akhir
         result["bias"] = new_bias
         
-        # ========== FILTER 5: Entry Filter ==========
-        # Tambahkan rekomendasi entry berdasarkan phase
+        # ========== OBV CONFLICT GUARD (SOLV case) ==========
+        # Cek apakah OBV bertentangan keras dengan bias di BAIT phase
+        final_bias = result.get("bias", "NEUTRAL")
+        if _check_obv_conflict(result, final_bias) and market_phase == "BAIT":
+            entry_ok = False
+            result["reason"] += f" | OBV CONFLICT IN BAIT PHASE — high risk of trap (bias={final_bias}, obv={result.get('obv_trend', 'N/A')})"
+        
+        # ========== FILTER 5: Entry Filter + Delayed Entry Logic ==========
+        # Tambahkan rekomendasi entry berdasarkan phase + delayed entry system
+        kill_check = _check_kill_confirmation(result)
+        delayed_entry = _apply_delayed_entry_logic(self.symbol, result, final_bias)
+        
+        # Base entry logic dari phase
         entry_ok = False
         if market_phase == "KILL" and result.get("greeks_gamma_executing", False):
             entry_ok = True
@@ -7492,11 +7619,18 @@ class BinanceAnalyzer:
         elif market_phase == "BAIT":
             entry_ok = False
         
+        # Override dengan delayed entry logic jika ada BAIT sebelumnya
+        if not delayed_entry["entry_allowed"]:
+            entry_ok = False
+            result["entry_reason_delayed"] = delayed_entry["entry_reason"]
+        
         result["entry_allowed"] = entry_ok
         result["entry_reason"] = (
-            "OK to enter (KILL phase + gamma executing)" if entry_ok
-            else "WAIT: market in BAIT phase or gamma not executing"
+            delayed_entry["entry_reason"] if not entry_ok else
+            ("OK to enter (KILL phase + gamma executing)" if entry_ok
+             else "WAIT: market in BAIT phase or gamma not executing")
         )
+        result["kill_confirmation"] = kill_check  # tambahkan info kill confirmation
         
         # Jika entry tidak diizinkan dan bias bukan NEUTRAL, turunkan confidence
         if not entry_ok and result["bias"] in ("LONG", "SHORT"):
@@ -9816,6 +9950,11 @@ class OutputFormatter:
         if result.get('entry_allowed') is not None:
             entry_status = "✅ ALLOWED" if result['entry_allowed'] else "⛔ WAIT"
             print(f"🚦 ENTRY STATUS: {entry_status} - {result.get('entry_reason', '')}")
+            if result.get('entry_reason_delayed'):
+                print(f"   └─ Delayed Entry: {result.get('entry_reason_delayed')}")
+            if result.get('kill_confirmation'):
+                kc = result['kill_confirmation']
+                print(f"   └─ Kill Confirmation: {'✅ CONFIRMED' if kc.get('kill_confirmed') else '⏳ WAITING'} (score: {kc.get('kill_score', 0)}/4) - {kc.get('reason', '')}")
 
         print(f"\n{'='*40}")
         print("📊 KEY METRICS:")
