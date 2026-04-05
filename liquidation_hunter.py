@@ -139,17 +139,29 @@ def _check_bait_phase(data: dict) -> Optional[PhaseResult]:
     Deteksi BAIT phase = market bikin gerakan kecil palsu untuk jebak trader.
     Ciri khas: ada gerakan, tapi volume masih rendah dan OBV tidak konfirmasi.
 
-    Rule (minimal 3 dari 4 harus terpenuhi):
+    Rule (minimal 3 dari 6 harus terpenuhi):
       • 0.5 <= |change_5m| < 2.0  → ada gerakan tapi kecil
       • volume_ratio < 0.8        → volume tidak mendukung
       • obv_trend == "NEUTRAL"    → OBV tidak konfirmasi arah
       • up_energy > 0 AND down_energy == 0 (atau sebaliknya) → energy satu arah tapi sepi
+      • RSI multi-TF divergence (RSI 1m > 70 & RSI 5m < 30, atau sebaliknya)
+      • ask_wall_dominant (ask_slope / bid_slope > 5.0)
     """
     change_5m = abs(data.get("change_5m", 0.0))
     volume_ratio = data.get("volume_ratio", 1.0)
     obv_trend = data.get("obv_trend", "NEUTRAL")
     up_energy = data.get("up_energy", 0.0)
     down_energy = data.get("down_energy", 0.0)
+    
+    # NEW: RSI multi-TF divergence = sinyal BAIT tambahan
+    rsi6 = data.get("rsi6", 50.0)
+    rsi6_5m = data.get("rsi6_5m", 50.0)
+    rsi_tf_divergence = (rsi6 > 70 and rsi6_5m < 30) or (rsi6 < 30 and rsi6_5m > 70)
+    
+    # NEW: ask wall dominance = sinyal BAIT tambahan
+    ask_slope = data.get("ask_slope", 0)
+    bid_slope = data.get("bid_slope", 1)
+    ask_wall_dominant = (bid_slope > 0 and ask_slope / bid_slope > 5.0)
 
     one_sided_energy = (up_energy > 0 and down_energy == 0) or \
                        (down_energy > 0 and up_energy == 0)
@@ -159,6 +171,8 @@ def _check_bait_phase(data: dict) -> Optional[PhaseResult]:
         "low_volume": volume_ratio < 0.8,
         "obv_not_confirming": obv_trend == "NEUTRAL",
         "one_sided_energy": one_sided_energy,
+        "rsi_tf_divergence": rsi_tf_divergence,   # NEW
+        "ask_wall_dominant": ask_wall_dominant,    # NEW
     }
 
     triggered = {k: v for k, v in conditions.items() if v}
@@ -7365,6 +7379,110 @@ class OverboughtShortLiqDumpReversal:
         return {"override": False}
 
 
+class AskWallLongTrap:
+    """
+    🔥 PLAYUSDT EXACT PATTERN:
+    
+    HFT pasang ask wall raksasa (ask_slope >> bid_slope) tapi bikin
+    semua trades BUY (agg=1.00) untuk memancing long entry.
+    
+    Tanda:
+    - ask_slope >> bid_slope (rasio > 5x) = barrier naik sangat tebal
+    - agg > 0.85 (hampir semua trades buy = spoofing buy pressure)  
+    - RSI 1m overbought tapi RSI 5m sangat oversold = divergence palsu
+    - change_5m kecil meski agg=1.00 = harga tidak bisa nembus ask wall
+    
+    Logika: jika 100% trades BUY tapi harga hanya naik 1-2% = ask wall
+    menyerap semua buy → setelah retail terisi → HFT tarik ask wall → dump
+    
+    Priority: -1099 (sangat tinggi)
+    """
+    @staticmethod
+    def detect(ask_slope: float, bid_slope: float,
+               agg: float, change_5m: float,
+               rsi6: float, rsi6_5m: float,
+               volume_ratio: float,
+               down_energy: float) -> Dict:
+        
+        if bid_slope <= 0:
+            return {"override": False}
+        
+        ask_bid_ratio = ask_slope / bid_slope
+        
+        # Core pattern: ask wall raksasa + agg tinggi palsu + price tidak naik proporsional
+        if (ask_bid_ratio > 5.0 and           # sell wall 5x lebih tebal
+            agg > 0.80 and                     # hampir semua trades BUY
+            0 < change_5m < 3.0 and           # harga naik tipis (tidak proporsional)
+            volume_ratio < 0.6 and            # volume rendah (tidak ada momentum nyata)
+            down_energy < 0.1):               # tidak ada seller di book (tapi ask wall ada)
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"ASK WALL LONG TRAP: ask_slope={ask_slope:.0f} vs bid={bid_slope:.0f} "
+                    f"(ratio {ask_bid_ratio:.1f}x), agg={agg:.2f} (spoof buy), "
+                    f"price only +{change_5m:.1f}% → ask wall absorbing all buys, "
+                    f"retail trapped LONG, dump incoming"
+                ),
+                "priority": -1099
+            }
+        
+        return {"override": False}
+
+
+class RSIMultiTFDivergenceTrap:
+    """
+    🔥 PLAYUSDT: RSI 1m overbought + RSI 5m oversold ekstrem
+    
+    Sistem sekarang interpret ini sebagai "bounce akan terjadi karena 5m oversold".
+    Padahal ini adalah JEBAKAN:
+    - RSI 1m = 77 (overbought = retail sudah beli di top)
+    - RSI 5m = 18 (oversold = trend turun jangka menengah masih kuat)
+    
+    Ketika RSI 1m overbought DAN RSI 5m masih sangat oversold:
+    → trend 5m lebih dominan
+    → bounce 1m hanya fake recovery
+    → arah sebenarnya = lanjut turun sesuai trend 5m
+    
+    Priority: -1098
+    """
+    @staticmethod
+    def detect(rsi6: float, rsi6_5m: float,
+               ask_slope: float, bid_slope: float,
+               change_5m: float, volume_ratio: float,
+               obv_trend: str) -> Dict:
+        
+        # RSI 1m overbought tapi RSI 5m masih oversold ekstrem
+        # = bounce palsu, trend 5m lebih kuat
+        rsi_divergence = rsi6 > 70 and rsi6_5m < 30
+        
+        if not rsi_divergence:
+            return {"override": False}
+        
+        # Konfirmasi: ask wall lebih tebal (supply lebih besar)
+        ask_dominant = (bid_slope > 0 and ask_slope / bid_slope > 3.0)
+        
+        # Konfirmasi: harga sudah naik tipis dengan volume rendah
+        # = momentum palsu, bukan breakout nyata
+        fake_pump = (0 < change_5m < 3.0 and volume_ratio < 0.6)
+        
+        if rsi_divergence and (ask_dominant or fake_pump):
+            bias = "SHORT"  # ikuti trend 5m yang lebih kuat
+            return {
+                "override": True,
+                "bias": bias,
+                "reason": (
+                    f"RSI MULTI-TF DIVERGENCE TRAP: RSI_1m={rsi6:.1f} overbought "
+                    f"tapi RSI_5m={rsi6_5m:.1f} oversold ekstrem → "
+                    f"bounce 1m adalah fake, trend 5m lebih dominan, "
+                    f"ask/bid ratio={ask_slope/bid_slope:.1f}x → SHORT"
+                ),
+                "priority": -1098
+            }
+        
+        return {"override": False}
+
+
 class OFISpoofingDetector:
     """
     🔥 RLSUSDT PATTERN: OFI SHORT 1.00 tapi sebenarnya LONG
@@ -8751,6 +8869,43 @@ class BinanceAnalyzer:
                             final_phase = "OVERBOUGHT_SHORT_LIQ_DUMP"
                             priority = overbought_dump["priority"]
                             prob_engine.add(overbought_dump["bias"], 10.06)
+
+                        # ===== PRIORITY -1099: ASK WALL LONG TRAP =====
+                        ask_wall_trap = AskWallLongTrap.detect(
+                            ask_slope=ask_slope,
+                            bid_slope=bid_slope,
+                            agg=agg,
+                            change_5m=change_5m,
+                            rsi6=rsi6,
+                            rsi6_5m=rsi6_5m,
+                            volume_ratio=volume_ratio,
+                            down_energy=down_energy
+                        )
+                        if not post_squeeze.get("override") and not low_vol_dist.get("override") and not profit_reversal.get("override") and not proximity_cont.get("override") and not oversold_bounce.get("override") and not overbought_dump.get("override") and ask_wall_trap["override"]:
+                            final_bias = ask_wall_trap["bias"]
+                            final_reason = ask_wall_trap["reason"]
+                            final_confidence = "ABSOLUTE"
+                            final_phase = "ASK_WALL_LONG_TRAP"
+                            priority = ask_wall_trap["priority"]
+                            prob_engine.add(ask_wall_trap["bias"], 9.997)
+
+                        # ===== PRIORITY -1098: RSI MULTI-TF DIVERGENCE TRAP =====
+                        rsi_tf_trap = RSIMultiTFDivergenceTrap.detect(
+                            rsi6=rsi6,
+                            rsi6_5m=rsi6_5m,
+                            ask_slope=ask_slope,
+                            bid_slope=bid_slope,
+                            change_5m=change_5m,
+                            volume_ratio=volume_ratio,
+                            obv_trend=obv_trend
+                        )
+                        if not post_squeeze.get("override") and not low_vol_dist.get("override") and not profit_reversal.get("override") and not proximity_cont.get("override") and not oversold_bounce.get("override") and not overbought_dump.get("override") and not ask_wall_trap.get("override") and rsi_tf_trap["override"]:
+                            final_bias = rsi_tf_trap["bias"]
+                            final_reason = rsi_tf_trap["reason"]
+                            final_confidence = "ABSOLUTE"
+                            final_phase = "RSI_MULTI_TF_DIVERGENCE_TRAP"
+                            priority = rsi_tf_trap["priority"]
+                            prob_engine.add(rsi_tf_trap["bias"], 9.995)
 
                         # ===== PRIORITY -1104: OVERSOLD DISTRIBUTION CONTINUATION =====
                         oversold_dist = OversoldDistributionContinuation.detect(
