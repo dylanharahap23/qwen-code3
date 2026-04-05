@@ -7183,6 +7183,70 @@ class ProfitImbalanceReversal:
         return {"override": False}
 
 
+class OversoldLongLiqBounceReversal:
+    """
+    🔥 PLAYUSDT PATTERN: Oversold + long liq sangat dekat + harga sudah turun
+    → HFT akan pump untuk reversal (bukan lanjut dump)
+    
+    Kondisi:
+    - long_liq < 2.0% (sangat dekat)
+    - rsi6 < 30 (oversold)
+    - change_5m < -2.0% (sudah turun signifikan)
+    - volume_ratio < 1.0 (exhaustion, tidak ada panic volume)
+    - down_energy < 0.1 (tidak ada seller aktif)
+    
+    Priority: -1104 (di atas VEGA-KILL CONFLICT -9991.5)
+    Bias: LONG
+    """
+    @staticmethod
+    def detect(long_liq: float, rsi6: float, change_5m: float,
+               volume_ratio: float, down_energy: float) -> Dict:
+        if (long_liq < 2.0 and
+            rsi6 < 30 and
+            change_5m < -2.0 and
+            volume_ratio < 1.0 and
+            down_energy < 0.1):
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": f"OVERSOLD LONG LIQ BOUNCE REVERSAL: long liq {long_liq:.2f}% super close, RSI {rsi6:.1f} oversold, price dropped {change_5m:.1f}%, volume dry ({volume_ratio:.2f}x), no sellers → HFT will pump for reversal",
+                "priority": -1104
+            }
+        return {"override": False}
+
+
+class OverboughtShortLiqDumpReversal:
+    """
+    Mirror: Overbought + short liq sangat dekat + harga sudah naik
+    → HFT akan dump untuk reversal
+    
+    Kondisi:
+    - short_liq < 2.0% (sangat dekat)
+    - rsi6 > 70 (overbought)
+    - change_5m > 2.0% (sudah naik signifikan)
+    - volume_ratio < 1.0 (exhaustion, tidak ada panic volume)
+    - up_energy < 0.1 (tidak ada buyer aktif)
+    
+    Priority: -1104 (di atas VEGA-KILL CONFLICT -9991.5)
+    Bias: SHORT
+    """
+    @staticmethod
+    def detect(short_liq: float, rsi6: float, change_5m: float,
+               volume_ratio: float, up_energy: float) -> Dict:
+        if (short_liq < 2.0 and
+            rsi6 > 70 and
+            change_5m > 2.0 and
+            volume_ratio < 1.0 and
+            up_energy < 0.1):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"OVERBOUGHT SHORT LIQ DUMP REVERSAL: short liq {short_liq:.2f}% super close, RSI {rsi6:.1f} overbought, price pumped {change_5m:.1f}%, volume dry → HFT will dump for reversal",
+                "priority": -1104
+            }
+        return {"override": False}
+
+
 class OFISpoofingDetector:
     """
     🔥 RLSUSDT PATTERN: OFI SHORT 1.00 tapi sebenarnya LONG
@@ -8522,6 +8586,38 @@ class BinanceAnalyzer:
                             final_phase = "PROFIT_IMBALANCE_REVERSAL"
                             priority = profit_reversal["priority"]
                             prob_engine.add(profit_reversal["bias"], 10.06)
+
+                        # ===== PRIORITY -1104: OVERSOLD LONG LIQ BOUNCE REVERSAL =====
+                        oversold_bounce = OversoldLongLiqBounceReversal.detect(
+                            long_liq=liq.get("long_dist", 99.0),
+                            rsi6=rsi6,
+                            change_5m=change_5m,
+                            volume_ratio=volume_ratio,
+                            down_energy=down_energy
+                        )
+                        if not post_squeeze.get("override") and not low_vol_dist.get("override") and not profit_reversal.get("override") and oversold_bounce["override"]:
+                            final_bias = oversold_bounce["bias"]
+                            final_reason = oversold_bounce["reason"]
+                            final_confidence = "ABSOLUTE"
+                            final_phase = "OVERSOLD_LONG_LIQ_BOUNCE"
+                            priority = oversold_bounce["priority"]
+                            prob_engine.add(oversold_bounce["bias"], 10.06)
+
+                        # ===== PRIORITY -1104: OVERBOUGHT SHORT LIQ DUMP REVERSAL (MIRROR) =====
+                        overbought_dump = OverboughtShortLiqDumpReversal.detect(
+                            short_liq=liq.get("short_dist", 99.0),
+                            rsi6=rsi6,
+                            change_5m=change_5m,
+                            volume_ratio=volume_ratio,
+                            up_energy=up_energy
+                        )
+                        if not post_squeeze.get("override") and not low_vol_dist.get("override") and not profit_reversal.get("override") and not oversold_bounce.get("override") and overbought_dump["override"]:
+                            final_bias = overbought_dump["bias"]
+                            final_reason = overbought_dump["reason"]
+                            final_confidence = "ABSOLUTE"
+                            final_phase = "OVERBOUGHT_SHORT_LIQ_DUMP"
+                            priority = overbought_dump["priority"]
+                            prob_engine.add(overbought_dump["bias"], 10.06)
 
                         # ===== PRIORITY -1104: OVERSOLD DISTRIBUTION CONTINUATION =====
                         oversold_dist = OversoldDistributionContinuation.detect(
