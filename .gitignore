@@ -17,6 +17,8 @@ __pycache__/
 # Editors
 .vscode/
 .idea/
+*.swp
+*.swo
 
 # Dependencies
 .venv/
@@ -27,4 +29,10 @@ node_modules/
 dist/
 build/
 target/
+*.o
+*.obj
+*.so
+*.a
+*.dll
+*.exe
 ```
