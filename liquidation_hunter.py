@@ -60,6 +60,9 @@ LOW_CAP_VOLUME_THRESHOLD = 100000
 LAST_BIAS = None
 LAST_BIAS_TIME = 0
 
+# ================= KILL-ZONE FLIP TRAP DETECTOR =================
+_kill_direction_history: Dict[str, List[Tuple[float, str]]] = {}
+
 # ================= TIME DECAY GLOBAL =================
 LAST_SIGNAL = None
 LAST_SIGNAL_TIME = 0
@@ -231,6 +234,182 @@ def _check_kill_phase(data: dict) -> Optional[PhaseResult]:
         reason=reason,
         sub_signals=triggered,
     )
+
+
+# ================= KILL-ZONE FLIP TRAP DETECTOR FUNCTIONS =================
+
+def _track_kill_direction(symbol: str, kill_direction: str) -> None:
+    """Catat history greeks_kill_direction per symbol."""
+    now = time.time()
+    if symbol not in _kill_direction_history:
+        _kill_direction_history[symbol] = []
+    
+    history = _kill_direction_history[symbol]
+    history.append((now, kill_direction))
+    
+    # Simpan hanya 60 detik terakhir
+    _kill_direction_history[symbol] = [
+        (t, d) for t, d in history if now - t <= 60
+    ]
+
+
+def _check_kill_direction_stability(symbol: str) -> dict:
+    """
+    Cek apakah greeks_kill_direction stabil dalam 60 detik terakhir.
+    
+    Jika kill_direction sering flip → BOTH_POSSIBLE → DANGER ZONE.
+    Jika kill_direction konsisten → aman untuk entry.
+    
+    Returns:
+        stable: bool — arah konsisten?
+        flip_count: int — berapa kali flip?
+        dominant_direction: str — arah yang paling sering muncul
+        danger: bool — apakah ini Kill-Zone Flip Trap?
+    """
+    history = _kill_direction_history.get(symbol, [])
+    
+    if len(history) < 2:
+        return {
+            "stable": True,
+            "flip_count": 0,
+            "dominant_direction": "UNKNOWN",
+            "danger": False,
+            "reason": "Insufficient history — assume stable"
+        }
+    
+    directions = [d for _, d in history]
+    
+    # Hitung flip
+    flip_count = sum(
+        1 for i in range(1, len(directions))
+        if directions[i] != directions[i-1]
+    )
+    
+    # Dominant direction
+    long_count = directions.count("LONG")
+    short_count = directions.count("SHORT")
+    both_count = directions.count("BOTH_POSSIBLE") + directions.count("BOTH")
+    
+    if long_count > short_count and long_count > both_count:
+        dominant = "LONG"
+    elif short_count > long_count and short_count > both_count:
+        dominant = "SHORT"
+    else:
+        dominant = "UNSTABLE"
+    
+    # Bahaya jika: banyak flip atau dominant tidak jelas
+    danger = flip_count >= 2 or dominant == "UNSTABLE" or both_count >= 2
+    
+    return {
+        "stable": not danger,
+        "flip_count": flip_count,
+        "dominant_direction": dominant,
+        "danger": danger,
+        "reason": (
+            f"Kill direction flipped {flip_count}x in last 60s. "
+            f"Dominant: {dominant}. {'⚠️ FLIP TRAP DETECTED' if danger else '✅ Stable'}"
+        )
+    }
+
+
+def _check_dual_liq_trap(data: dict) -> dict:
+    """
+    Deteksi Kill-Zone Flip Trap: kedua sisi likuiditas dekat,
+    gamma belum executing, who_dies_first masih ambigu.
+    
+    Ini kondisi paling berbahaya — bandar belum commit arah.
+    Entry apapun di sini = masuk jebakan.
+    
+    Trigger jika minimal 3 dari 5:
+    - greeks_who_dies_first == "BOTH_POSSIBLE"
+    - greeks_liq_7pct == "BOTH"
+    - greeks_gamma_executing == False
+    - short_liq < 3.0% DAN long_liq < 5.0%  (dua-duanya dekat)
+    - greeks_kill_speed < 2.0  (belum ada momentum kill)
+    """
+    who_dies = data.get("greeks_who_dies_first", "")
+    liq_7pct = data.get("greeks_liq_7pct", "")
+    gamma_executing = data.get("greeks_gamma_executing", False)
+    short_liq = data.get("short_liq", 99.0)
+    long_liq = data.get("long_liq", 99.0)
+    kill_speed = abs(data.get("greeks_kill_speed", 0))
+    
+    conditions = {
+        "both_possible": who_dies in ("BOTH_POSSIBLE", "BOTH"),
+        "liq_7pct_both": liq_7pct in ("BOTH", "BOTH_POSSIBLE"),
+        "gamma_not_executing": not gamma_executing,
+        "dual_liq_close": short_liq < 3.0 and long_liq < 5.0,
+        "kill_speed_low": kill_speed < 2.0,
+    }
+    
+    triggered = {k: v for k, v in conditions.items() if v}
+    score = len(triggered)
+    
+    is_trap = score >= 3
+    
+    return {
+        "dual_liq_trap": is_trap,
+        "trap_score": score,
+        "triggered_conditions": list(triggered.keys()),
+        "reason": (
+            f"DUAL LIQ TRAP: {score}/5 conditions — "
+            f"who_dies={who_dies}, liq_7pct={liq_7pct}, "
+            f"gamma_exec={gamma_executing}, "
+            f"short_liq={short_liq:.1f}%, long_liq={long_liq:.1f}%, "
+            f"kill_speed={kill_speed:.2f}. "
+            f"{'🚨 SKIP ENTRY — direction not committed' if is_trap else '✅ OK'}"
+        )
+    }
+
+
+def _check_bias_kill_conflict(data: dict, final_bias: str) -> dict:
+    """
+    KASUS DEGO: bias = LONG tapi greeks_kill_direction = SHORT.
+    
+    Ini adalah sinyal bahwa system salah interpret Greeks.
+    greeks_kill_direction SHORT artinya LONG TRADERS YANG AKAN MATI.
+    Jadi entry LONG = masuk ke zona yang akan dieksekusi.
+    
+    Block entry jika:
+    - final_bias == "LONG" tapi greeks_kill_direction == "SHORT"
+    - final_bias == "SHORT" tapi greeks_kill_direction == "LONG"  
+    - Dan: greeks_gamma_executing == False (belum start, masih bisa flip)
+    """
+    kill_dir = data.get("greeks_kill_direction", "")
+    gamma_executing = data.get("greeks_gamma_executing", False)
+    who_dies = data.get("greeks_who_dies_first", "")
+    
+    # Mapping: kill_direction SHORT = LONG traders mati = jangan LONG
+    conflict = False
+    conflict_reason = ""
+    
+    if final_bias == "LONG" and kill_dir == "SHORT" and not gamma_executing:
+        conflict = True
+        conflict_reason = (
+            f"BIAS CONFLICT: bias=LONG tapi kill_direction=SHORT "
+            f"(LONG traders akan dieksekusi). gamma_executing=False → "
+            f"belum start, tapi arah sudah jelas. BLOCK LONG entry."
+        )
+    elif final_bias == "SHORT" and kill_dir == "LONG" and not gamma_executing:
+        conflict = True
+        conflict_reason = (
+            f"BIAS CONFLICT: bias=SHORT tapi kill_direction=LONG "
+            f"(SHORT traders akan dieksekusi). gamma_executing=False → "
+            f"belum start, tapi arah sudah jelas. BLOCK SHORT entry."
+        )
+    
+    # Exception: jika who_dies sudah confirmed (bukan BOTH_POSSIBLE), 
+    # dan kill_dir align dengan who_dies → boleh masuk sesuai kill_dir
+    if conflict and who_dies not in ("BOTH_POSSIBLE", "BOTH", ""):
+        # who_dies confirmed → override bias ke arah kill yang benar
+        correct_bias = "SHORT" if kill_dir == "SHORT" else "LONG"
+        conflict_reason += f" → Correct bias should be: {correct_bias}"
+    
+    return {
+        "has_conflict": conflict,
+        "correct_direction": kill_dir if conflict else final_bias,
+        "reason": conflict_reason if conflict else "No bias-kill conflict"
+    }
 
 
 def detect_market_phase(data: dict) -> PhaseResult:
@@ -7637,6 +7816,42 @@ class BinanceAnalyzer:
             if result["confidence"] == "ABSOLUTE":
                 result["confidence"] = "HIGH"
         
+        # ===== NEW: KILL-ZONE FLIP TRAP DETECTION INTEGRATION =====
+        # 1. Track kill direction history
+        symbol = data.get("symbol", result.get("symbol", "UNKNOWN"))
+        kill_dir = result.get("greeks_kill_direction", "")
+        _track_kill_direction(symbol, kill_dir)
+
+        # 2. Cek Kill Direction Stability
+        dir_stability = _check_kill_direction_stability(symbol)
+        result["kill_direction_stability"] = dir_stability
+
+        # 3. Cek Dual Liquidity Trap
+        dual_trap = _check_dual_liq_trap(result)
+        result["dual_liq_trap"] = dual_trap
+
+        # 4. Cek Bias vs Kill Direction Conflict
+        bias_conflict = _check_bias_kill_conflict(result, result.get("bias", "NEUTRAL"))
+        result["bias_kill_conflict"] = bias_conflict
+
+        # 5. Apply semua ke entry_allowed
+        if result.get("entry_allowed", True):  # hanya block jika belum di-block
+            
+            if dual_trap["dual_liq_trap"]:
+                result["entry_allowed"] = False
+                result["entry_reason"] = f"DUAL LIQ TRAP ({dual_trap['trap_score']}/5) — {dual_trap['reason']}"
+            
+            elif dir_stability["danger"]:
+                result["entry_allowed"] = False
+                result["entry_reason"] = f"KILL FLIP TRAP — {dir_stability['reason']}"
+            
+            elif bias_conflict["has_conflict"]:
+                result["entry_allowed"] = False
+                result["entry_reason"] = f"BIAS-KILL CONFLICT — {bias_conflict['reason']}"
+                # Koreksi bias ke arah yang benar
+                result["bias_corrected"] = bias_conflict["correct_direction"]
+                result["reason"] = f"[BIAS CORRECTED → {bias_conflict['correct_direction']}] " + result.get("reason", "")
+        
         return result
 
     def analyze(self) -> Optional[Dict]:
@@ -9955,6 +10170,24 @@ class OutputFormatter:
             if result.get('kill_confirmation'):
                 kc = result['kill_confirmation']
                 print(f"   └─ Kill Confirmation: {'✅ CONFIRMED' if kc.get('kill_confirmed') else '⏳ WAITING'} (score: {kc.get('kill_score', 0)}/4) - {kc.get('reason', '')}")
+            
+            # NEW: Kill-Zone Flip Trap Detection Output
+            if result.get('kill_direction_stability'):
+                kds = result['kill_direction_stability']
+                stability_icon = "⚠️ DANGER" if kds.get('danger') else "✅ STABLE"
+                print(f"   └─ Kill Direction Stability: {stability_icon} (flips: {kds.get('flip_count', 0)}, dominant: {kds.get('dominant_direction', 'UNKNOWN')})")
+            
+            if result.get('dual_liq_trap'):
+                dlt = result['dual_liq_trap']
+                trap_icon = "🚨 TRAP DETECTED" if dlt.get('dual_liq_trap') else "✅ OK"
+                print(f"   └─ Dual Liq Trap: {trap_icon} (score: {dlt.get('trap_score', 0)}/5)")
+            
+            if result.get('bias_kill_conflict'):
+                bkc = result['bias_kill_conflict']
+                conflict_icon = "⚠️ CONFLICT" if bkc.get('has_conflict') else "✅ NO CONFLICT"
+                print(f"   └─ Bias-Kill Conflict: {conflict_icon}")
+                if bkc.get('has_conflict'):
+                    print(f"      └─ Corrected Direction: {bkc.get('correct_direction', 'N/A')}")
 
         print(f"\n{'='*40}")
         print("📊 KEY METRICS:")
