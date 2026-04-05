@@ -7243,6 +7243,13 @@ class BinanceAnalyzer:
         self.prev_ofi_timestamp = 0.0
         self.ofi_consistency_required = 2.0
 
+        # ========== SIGNAL STABILITY FILTERS ==========
+        self.flip_cooldown_sec = 3.0           # detik minimal antara flip
+        self.last_flip_time = 0.0              # timestamp flip terakhir
+        self.last_confirmed_bias = "NEUTRAL"   # bias terakhir yang sudah dikonfirmasi
+        self.confirmation_count = 0            # hitungan konfirmasi berturut-turut
+        self.confirmation_required = 2         # butuh 2 tick konsisten
+
     def __del__(self):
         if hasattr(self, 'ws') and self.ws is not None:
             self.ws.stop()
@@ -7258,6 +7265,96 @@ class BinanceAnalyzer:
         if abs(change_5m) > 8.0:
             return True
         return False
+
+    def _apply_stability_filters(self, result: dict, phase_result, greeks_dict: dict) -> dict:
+        """
+        Menerapkan 5 filter stabilitas sinyal:
+        1. Flip Cooldown (anti-flip cepat)
+        2. Phase Lock (BAIT phase membutuhkan Gamma EXTREME untuk override)
+        3. Confirmation Window (butuh N tick konsisten)
+        4. Gamma Delay (Gamma EXTREME tapi delta exposure < 0.95 => tunda)
+        5. Entry Filter (tambahkan rekomendasi entry di output)
+        """
+        new_bias = result["bias"]
+        now = time.time()
+        market_phase = phase_result.phase if phase_result else "UNKNOWN"
+        
+        # Ambil data Greeks dari result (sudah ada dari greeks_final_screen)
+        gamma_intensity = result.get("greeks_gamma_intensity", "LOW")
+        delta_exposure = result.get("greeks_delta_exposure", 0.0)
+        greeks_override = result.get("greeks_override", False)
+        
+        # ========== FILTER 4: Gamma Delay ==========
+        if gamma_intensity == "EXTREME" and delta_exposure < 0.95:
+            # Gamma fake: belum cukup crowded, tunda override
+            if greeks_override:
+                result["reason"] += f" | GAMMA DELAY: intensity EXTREME but delta_exposure={delta_exposure:.3f}<0.95 → hold"
+                # Jangan terapkan override ini, kembalikan bias sebelumnya
+                new_bias = self.last_confirmed_bias if self.last_confirmed_bias != "NEUTRAL" else result["bias"]
+                # Turunkan confidence sementara
+                result["confidence"] = "HIGH"
+                result["greeks_override"] = False  # batalkan override
+        
+        # ========== FILTER 2: Phase Lock ==========
+        if market_phase == "BAIT" and greeks_override and gamma_intensity != "EXTREME":
+            # Di BAIT phase, hanya Gamma EXTREME yang boleh override
+            result["reason"] += f" | PHASE LOCK: BAIT phase, greeks override blocked (gamma={gamma_intensity})"
+            result["greeks_override"] = False
+            new_bias = self.last_confirmed_bias if self.last_confirmed_bias != "NEUTRAL" else result["bias"]
+            result["confidence"] = "HIGH"
+        
+        # ========== FILTER 3: Confirmation Window ==========
+        if new_bias == self.last_confirmed_bias:
+            self.confirmation_count += 1
+        else:
+            self.confirmation_count = 1  # mulai hitung dari 1 untuk bias baru
+        
+        if self.confirmation_count < self.confirmation_required:
+            # Belum cukup konfirmasi, pakai bias terkonfirmasi sebelumnya
+            if self.last_confirmed_bias != "NEUTRAL":
+                result["reason"] += f" | CONF WINDOW: need {self.confirmation_required} ticks, current {self.confirmation_count} → holding {self.last_confirmed_bias}"
+                new_bias = self.last_confirmed_bias
+                result["confidence"] = "MEDIUM"
+            # jika belum ada bias terkonfirmasi, biarkan new_bias (pertama kali)
+        else:
+            # Cukup konfirmasi, update bias terkonfirmasi
+            self.last_confirmed_bias = new_bias
+        
+        # ========== FILTER 1: Flip Cooldown ==========
+        if self.last_confirmed_bias != "NEUTRAL" and new_bias != self.last_confirmed_bias:
+            elapsed = now - self.last_flip_time
+            if elapsed < self.flip_cooldown_sec:
+                result["reason"] += f" | FLIP COOLDOWN: {elapsed:.1f}s < {self.flip_cooldown_sec}s → block flip to {new_bias}"
+                new_bias = self.last_confirmed_bias
+                result["confidence"] = "MEDIUM"
+            else:
+                self.last_flip_time = now
+        
+        # Terapkan bias akhir
+        result["bias"] = new_bias
+        
+        # ========== FILTER 5: Entry Filter ==========
+        # Tambahkan rekomendasi entry berdasarkan phase
+        entry_ok = False
+        if market_phase == "KILL" and result.get("greeks_gamma_executing", False):
+            entry_ok = True
+        elif market_phase == "KILL" and gamma_intensity in ("HIGH", "EXTREME"):
+            entry_ok = True
+        elif market_phase == "BAIT":
+            entry_ok = False
+        
+        result["entry_allowed"] = entry_ok
+        result["entry_reason"] = (
+            "OK to enter (KILL phase + gamma executing)" if entry_ok
+            else "WAIT: market in BAIT phase or gamma not executing"
+        )
+        
+        # Jika entry tidak diizinkan dan bias bukan NEUTRAL, turunkan confidence
+        if not entry_ok and result["bias"] in ("LONG", "SHORT"):
+            if result["confidence"] == "ABSOLUTE":
+                result["confidence"] = "HIGH"
+        
+        return result
 
     def analyze(self) -> Optional[Dict]:
         try:
@@ -9347,6 +9444,9 @@ class BinanceAnalyzer:
             # ========== GREEKS FINAL SCREENER INTEGRATION ==========
             result = greeks_final_screen(result)
 
+            # ========== STABILITY FILTERS (Flip Cooldown, Phase Lock, Confirmation, Gamma Delay, Entry) ==========
+            result = self._apply_stability_filters(result, phase_result, {})
+
             return result
 
         except Exception as e:
@@ -9531,6 +9631,10 @@ class OutputFormatter:
         print(f"📌 REASON: {result.get('reason', '')}")
         print(f"🎯 PHASE: {result.get('phase', '')}")
         print(f"💰 POSITION SIZE MULTIPLIER: {result.get('position_multiplier', 1.0):.2f}")
+
+        if result.get('entry_allowed') is not None:
+            entry_status = "✅ ALLOWED" if result['entry_allowed'] else "⛔ WAIT"
+            print(f"🚦 ENTRY STATUS: {entry_status} - {result.get('entry_reason', '')}")
 
         print(f"\n{'='*40}")
         print("📊 KEY METRICS:")
