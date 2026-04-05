@@ -1144,18 +1144,17 @@ class BinanceWebSocket:
 
 class PostSqueezeReversal:
     """
-    🔥 AIOTUSDT FIX: Mendeteksi akhir dari squeeze (short liq hampir tersapu)
+    🔥 MENDETEKSI AKHIR SQUEEZE: Harga sudah melewati target likuiditas
     
-    Kondisi:
-    - Harga sudah pump signifikan (> 3%)
-    - Short liq sangat dekat (< 2%) → target hampir tercapai
-    - RSI overbought (> 80)
-    - Volume rendah (< 0.6x) → tidak ada pembeli baru
-    - Up_energy kecil (< 0.5) → energy pump habis
+    Kondisi SHORT (setelah pump):
+    - Harga naik (change_5m > 0)
+    - Short liq dekat (< 2%)
+    - RSI overbought (> 70)
+    - Volume rendah (< 0.6x)
+    - Up energy habis (< 0.5)
+    - **Harga sudah naik melebihi short_liq** (change_5m > short_liq)
     
-    Maka HFT akan reverse untuk dump.
-    
-    Priority: -1107 (di atas semua detector lain)
+    Priority: -1107 (sangat tinggi)
     """
     @staticmethod
     def detect(change_5m: float, short_liq: float, rsi6: float,
@@ -1163,38 +1162,37 @@ class PostSqueezeReversal:
                long_liq: float = 99.0, down_energy: float = 0.0,
                obv_trend: str = "NEUTRAL") -> Dict:
         
-        # Pump besar + short liq dekat + overbought + volume rendah + energy habis
-        if (change_5m > 3.0 and
+        # Kasus SHORT: pump selesai, target short liq sudah tersapu
+        if (change_5m > 0 and
             short_liq < 2.0 and
-            rsi6 > 80 and
+            rsi6 > 70 and
             volume_ratio < 0.6 and
-            up_energy < 0.5):
+            up_energy < 0.5 and
+            change_5m > short_liq):   # 🔥 kunci: harga sudah lewati target
             return {
                 "override": True,
                 "bias": "SHORT",
                 "reason": (
-                    f"POST-SQUEEZE REVERSAL: price pumped {change_5m:.1f}%, "
-                    f"short liq {short_liq:.2f}% hampir habis, RSI {rsi6:.1f} overbought, "
-                    f"volume {volume_ratio:.2f}x rendah, up_energy={up_energy:.2f} habis → "
-                    f"squeeze selesai, HFT akan dump"
+                    f"POST-SQUEEZE REVERSAL: price pumped {change_5m:.1f}% > short liq {short_liq:.2f}%, "
+                    f"RSI {rsi6:.1f} overbought, volume {volume_ratio:.2f}x rendah, up_energy={up_energy:.2f} habis → "
+                    f"short stop sudah tersapu, HFT akan dump"
                 ),
                 "priority": -1107
             }
         
-        # Mirror untuk kasus dump (long liq dekat) – simetris
-        if (change_5m < -3.0 and
+        # Kasus LONG: dump selesai, target long liq sudah tersapu
+        if (change_5m < 0 and
             long_liq < 2.0 and
-            rsi6 < 20 and
+            rsi6 < 30 and
             volume_ratio < 0.6 and
-            down_energy < 0.5):
+            down_energy < 0.5 and
+            abs(change_5m) > long_liq):
             return {
                 "override": True,
                 "bias": "LONG",
                 "reason": (
-                    f"POST-DUMP REVERSAL: price dumped {change_5m:.1f}%, "
-                    f"long liq {long_liq:.2f}% hampir habis, RSI {rsi6:.1f} oversold, "
-                    f"volume {volume_ratio:.2f}x rendah, down_energy={down_energy:.2f} habis → "
-                    f"dump selesai, HFT akan pump"
+                    f"POST-DUMP REVERSAL: price dumped {abs(change_5m):.1f}% > long liq {long_liq:.2f}%, "
+                    f"RSI {rsi6:.1f} oversold, volume rendah, down_energy habis → long stop tersapu, HFT akan pump"
                 ),
                 "priority": -1107
             }
