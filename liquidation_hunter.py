@@ -361,16 +361,31 @@ def _check_dual_liq_trap(data: dict) -> dict:
     
     is_trap = score >= 3
     
+    # ============================================================
+    # 🔥 TAMBAHAN: DOUBLE KILL PROXIMITY ANALYSIS
+    # Jika dual liq trap aktif, tentukan "first move direction"
+    # berdasarkan mana yang lebih dekat
+    # ============================================================
+    first_move = "UNKNOWN"
+    if is_trap:
+        if short_liq < long_liq and short_liq < 3.0:
+            first_move = "UP"   # short swept dulu
+        elif long_liq < short_liq and long_liq < 3.0:
+            first_move = "DOWN" # long swept dulu
+        else:
+            first_move = "UNKNOWN"  # terlalu simetris
+    
     return {
         "dual_liq_trap": is_trap,
         "trap_score": score,
         "triggered_conditions": list(triggered.keys()),
+        "first_move_direction": first_move,  # NEW
         "reason": (
             f"DUAL LIQ TRAP: {score}/5 conditions — "
             f"who_dies={who_dies}, liq_7pct={liq_7pct}, "
             f"gamma_exec={gamma_executing}, "
             f"short_liq={short_liq:.1f}%, long_liq={long_liq:.1f}%, "
-            f"kill_speed={kill_speed:.2f}. "
+            f"kill_speed={kill_speed:.2f}, first_move={first_move}. "
             f"{'🚨 SKIP ENTRY — direction not committed' if is_trap else '✅ OK'}"
         )
     }
@@ -2149,6 +2164,177 @@ class LowVolumeDistributionContinuation:
                 ),
                 "priority": -1106
             }
+        
+        return {"override": False}
+
+
+class DoubleKillSequenceDetector:
+    """
+    🔥 SYSUSDT PATTERN: Double Kill Setup
+    
+    HFT mau bunuh DUA sisi, tapi ada urutan:
+    1. Siapa yang lebih dekat = yang mati DULU
+    2. Setelah yang dekat habis → baru giliran yang jauh
+    
+    Rule:
+    - who_dies_first == "BOTH_POSSIBLE" (belum ada korban dipilih)
+    - dual_liq_trap == True (arena pembantaian aktif)
+    - short_liq < long_liq → pump DULU untuk kill SHORT, baru dump
+    - long_liq < short_liq → dump DULU untuk kill LONG, baru pump
+    
+    Output: EXPECTED_FIRST_MOVE = arah gerak PERTAMA (bukan akhir)
+    
+    Priority: -1106 (di atas ProfitImbalanceReversal -1105)
+    Karena ini override semua sinyal tentang arah akhir.
+    """
+    @staticmethod
+    def detect(who_dies_first: str, dual_liq_trap: bool, trap_score: int,
+               short_liq: float, long_liq: float,
+               kill_confirmed: bool, ofi_bias: str, ofi_strength: float,
+               agg: float, volume_ratio: float,
+               kill_direction: str) -> Dict:
+        
+        # Hanya aktif jika belum ada korban dipilih
+        if who_dies_first != "BOTH_POSSIBLE":
+            return {"override": False}
+        
+        # Hanya aktif jika dual liq trap aktif
+        if not dual_liq_trap or trap_score < 3:
+            return {"override": False}
+        
+        # Hanya aktif jika kill belum dimulai
+        if kill_confirmed:
+            return {"override": False}
+        
+        # ============================================================
+        # KAIDAH UTAMA: siapa yang lebih dekat = mati DULU
+        # Setelah yang dekat mati, baru arah akhir (kill_direction) jalan
+        # ============================================================
+        
+        liq_diff = abs(short_liq - long_liq)
+        
+        # Short liq lebih dekat → pump dulu (kill SHORT) → baru dump (kill LONG)
+        if short_liq < long_liq and short_liq < 3.0:
+            
+            # Konfirmasi OFI palsu: ofi_strength tinggi + volume rendah = umpan
+            ofi_is_fake = ofi_strength > 0.8 and volume_ratio < 0.8
+            
+            # Konfirmasi agg palsu: 100% buy tapi volume rendah
+            agg_is_fake = agg > 0.85 and volume_ratio < 0.7
+            
+            # Jika ada umpan aktif = HFT sedang narik SHORT masuk
+            has_bait = ofi_is_fake or agg_is_fake
+            
+            return {
+                "override": True,
+                "bias": "LONG",  # gerak PERTAMA = pump
+                "expected_first_move": "UP",
+                "expected_second_move": "DOWN",
+                "reason": (
+                    f"DOUBLE KILL SEQUENCE: who_dies=BOTH_POSSIBLE, "
+                    f"short_liq={short_liq:.2f}% DEKAT vs long_liq={long_liq:.2f}% JAUH → "
+                    f"HFT pump DULU untuk sweep short stop, "
+                    f"BARU dump untuk kill long | "
+                    f"bait_active={has_bait} (ofi={ofi_strength:.2f}, agg={agg:.2f})"
+                ),
+                "priority": -1106,
+                "kill_sequence": "SHORT_FIRST_THEN_LONG"
+            }
+        
+        # Long liq lebih dekat → dump dulu (kill LONG) → baru pump (kill SHORT)
+        if long_liq < short_liq and long_liq < 3.0:
+            
+            ofi_is_fake = ofi_strength > 0.8 and volume_ratio < 0.8
+            agg_is_fake = agg < 0.15 and volume_ratio < 0.7
+            has_bait = ofi_is_fake or agg_is_fake
+            
+            return {
+                "override": True,
+                "bias": "SHORT",  # gerak PERTAMA = dump
+                "expected_first_move": "DOWN",
+                "expected_second_move": "UP",
+                "reason": (
+                    f"DOUBLE KILL SEQUENCE: who_dies=BOTH_POSSIBLE, "
+                    f"long_liq={long_liq:.2f}% DEKAT vs short_liq={short_liq:.2f}% JAUH → "
+                    f"HFT dump DULU untuk sweep long stop, "
+                    f"BARU pump untuk kill short | "
+                    f"bait_active={has_bait}"
+                ),
+                "priority": -1106,
+                "kill_sequence": "LONG_FIRST_THEN_SHORT"
+            }
+        
+        return {"override": False}
+
+
+class OFIBaitValidator:
+    """
+    🔥 SYSUSDT: OFI 1.00 + agg 1.00 + volume rendah = UMPAN HFT
+    
+    Ketika OFI sangat tinggi (>0.9) tapi volume rendah:
+    - Ini bukan akumulasi nyata
+    - Ini adalah spoofing untuk menarik posisi ke arah tertentu
+    - Setelah cukup posisi terisi, HFT akan balik arah
+    
+    Bedakan dengan OFI nyata:
+    - OFI nyata: strength tinggi + volume tinggi (>1.0x)
+    - OFI bait:  strength tinggi + volume RENDAH (<0.8x)
+    
+    Jika OFI terdeteksi sebagai bait:
+    → Percaya LIQUIDITY PROXIMITY bukan OFI
+    → Output arah sesuai liq terdekat
+    
+    Priority: -1099 (di atas OFISpoofingDetector yang ada)
+    """
+    @staticmethod
+    def detect(ofi_bias: str, ofi_strength: float,
+               agg: float, volume_ratio: float,
+               short_liq: float, long_liq: float,
+               who_dies_first: str,
+               dual_liq_trap: bool) -> Dict:
+        
+        # OFI bait: strength sangat tinggi tapi volume rendah
+        ofi_bait = (
+            ofi_strength > 0.85 and
+            volume_ratio < 0.7 and
+            agg > 0.75  # trades juga spoofed
+        )
+        
+        if not ofi_bait:
+            return {"override": False}
+        
+        # Jika who_dies = BOTH_POSSIBLE + dual trap = setup double kill
+        # OFI sedang menarik korban ke arah yang AKAN DISAPU DULU
+        if who_dies_first == "BOTH_POSSIBLE" and dual_liq_trap:
+            # OFI LONG tapi short_liq dekat = HFT mau sweep short dulu
+            if ofi_bias == "LONG" and short_liq < long_liq and short_liq < 3.0:
+                return {
+                    "override": True,
+                    "bias": "LONG",  # ikuti OFI bait = ikuti first move
+                    "ofi_is_bait": True,
+                    "reason": (
+                        f"OFI BAIT VALIDATOR: OFI {ofi_bias} ({ofi_strength:.2f}) "
+                        f"dengan volume {volume_ratio:.2f}x = UMPAN. "
+                        f"HFT menarik SHORT masuk untuk di-sweep dulu. "
+                        f"short_liq {short_liq:.2f}% dekat → first move = UP"
+                    ),
+                    "priority": -1099
+                }
+            
+            # OFI SHORT tapi long_liq dekat = HFT mau sweep long dulu
+            if ofi_bias == "SHORT" and long_liq < short_liq and long_liq < 3.0:
+                return {
+                    "override": True,
+                    "bias": "SHORT",
+                    "ofi_is_bait": True,
+                    "reason": (
+                        f"OFI BAIT VALIDATOR: OFI {ofi_bias} ({ofi_strength:.2f}) "
+                        f"dengan volume {volume_ratio:.2f}x = UMPAN. "
+                        f"HFT menarik LONG masuk untuk di-sweep dulu. "
+                        f"long_liq {long_liq:.2f}% dekat → first move = DOWN"
+                    ),
+                    "priority": -1099
+                }
         
         return {"override": False}
 
@@ -9220,6 +9406,31 @@ class BinanceAnalyzer:
                             priority = post_squeeze["priority"]
                             prob_engine.add(post_squeeze["bias"], 10.09)
 
+                        # ===== PRIORITY -1106: DOUBLE KILL SEQUENCE DETECTOR =====
+                        kill_check_data = result.get("kill_confirmation", {})
+                        dual_trap_data = result.get("dual_liq_trap", {})
+
+                        double_kill = DoubleKillSequenceDetector.detect(
+                            who_dies_first=result.get("greeks_who_dies_first", ""),
+                            dual_liq_trap=dual_trap_data.get("dual_liq_trap", False),
+                            trap_score=dual_trap_data.get("trap_score", 0),
+                            short_liq=liq["short_dist"],
+                            long_liq=liq["long_dist"],
+                            kill_confirmed=kill_check_data.get("kill_confirmed", False),
+                            ofi_bias=ofi["bias"],
+                            ofi_strength=ofi["strength"],
+                            agg=agg,
+                            volume_ratio=volume_ratio,
+                            kill_direction=result.get("greeks_kill_direction", "")
+                        )
+                        if not post_squeeze.get("override") and double_kill["override"]:
+                            final_bias = double_kill["bias"]
+                            final_reason = double_kill["reason"]
+                            final_confidence = "ABSOLUTE"
+                            final_phase = "DOUBLE_KILL_SEQUENCE"
+                            priority = double_kill["priority"]
+                            prob_engine.add(double_kill["bias"], 10.08)
+
                         # ===== PRIORITY -1106: LOW VOLUME DISTRIBUTION CONTINUATION =====
                         low_vol_dist = LowVolumeDistributionContinuation.detect(
                             change_5m, rsi6,
@@ -9227,7 +9438,7 @@ class BinanceAnalyzer:
                             obv_trend, volume_ratio,
                             down_energy, up_energy
                         )
-                        if not post_squeeze.get("override") and low_vol_dist["override"]:
+                        if not post_squeeze.get("override") and not double_kill.get("override") and low_vol_dist["override"]:
                             final_bias = low_vol_dist["bias"]
                             final_reason = low_vol_dist["reason"]
                             final_confidence = "ABSOLUTE"
@@ -9242,7 +9453,7 @@ class BinanceAnalyzer:
                             liq["long_dist"], liq["short_dist"],
                             volume_ratio
                         )
-                        if not post_squeeze.get("override") and not low_vol_dist.get("override") and profit_reversal["override"]:
+                        if not post_squeeze.get("override") and not double_kill.get("override") and not low_vol_dist.get("override") and profit_reversal["override"]:
                             final_bias = profit_reversal["bias"]
                             final_reason = profit_reversal["reason"]
                             final_confidence = "ABSOLUTE"
@@ -9257,13 +9468,32 @@ class BinanceAnalyzer:
                             down_energy=down_energy, up_energy=up_energy,
                             agg=agg, ofi_bias=ofi["bias"]
                         )
-                        if not post_squeeze.get("override") and not low_vol_dist.get("override") and not profit_reversal.get("override") and proximity_cont["override"]:
+                        if not post_squeeze.get("override") and not double_kill.get("override") and not low_vol_dist.get("override") and not profit_reversal.get("override") and proximity_cont["override"]:
                             final_bias = proximity_cont["bias"]
                             final_reason = proximity_cont["reason"]
                             final_confidence = "ABSOLUTE"
                             final_phase = "PROXIMITY_CONTINUATION"
                             priority = proximity_cont["priority"]
                             prob_engine.add(proximity_cont["bias"], 10.07)
+
+                        # ===== PRIORITY -1099: OFI BAIT VALIDATOR =====
+                        ofi_bait_result = OFIBaitValidator.detect(
+                            ofi_bias=ofi["bias"],
+                            ofi_strength=ofi["strength"],
+                            agg=agg,
+                            volume_ratio=volume_ratio,
+                            short_liq=liq["short_dist"],
+                            long_liq=liq["long_dist"],
+                            who_dies_first=result.get("greeks_who_dies_first", ""),
+                            dual_liq_trap=dual_trap_data.get("dual_liq_trap", False)
+                        )
+                        if not post_squeeze.get("override") and not double_kill.get("override") and not low_vol_dist.get("override") and not profit_reversal.get("override") and not proximity_cont.get("override") and ofi_bait_result["override"]:
+                            final_bias = ofi_bait_result["bias"]
+                            final_reason = ofi_bait_result["reason"]
+                            final_confidence = "ABSOLUTE"
+                            final_phase = "OFI_BAIT_DETECTED"
+                            priority = ofi_bait_result["priority"]
+                            prob_engine.add(ofi_bait_result["bias"], 9.997)
 
                         # ===== PRIORITY -1104: OVERSOLD LONG LIQ BOUNCE REVERSAL =====
                         oversold_bounce = OversoldLongLiqBounceReversal.detect(
