@@ -1552,6 +1552,36 @@ def greeks_final_screen(result: dict) -> dict:
     output["greeks_liq_7pct"]         = delta["liq_7pct_touch"]
     output["greeks_kill_direction"]   = delta["kill_direction"]
 
+    # ===== TAMBAH: PRE-KILL SIGNAL CHECK =====
+    # Cek sebelum apply score override
+    bias_conflict_data = result.get("bias_kill_conflict", {})
+    
+    pre_kill = PreKillSignal.detect(
+        kill_direction=delta.get("kill_direction", ""),
+        short_dist=result.get("short_liq", 99.0),
+        long_dist=result.get("long_liq", 99.0),
+        delta_crowded=delta.get("who_is_crowded", ""),
+        kill_speed=gamma.get("kill_speed", 0),
+        gamma_intensity=gamma.get("gamma_intensity", "LOW"),
+        bias_kill_conflict=bias_conflict_data.get("has_conflict", False),
+        down_energy=result.get("down_energy", 0),
+        up_energy=result.get("up_energy", 0),
+        agg=result.get("agg", 0.5),
+        volume_ratio=result.get("volume_ratio", 1.0)
+    )
+    
+    output["greeks_pre_kill"] = pre_kill  # expose ke output
+    
+    if pre_kill["override"]:
+        output["bias"] = pre_kill["bias"]
+        output["confidence"] = "ABSOLUTE"
+        output["greeks_override"] = True
+        output["greeks_priority"] = pre_kill["priority"]
+        output["reason"] = (
+            f"[PRE-KILL SIGNAL] {pre_kill['reason']} "
+            f"| Original: {result.get('reason', '')}"
+        )
+
     if score["override"]:
         output["bias"]       = score["final_bias"]
         output["confidence"] = "ABSOLUTE"
@@ -2129,75 +2159,190 @@ class GammaLiquidityAlignment:
     (misal: kill SHORT tapi long_liq lebih dekat), maka override ke arah liquidity.
     
     Priority: -10000 (di atas Gamma EXTREME -9999)
+    
+    🔥 KAIDAH BARU: VALIDASI KONSISTENSI SEBELUM SPOOFING CLAIM
+    Spoofing = kill_direction BERLAWANAN dengan liquidity proximity
+    DAN gamma belum executing DAN volume rendah
+    
+    BUKAN spoofing jika:
+    - kill_direction SEARAH dengan liquidity proximity
+    - Contoh: kill=LONG + short_liq lebih dekat = KONSISTEN
+      (short yang akan mati karena dekat target)
     """
     @staticmethod
     def detect(gamma_intensity: str, kill_direction: str,
-               short_liq: float, long_liq: float,
+               short_dist: float, long_dist: float,
                gamma_executing: bool, volume_ratio: float,
                market_phase: str = "UNKNOWN") -> Dict:
         
         if gamma_intensity != "EXTREME":
             return {"override": False}
         
-        # Kasus A: Gamma bilang SHORT tapi long_liq lebih dekat (harusnya LONG)
-        if (kill_direction == "SHORT" and
-            long_liq < short_liq and
-            long_liq < 1.5):
-            
-            # Jika Gamma tidak executing dan volume rendah → ini spoof
-            if not gamma_executing and volume_ratio < 0.8:
-                return {
-                    "override": True,
-                    "bias": "LONG",
-                    "reason": (
-                        f"GAMMA SPOOFING DETECTED: Gamma EXTREME kill={kill_direction} "
-                        f"tapi long_liq={long_liq:.2f}% << short_liq={short_liq:.2f}%, "
-                        f"gamma_executing={gamma_executing}, volume={volume_ratio:.2f}x. "
-                        f"HFT memancing SHORT, sebenarnya akan PUMP untuk sweep long stop."
-                    ),
-                    "priority": -10000
-                }
-            # Jika Gamma executing tapi masih kontradiksi, tetap ikuti liquidity
-            elif long_liq < short_liq * 0.5:
-                return {
-                    "override": True,
-                    "bias": "LONG",
-                    "reason": (
-                        f"GAMMA-LIQUIDITY CONFLICT: Gamma kill={kill_direction} "
-                        f"tapi long_liq={long_liq:.2f}% jauh lebih dekat dari short_liq={short_liq:.2f}%. "
-                        f"Ikuti liquidity → LONG"
-                    ),
-                    "priority": -10000
-                }
+        # ============================================================
+        # 🔥 KAIDAH BARU: VALIDASI KONSISTENSI SEBELUM SPOOFING CLAIM
+        # 
+        # Spoofing = kill_direction BERLAWANAN dengan liquidity proximity
+        # DAN gamma belum executing DAN volume rendah
+        #
+        # BUKAN spoofing jika:
+        # - kill_direction SEARAH dengan liquidity proximity
+        # - Contoh: kill=LONG + short_liq lebih dekat = KONSISTEN
+        #   (short yang akan mati karena dekat target)
+        # ============================================================
         
-        # Kasus B: Gamma bilang LONG tapi short_liq lebih dekat (harusnya SHORT)
-        if (kill_direction == "LONG" and
-            short_liq < long_liq and
-            short_liq < 1.5):
+        # Cek konsistensi kill_direction vs liquidity proximity
+        liq_says_long = short_dist < long_dist   # short lebih dekat = LONG target
+        liq_says_short = long_dist < short_dist  # long lebih dekat = SHORT target
+        
+        kill_says_long = kill_direction == "LONG"
+        kill_says_short = kill_direction == "SHORT"
+        
+        # Konsisten = kill_direction SEARAH dengan liquidity proximity
+        is_consistent = (
+            (kill_says_long and liq_says_long) or   # STOUSDT case ini
+            (kill_says_short and liq_says_short)
+        )
+        
+        # Inkonsisten = kill_direction BERLAWANAN dengan liquidity proximity
+        is_inconsistent = (
+            (kill_says_long and liq_says_short) or
+            (kill_says_short and liq_says_long)
+        )
+        
+        # ============================================================
+        # JIKA KONSISTEN = INI PRE-KILL SIGNAL, BUKAN SPOOFING
+        # Jangan override, biarkan Greeks yang handle
+        # ============================================================
+        if is_consistent:
+            return {"override": False}  # tidak ada spoofing
+        
+        # ============================================================
+        # JIKA INKONSISTEN = BARU cek apakah ini spoofing
+        # Syarat spoofing: inkonsisten + belum executing + volume rendah
+        # ============================================================
+        if is_inconsistent:
             
-            if not gamma_executing and volume_ratio < 0.8:
-                return {
-                    "override": True,
-                    "bias": "SHORT",
-                    "reason": (
-                        f"GAMMA SPOOFING DETECTED: Gamma EXTREME kill={kill_direction} "
-                        f"tapi short_liq={short_liq:.2f}% << long_liq={long_liq:.2f}%, "
-                        f"gamma_executing={gamma_executing}, volume={volume_ratio:.2f}x. "
-                        f"HFT memancing LONG, sebenarnya akan DUMP untuk sweep short stop."
-                    ),
-                    "priority": -10000
-                }
-            elif short_liq < long_liq * 0.5:
-                return {
-                    "override": True,
-                    "bias": "SHORT",
-                    "reason": (
-                        f"GAMMA-LIQUIDITY CONFLICT: Gamma kill={kill_direction} "
-                        f"tapi short_liq={short_liq:.2f}% jauh lebih dekat dari long_liq={long_liq:.2f}%. "
-                        f"Ikuti liquidity → SHORT"
-                    ),
-                    "priority": -10000
-                }
+            # Kasus A: Gamma bilang SHORT tapi short_liq lebih dekat
+            # (harusnya LONG karena short yang akan mati)
+            if (kill_direction == "SHORT" and
+                short_dist < long_dist and
+                short_dist < 1.5):
+                
+                if not gamma_executing and volume_ratio < 0.8:
+                    return {
+                        "override": True,
+                        "bias": "LONG",
+                        "reason": (
+                            f"GAMMA SPOOFING: kill=SHORT tapi short_liq={short_dist:.2f}% "
+                            f"lebih dekat → inkonsisten, HFT spoof SHORT, "
+                            f"sebenarnya LONG squeeze"
+                        ),
+                        "priority": -10000
+                    }
+            
+            # Kasus B: Gamma bilang LONG tapi long_liq lebih dekat
+            # (harusnya SHORT karena long yang akan mati)
+            if (kill_direction == "LONG" and
+                long_dist < short_dist and
+                long_dist < 1.5):
+                
+                if not gamma_executing and volume_ratio < 0.8:
+                    return {
+                        "override": True,
+                        "bias": "SHORT",
+                        "reason": (
+                            f"GAMMA SPOOFING: kill=LONG tapi long_liq={long_dist:.2f}% "
+                            f"lebih dekat → inkonsisten, HFT spoof LONG, "
+                            f"sebenarnya SHORT dump"
+                        ),
+                        "priority": -10000
+                    }
+        
+        return {"override": False}
+
+
+class PreKillSignal:
+    """
+    🔥 KAIDAH BARU: PRE-KILL = arah sudah fix sebelum gamma execute
+    
+    Dosen: "gamma tidak perlu executing dulu untuk menentukan arah"
+    
+    Pre-Kill terkonfirmasi jika:
+    1. kill_direction jelas (bukan NEUTRAL)
+    2. Liquidity proximity KONSISTEN dengan kill_direction
+    3. delta_crowded KONSISTEN (crowded = yang akan mati)
+    4. kill_speed > 3.0 (momentum sudah tinggi)
+    5. bias_kill_conflict = True (sistem sendiri tahu ada konflik)
+    
+    Jika semua terpenuhi → langsung ikuti kill_direction
+    TANPA nunggu gamma_executing = True
+    
+    Priority: -9998 (tepat di bawah Gamma EXTREME -9999)
+    """
+    @staticmethod
+    def detect(kill_direction: str,
+               short_dist: float, long_dist: float,
+               delta_crowded: str,
+               kill_speed: float,
+               gamma_intensity: str,
+               bias_kill_conflict: bool,
+               down_energy: float, up_energy: float,
+               agg: float, volume_ratio: float) -> Dict:
+        
+        if kill_direction == "NEUTRAL" or kill_direction == "":
+            return {"override": False}
+        
+        # Cek konsistensi kill_direction vs liquidity
+        liq_consistent = (
+            (kill_direction == "LONG" and short_dist < long_dist) or
+            (kill_direction == "SHORT" and long_dist < short_dist)
+        )
+        
+        # Cek konsistensi delta_crowded
+        # crowded SHORT + kill LONG = shorts yang mati = konsisten
+        # crowded LONG + kill SHORT = longs yang mati = konsisten
+        delta_consistent = (
+            (kill_direction == "LONG" and delta_crowded == "SHORT") or
+            (kill_direction == "SHORT" and delta_crowded == "LONG")
+        )
+        
+        # Cek energy: tidak ada perlawanan
+        no_resistance = (
+            (kill_direction == "LONG" and down_energy < 0.1) or
+            (kill_direction == "SHORT" and up_energy < 0.1)
+        )
+        
+        # Hitung skor konfirmasi Pre-Kill
+        pre_kill_score = sum([
+            liq_consistent,                    # +1
+            delta_consistent,                  # +1
+            kill_speed > 3.0,                  # +1
+            bias_kill_conflict,                # +1 (sistem sendiri tahu)
+            no_resistance,                     # +1
+            gamma_intensity in ("HIGH",
+                                "EXTREME"),    # +1
+        ])
+        
+        # Butuh minimal 4 dari 6 konfirmasi
+        if pre_kill_score >= 4:
+            
+            # Tentukan target liquidity distance
+            target_liq = short_dist if kill_direction == "LONG" else long_dist
+            
+            return {
+                "override": True,
+                "bias": kill_direction,
+                "reason": (
+                    f"PRE-KILL SIGNAL ({pre_kill_score}/6): "
+                    f"kill={kill_direction}, "
+                    f"liq_consistent={liq_consistent}, "
+                    f"delta_crowded={delta_crowded} akan mati, "
+                    f"kill_speed={kill_speed:.1f}/10, "
+                    f"target_liq={target_liq:.2f}% "
+                    f"→ arah sudah fix, tidak perlu tunggu gamma execute"
+                ),
+                "priority": -9998
+            }
         
         return {"override": False}
 
@@ -8551,6 +8696,38 @@ class BinanceAnalyzer:
         # 4. Cek Bias vs Kill Direction Conflict
         bias_conflict = _check_bias_kill_conflict(result, result.get("bias", "NEUTRAL"))
         result["bias_kill_conflict"] = bias_conflict
+
+        # ===== KAIDAH BARU: BIAS-KILL CONFLICT = HARD BLOCK =====
+        # Jika bias_kill_conflict = True, sistem sudah tahu bias salah
+        # Langsung flip ke kill_direction tanpa perlu nunggu konfirmasi lain
+        bias_conflict_data = result.get("bias_kill_conflict", {})
+        if (bias_conflict_data.get("has_conflict", False) and
+            not result.get("greeks_override", False)):
+            
+            correct_dir = bias_conflict_data.get("correct_direction", "")
+            if correct_dir in ("LONG", "SHORT"):
+                
+                # Validasi: liquidity juga harus konsisten
+                short_liq = result.get("short_liq", 99.0)
+                long_liq = result.get("long_liq", 99.0)
+                liq_ok = (
+                    (correct_dir == "LONG" and short_liq < long_liq) or
+                    (correct_dir == "SHORT" and long_liq < short_liq)
+                )
+                
+                kill_speed = abs(result.get("greeks_kill_speed", 0))
+                
+                if liq_ok and kill_speed > 2.0:
+                    result["bias"] = correct_dir
+                    result["reason"] = (
+                        f"[BIAS-KILL HARD CORRECTION] "
+                        f"kill_direction={correct_dir} konflik dengan bias sebelumnya. "
+                        f"Liquidity konsisten (liq_ok={liq_ok}), "
+                        f"kill_speed={kill_speed:.1f} → paksa ke {correct_dir} | "
+                        + result.get("reason", "")
+                    )
+                    result["confidence"] = "ABSOLUTE"
+                    result["priority_level"] = -9998
 
         # 5. NEW DETECTORS FROM LECTURER FEEDBACK
         # 5a. Bullish Order Flow Divergence Detector
