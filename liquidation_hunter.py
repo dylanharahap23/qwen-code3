@@ -2201,6 +2201,152 @@ class OverboughtLowVolumeReversal:
         return {"override": False}
 
 
+# ================= NEW DETECTOR MODULES (LECTURER'S ADDITIONS) =================
+
+class FakeKillDirection:
+    """
+    🔥 FAKE KILL DIRECTION DETECTOR – Priority -1104
+    
+    Jangan ikuti kill_direction jika tidak ada momentum.
+    
+    Kondisi:
+    - kill_direction ada (LONG/SHORT)
+    - kill_speed < 1.0 (lambat)
+    - volume_ratio < 0.6 (volume rendah)
+    - gamma_executing = False (gamma belum jalan)
+    
+    Priority: -1104
+    """
+    @staticmethod
+    def detect(kill_direction: str, kill_speed: float, volume_ratio: float, 
+               gamma_executing: bool, who_dies_first: str) -> Dict:
+        if (kill_direction in ("LONG", "SHORT") and 
+            kill_speed < 1.0 and 
+            volume_ratio < 0.6 and 
+            not gamma_executing):
+            return {
+                "override": True,
+                "bias": "NEUTRAL",
+                "reason": f"FAKE KILL DIRECTION: kill={kill_direction} speed={kill_speed:.2f}<1.0, vol={volume_ratio:.2f}x, gamma not executing → ignore",
+                "priority": -1104
+            }
+        return {"override": False}
+
+
+class RsiDivergenceReversal:
+    """
+    🔥 RSI DIVERGENCE MULTI-TF REVERSAL – Priority -1105
+    
+    RSI 1m vs 5m divergensi ekstrem → ikuti RSI 1m (lebih cepat bereaksi).
+    
+    Kondisi LONG:
+    - rsi6_1m < 40 (oversold di 1m)
+    - rsi6_5m > 70 (overbought di 5m)
+    - volume_ratio < 0.7 (volume rendah)
+    
+    Kondisi SHORT:
+    - rsi6_1m > 60 (overbought di 1m)
+    - rsi6_5m < 30 (oversold di 5m)
+    - volume_ratio < 0.7 (volume rendah)
+    
+    Priority: -1105
+    """
+    @staticmethod
+    def detect(rsi6_1m: float, rsi6_5m: float, volume_ratio: float) -> Dict:
+        # 1m oversold, 5m overbought → bounce LONG
+        if rsi6_1m < 40 and rsi6_5m > 70 and volume_ratio < 0.7:
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": f"RSI DIVERGENCE: 1m={rsi6_1m:.1f} oversold, 5m={rsi6_5m:.1f} overbought → bounce up",
+                "priority": -1105
+            }
+        # 1m overbought, 5m oversold → dump SHORT
+        if rsi6_1m > 60 and rsi6_5m < 30 and volume_ratio < 0.7:
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"RSI DIVERGENCE: 1m={rsi6_1m:.1f} overbought, 5m={rsi6_5m:.1f} oversold → dump down",
+                "priority": -1105
+            }
+        return {"override": False}
+
+
+class ObvPriceDivergence:
+    """
+    🔥 OBV-PRICE DIVERGENCE DETECTOR – Priority -1103
+    
+    OBV POSITIVE_EXTREME tapi harga turun atau flat → smart money distribusi.
+    OBV NEGATIVE_EXTREME tapi harga naik → smart money akumulasi.
+    
+    Kondisi SHORT:
+    - obv_trend = "POSITIVE_EXTREME"
+    - change_5m < 0 (harga turun)
+    - volume_ratio < 0.6 (volume rendah)
+    
+    Kondisi LONG:
+    - obv_trend = "NEGATIVE_EXTREME"
+    - change_5m > 0 (harga naik)
+    - volume_ratio < 0.6 (volume rendah)
+    
+    Priority: -1103
+    """
+    @staticmethod
+    def detect(obv_trend: str, change_5m: float, volume_ratio: float) -> Dict:
+        if obv_trend == "POSITIVE_EXTREME" and change_5m < 0 and volume_ratio < 0.6:
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"OBV-PRICE DIVERGENCE: OBV positive extreme but price down {change_5m:.1f}%, volume low → distribution, dump",
+                "priority": -1103
+            }
+        if obv_trend == "NEGATIVE_EXTREME" and change_5m > 0 and volume_ratio < 0.6:
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": f"OBV-PRICE DIVERGENCE: OBV negative extreme but price up → accumulation, pump",
+                "priority": -1103
+            }
+        return {"override": False}
+
+
+class ExtremeRsiShortSqueeze:
+    """
+    🔥 EXTREME RSI SHORT SQUEEZE DETECTOR – Priority -1102
+    
+    RSI6=100 + short_liq lebih dekat + volume rendah → squeeze lanjut (LONG), bukan blow-off.
+    
+    Kondisi LONG:
+    - rsi6 > 98 (RSI maksimal)
+    - short_liq < long_liq (short liquidation lebih dekat)
+    - volume_ratio < 0.7 (volume rendah)
+    
+    Kondisi SHORT:
+    - rsi6 < 2 (RSI minimal)
+    - long_liq < short_liq (long liquidation lebih dekat)
+    - volume_ratio < 0.7 (volume rendah)
+    
+    Priority: -1102
+    """
+    @staticmethod
+    def detect(rsi6: float, short_liq: float, long_liq: float, volume_ratio: float) -> Dict:
+        if rsi6 > 98 and short_liq < long_liq and volume_ratio < 0.7:
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": f"EXTREME RSI SHORT SQUEEZE: RSI6={rsi6:.1f} max, short liq={short_liq:.2f}% closer than long liq, volume low → squeeze continues",
+                "priority": -1102
+            }
+        if rsi6 < 2 and long_liq < short_liq and volume_ratio < 0.7:
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"EXTREME RSI LONG SQUEEZE: RSI6={rsi6:.1f} min, long liq closer → dump continues",
+                "priority": -1102
+            }
+        return {"override": False}
+
+
 class OFIAggSpoofingDetector:
     """
     🔥 OFI-AGG SPOOFING DETECTOR – Priority -1100
@@ -8973,6 +9119,16 @@ class BinanceAnalyzer:
         now = time.time()
         market_phase = phase_result.phase if phase_result else "UNKNOWN"
         
+        # ===== BAIT HARD BLOCK - PRIORITY TERTINGGI (-2000) =====
+        # Jangan izinkan APAPUN bias selain NEUTRAL di BAIT phase. Ini override semua sinyal lain.
+        if market_phase == "BAIT":
+            result["bias"] = "NEUTRAL"
+            result["confidence"] = "BLOCK"
+            result["entry_allowed"] = False
+            result["greeks_override"] = False
+            result["reason"] = f"[BAIT HARD BLOCK] Market in BAIT phase - no trading allowed. " + result.get("reason", "")
+            return result  # Langsung return, skip filter lain
+        
         # Ambil data Greeks dari result (sudah ada dari greeks_final_screen)
         gamma_intensity = result.get("greeks_gamma_intensity", "LOW")
         delta_exposure = result.get("greeks_delta_exposure", 0.0)
@@ -9650,6 +9806,52 @@ class BinanceAnalyzer:
                             final_confidence = "ABSOLUTE"
                             final_phase = "KILL_NO_MOMENTUM"
                             priority = kill_no_mom["priority"]
+
+                        # ===== PRIORITY -1105: RSI DIVERGENCE REVERSAL (NEW) =====
+                        rsi_div = RsiDivergenceReversal.detect(rsi6, rsi6_5m, volume_ratio)
+                        if not post_squeeze.get("override") and not olvr.get("override") and not double_kill.get("override") and not low_vol_dist.get("override") and not vol_dry_trap.get("override") and not profit_reversal.get("override") and not proximity_cont.get("override") and rsi_div["override"]:
+                            final_bias = rsi_div["bias"]
+                            final_reason = rsi_div["reason"]
+                            final_confidence = "ABSOLUTE"
+                            final_phase = "RSI_DIVERGENCE_REVERSAL"
+                            priority = rsi_div["priority"]
+                            prob_engine.add(rsi_div["bias"], 10.05)
+
+                        # ===== PRIORITY -1104: FAKE KILL DIRECTION (NEW) =====
+                        fake_kill = FakeKillDirection.detect(
+                            greeks_dict.get("kill_direction", ""),
+                            greeks_dict.get("kill_speed", 0),
+                            volume_ratio,
+                            greeks_dict.get("gamma_executing", False),
+                            greeks_dict.get("who_dies_first", "")
+                        )
+                        if not post_squeeze.get("override") and not olvr.get("override") and not double_kill.get("override") and not low_vol_dist.get("override") and not vol_dry_trap.get("override") and not profit_reversal.get("override") and not proximity_cont.get("override") and not rsi_div.get("override") and fake_kill["override"]:
+                            final_bias = fake_kill["bias"]
+                            final_reason = fake_kill["reason"]
+                            final_confidence = "ABSOLUTE"
+                            final_phase = "FAKE_KILL_DIRECTION"
+                            priority = fake_kill["priority"]
+                            prob_engine.add(fake_kill["bias"], 10.04)
+
+                        # ===== PRIORITY -1103: OBV-PRICE DIVERGENCE (NEW) =====
+                        obv_div = ObvPriceDivergence.detect(obv_trend, change_5m, volume_ratio)
+                        if not post_squeeze.get("override") and not olvr.get("override") and not double_kill.get("override") and not low_vol_dist.get("override") and not vol_dry_trap.get("override") and not profit_reversal.get("override") and not proximity_cont.get("override") and not rsi_div.get("override") and not fake_kill.get("override") and obv_div["override"]:
+                            final_bias = obv_div["bias"]
+                            final_reason = obv_div["reason"]
+                            final_confidence = "ABSOLUTE"
+                            final_phase = "OBV_PRICE_DIVERGENCE"
+                            priority = obv_div["priority"]
+                            prob_engine.add(obv_div["bias"], 10.03)
+
+                        # ===== PRIORITY -1102: EXTREME RSI SQUEEZE (NEW) =====
+                        extreme_rsi = ExtremeRsiShortSqueeze.detect(rsi6, liq["short_dist"], liq["long_dist"], volume_ratio)
+                        if not post_squeeze.get("override") and not olvr.get("override") and not double_kill.get("override") and not low_vol_dist.get("override") and not vol_dry_trap.get("override") and not profit_reversal.get("override") and not proximity_cont.get("override") and not rsi_div.get("override") and not fake_kill.get("override") and not obv_div.get("override") and extreme_rsi["override"]:
+                            final_bias = extreme_rsi["bias"]
+                            final_reason = extreme_rsi["reason"]
+                            final_confidence = "ABSOLUTE"
+                            final_phase = "EXTREME_RSI_SQUEEZE"
+                            priority = extreme_rsi["priority"]
+                            prob_engine.add(extreme_rsi["bias"], 10.02)
 
                         # ===== PRIORITY -1100: OFI-AGG SPOOFING DETECTOR (NEW) =====
                         ofi_agg_spoof = OFIAggSpoofingDetector.detect(
