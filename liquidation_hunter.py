@@ -600,6 +600,164 @@ class BlowOffTopShortLiqTrap:
         return {"override": False}
 
 
+class PhantomBuyEnergyTrap:
+    """
+    🔥 BSBUSDT PATTERN: up_energy besar tapi ask_slope jauh lebih besar
+    
+    HFT spoof up_energy dengan bid order besar di order book,
+    tapi pasang ask wall jauh lebih besar di atas.
+    
+    Result: sistem lihat up_energy tinggi → pikir LONG kuat
+    Kenyataan: ask wall akan menyerap semua buy → dump
+    
+    Deteksi: ask_slope > bid_slope * RATIO dan up_energy > 1.0
+    tapi change_5m flat/negatif = energy tidak bisa tembus ask wall
+    
+    Priority: -1101 (di atas MasterSqueezeRule)
+    """
+    @staticmethod
+    def detect(ask_slope: float, bid_slope: float,
+               up_energy: float, down_energy: float,
+               change_5m: float, volume_ratio: float,
+               funding_rate: float,
+               long_liq: float, short_liq: float) -> Dict:
+        
+        if bid_slope <= 0:
+            return {"override": False}
+        
+        ask_bid_ratio = ask_slope / bid_slope
+        
+        # Ask wall ekstrem + up_energy ada tapi harga tidak naik = phantom
+        if (ask_bid_ratio > 50.0 and          # ask wall 50x lebih tebal
+            up_energy > 1.0 and               # ada "buy energy" (spoofed)
+            down_energy < 0.1 and             # tidak ada seller nyata
+            change_5m < 1.0 and              # harga tidak naik meski energy ada
+            volume_ratio < 0.8):             # volume rendah = spoof mudah
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"PHANTOM BUY ENERGY TRAP: ask_slope={ask_slope:.0f} vs "
+                    f"bid={bid_slope:.0f} (ratio {ask_bid_ratio:.0f}x), "
+                    f"up_energy={up_energy:.2f} tapi harga cuma {change_5m:.1f}% "
+                    f"→ buy energy palsu (spoof bid), ask wall raksasa akan dump"
+                ),
+                "priority": -1101
+            }
+        
+        # Versi moderat: ratio > 20x + funding negatif (double trap)
+        if (ask_bid_ratio > 20.0 and
+            up_energy > 2.0 and
+            change_5m < 0.5 and
+            funding_rate is not None and
+            funding_rate < -0.0001 and        # funding negatif = sistem pikir LONG
+            volume_ratio < 0.8):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"PHANTOM BUY ENERGY + FUNDING BAIT: ask/bid={ask_bid_ratio:.0f}x, "
+                    f"funding={funding_rate:.5f} (crowded short bait), "
+                    f"up_energy={up_energy:.2f} spoof → sistem dipancing LONG, "
+                    f"kenyataannya ask wall dump"
+                ),
+                "priority": -1101
+            }
+        
+        return {"override": False}
+
+
+class DipThenRipSweep:
+    """
+    🔥 TRUUSDT PATTERN: long_liq sangat dekat = sweep victim, bukan dump target
+    
+    Ketika long_liq < 1.0% dan short_liq jauh (> 2x jarak long_liq):
+    HFT strategy = Dip Then Rip:
+    1. Turun sedikit (0.67%) untuk sweep long stop
+    2. Setelah long stop habis, tidak ada yang jual lagi
+    3. Pump ke short liq (3.06%) untuk squeeze short
+    
+    Sinyal konfirmasi:
+    - agg > 0.6 (mayoritas buy = retail sudah positioning LONG)
+    - up_energy > down_energy (buy pressure lebih kuat)
+    - RSI oversold (sudah turun cukup = bouncing point)
+    - bid_slope > ask_slope (buy wall lebih tebal = support di bawah)
+    
+    KUNCI: OBV NEGATIVE_EXTREME tidak relevan di sini karena
+    sweep jangka pendek (< 1%) + pump jangka menengah > 3%
+    
+    Priority: -1103 (di atas funding ban)
+    """
+    @staticmethod
+    def detect(long_liq: float, short_liq: float,
+               agg: float, up_energy: float, down_energy: float,
+               rsi6: float, bid_slope: float, ask_slope: float,
+               volume_ratio: float, change_5m: float,
+               obv_trend: str) -> Dict:
+        
+        # Core: long_liq sangat dekat tapi short_liq jauh lebih besar
+        if long_liq <= 0:
+            return {"override": False}
+            
+        liq_ratio = short_liq / long_liq  # TRUUSDT: 3.06/0.67 = 4.56x
+        
+        if (long_liq < 1.5 and              # long liq sangat dekat
+            liq_ratio > 2.5 and             # short liq jauh lebih besar
+            agg > 0.55 and                  # mayoritas buy
+            up_energy > down_energy and     # buy pressure lebih kuat
+            down_energy < 0.1 and           # hampir tidak ada seller
+            rsi6 < 40):                     # oversold = bouncing point
+            
+            # Konfirmasi tambahan: bid wall lebih tebal
+            bid_stronger = (bid_slope > 0 and 
+                           ask_slope > 0 and 
+                           bid_slope > ask_slope * 0.5)  # bid minimal 50% dari ask
+            
+            if bid_stronger or volume_ratio > 0.5:
+                return {
+                    "override": True,
+                    "bias": "LONG",
+                    "reason": (
+                        f"DIP THEN RIP SWEEP: long_liq={long_liq:.2f}% dekat "
+                        f"(sweep victim), short_liq={short_liq:.2f}% jauh "
+                        f"(liq_ratio={liq_ratio:.1f}x), agg={agg:.2f} buy, "
+                        f"rsi={rsi6:.1f} oversold, down_energy={down_energy:.2f} "
+                        f"→ HFT dip {long_liq:.2f}% sweep long stop LALU pump "
+                        f"ke short_liq {short_liq:.2f}%"
+                    ),
+                    "priority": -1103
+                }
+        
+        # Mirror: short_liq sangat dekat = sweep then dump
+        if short_liq > 0:
+            liq_ratio_short = long_liq / short_liq
+            if (short_liq < 1.5 and
+                liq_ratio_short > 2.5 and
+                agg < 0.45 and
+                down_energy > up_energy and
+                up_energy < 0.1 and
+                rsi6 > 60):
+                
+                bid_weaker = (bid_slope > 0 and 
+                             ask_slope > 0 and 
+                             ask_slope > bid_slope * 0.5)
+                
+                if bid_weaker or volume_ratio > 0.5:
+                    return {
+                        "override": True,
+                        "bias": "SHORT",
+                        "reason": (
+                            f"RIP THEN DIP SWEEP: short_liq={short_liq:.2f}% dekat "
+                            f"(sweep victim), long_liq={long_liq:.2f}% jauh "
+                            f"(ratio={liq_ratio_short:.1f}x) "
+                            f"→ HFT pump sweep short stop LALU dump"
+                        ),
+                        "priority": -1103
+                    }
+        
+        return {"override": False}
+
+
 class VolumeDryUpReversal:
     """
     Detector: Volume Dry-Up Reversal (Priority -1080)
@@ -962,6 +1120,18 @@ def _delta_calculate(data: dict) -> dict:
         who_dies_first = "LONG_TRADERS" if delta_long > delta_short else "SHORT_TRADERS"
 
     who_is_crowded = "LONG" if delta_long > delta_short else "SHORT"
+
+    # ===== GUARD: Dip-Then-Rip Override =====
+    # Jika long_liq sangat dekat (<1%) dan short_liq jauh (>2x),
+    # kill_direction seharusnya LONG (sweep long stop dulu, lalu pump)
+    # bukan SHORT meski delta_long > delta_short
+    if (short_dies_at > long_dies_at * 2.0 and    # short liq jauh lebih besar
+        long_dies_at < 1.0 and                     # long liq sangat dekat
+        ofi_long_add > ofi_short_add):             # ada buy pressure
+        # Override kill direction
+        kill_direction = "LONG"  
+        who_dies_first = "SHORT_TRADERS"  # setelah sweep long stop, short yang mati
+        liq_7pct_touch = "SHORT_TRADERS_DIE"
 
     liq_pressure_short = max(0.0, 10.0 - short_dies_at) / 10.0
     liq_pressure_long  = max(0.0, 10.0 - long_dies_at)  / 10.0
@@ -8956,8 +9126,51 @@ class BinanceAnalyzer:
                                 priority = asym_liq["priority"]
                                 prob_engine.add(asym_liq["bias"], asym_liq["weight"])
 
+                        # ===== PRIORITY -1103: DIP THEN RIP SWEEP =====
+                        dip_then_rip = DipThenRipSweep.detect(
+                            long_liq=liq["long_dist"],
+                            short_liq=liq["short_dist"],
+                            agg=agg,
+                            up_energy=up_energy,
+                            down_energy=down_energy,
+                            rsi6=rsi6,
+                            bid_slope=bid_slope,
+                            ask_slope=ask_slope,
+                            volume_ratio=volume_ratio,
+                            change_5m=change_5m,
+                            obv_trend=obv_trend
+                        )
+                        if dip_then_rip["override"]:
+                            final_bias = dip_then_rip["bias"]
+                            final_reason = dip_then_rip["reason"]
+                            final_confidence = "ABSOLUTE"
+                            final_phase = "DIP_THEN_RIP_SWEEP"
+                            priority = dip_then_rip["priority"]
+                            prob_engine.add(dip_then_rip["bias"], 10.03)
+
+                        # ===== PRIORITY -1101: PHANTOM BUY ENERGY TRAP =====
+                        if not dip_then_rip.get("override"):
+                            phantom_buy = PhantomBuyEnergyTrap.detect(
+                                ask_slope=ask_slope,
+                                bid_slope=bid_slope,
+                                up_energy=up_energy,
+                                down_energy=down_energy,
+                                change_5m=change_5m,
+                                volume_ratio=volume_ratio,
+                                funding_rate=funding_rate,
+                                long_liq=liq["long_dist"],
+                                short_liq=liq["short_dist"]
+                            )
+                            if phantom_buy["override"]:
+                                final_bias = phantom_buy["bias"]
+                                final_reason = phantom_buy["reason"]
+                                final_confidence = "ABSOLUTE"
+                                final_phase = "PHANTOM_BUY_ENERGY_TRAP"
+                                priority = phantom_buy["priority"]
+                                prob_engine.add(phantom_buy["bias"], 10.01)
+
                         # ===== PRIORITY -1103: EXTREME RSI6 OVERBOUGHT REVERSAL =====
-                        if not post_squeeze.get("override") and not profit_reversal.get("override") and not oversold_dist.get("override"):
+                        if not post_squeeze.get("override") and not profit_reversal.get("override") and not oversold_dist.get("override") and not dip_then_rip.get("override"):
                             extreme_rsi6_rev = ExtremeRsi6OverboughtReversal.detect(
                                 rsi6, volume_ratio, ofi["bias"], up_energy
                             )
@@ -8970,7 +9183,7 @@ class BinanceAnalyzer:
                                 prob_engine.add(extreme_rsi6_rev["bias"], 10.02)
 
                         # ===== PRIORITY -1103: FUNDING NEGATIVE + SHORT LIQ SUPER CLOSE =====
-                        if not post_squeeze.get("override") and not profit_reversal.get("override") and not oversold_dist.get("override"):
+                        if not post_squeeze.get("override") and not profit_reversal.get("override") and not oversold_dist.get("override") and not dip_then_rip.get("override"):
                             funding_short_squeeze = FundingNegativeShortLiqSqueeze.detect(
                                 funding_rate, liq["short_dist"], liq["long_dist"],
                                 up_energy, down_energy, rsi6, volume_ratio
@@ -8984,7 +9197,7 @@ class BinanceAnalyzer:
                                 prob_engine.add(funding_short_squeeze["bias"], 10.03)
 
                         # ===== PRIORITY -1102: MOMENTUM VOLUME SPIKE PROTECTION =====
-                        if not post_squeeze.get("override") and not profit_reversal.get("override") and not oversold_dist.get("override"):
+                        if not post_squeeze.get("override") and not profit_reversal.get("override") and not oversold_dist.get("override") and not dip_then_rip.get("override"):
                             mom_vol_spike = MomentumVolumeSpikeProtection.detect(
                                 change_5m, latest_volume, volume_ma10,
                                 liq["short_dist"], liq["long_dist"],
@@ -8999,7 +9212,7 @@ class BinanceAnalyzer:
                                 prob_engine.add(mom_vol_spike["bias"], 10.015)
 
                         # ===== PRIORITY -1102: MARK PRICE GAP DETECTOR =====
-                        if not post_squeeze.get("override") and not profit_reversal.get("override") and not oversold_dist.get("override"):
+                        if not post_squeeze.get("override") and not profit_reversal.get("override") and not oversold_dist.get("override") and not dip_then_rip.get("override"):
                             mark_gap = MarkPriceGapDetector.detect(
                                 mark_price, price, funding_rate, change_5m
                             )
@@ -9017,7 +9230,7 @@ class BinanceAnalyzer:
                         )
 
                         # ===== PRIORITY -1101: EXTREME FUNDING RATE LONG/SHORT BAN =====
-                        if not post_squeeze.get("override") and not profit_reversal.get("override") and not oversold_dist.get("override") and extreme_funding_ban["override"]:
+                        if not post_squeeze.get("override") and not profit_reversal.get("override") and not oversold_dist.get("override") and not dip_then_rip.get("override") and extreme_funding_ban["override"]:
                             final_bias = extreme_funding_ban["bias"]
                             final_reason = extreme_funding_ban["reason"]
                             final_confidence = "ABSOLUTE"
