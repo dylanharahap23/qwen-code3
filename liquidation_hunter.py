@@ -9278,8 +9278,44 @@ class BinanceAnalyzer:
         has_extreme_override = result.get("_liquidity_extreme_override", False)
         
         if market_phase == "BAIT":
-            if not has_extreme_override:
-                # Jika tidak ada override ekstrem, block trading
+            # ===== NEW: BAIT BYPASS CONDITIONS =====
+            short_liq = result.get("short_liq", 99.0)
+            long_liq = result.get("long_liq", 99.0)
+            rsi6_val = result.get("rsi6", 50.0)
+            gamma_intensity = result.get("greeks_gamma_intensity", "LOW")
+            kill_speed = abs(result.get("greeks_kill_speed", 0))
+            down_energy_val = result.get("down_energy", 1.0)
+            up_energy_val = result.get("up_energy", 0.0)
+            agg_val = result.get("agg", 0.5)
+
+            bait_bypass = False
+            bait_bypass_reason = ""
+
+            # Bypass 1: Liquidity SANGAT dekat (<0.5%) = tidak bisa tunggu
+            if short_liq < 0.5 and short_liq < long_liq:
+                bait_bypass = True
+                bait_bypass_reason = f"BAIT BYPASS: short_liq={short_liq:.2f}% < 0.5% (critical proximity)"
+
+            elif long_liq < 0.5 and long_liq < short_liq:
+                bait_bypass = True
+                bait_bypass_reason = f"BAIT BYPASS: long_liq={long_liq:.2f}% < 0.5% (critical proximity)"
+
+            # Bypass 2: Gamma EXTREME + kill_speed sangat tinggi = eksekusi sudah jalan
+            elif gamma_intensity == "EXTREME" and kill_speed >= 8.0:
+                bait_bypass = True
+                bait_bypass_reason = f"BAIT BYPASS: Gamma EXTREME + kill_speed={kill_speed:.1f} >= 8.0 (execution confirmed)"
+
+            # Bypass 3: RSI6 = 100 + no seller + short_liq dekat
+            elif rsi6_val >= 99 and down_energy_val < 0.01 and short_liq < 2.0:
+                bait_bypass = True
+                bait_bypass_reason = f"BAIT BYPASS: RSI6={rsi6_val} max + down_energy=0 + short_liq={short_liq:.2f}% close"
+
+            # Bypass 4: Liquidity extreme override sudah aktif
+            elif has_extreme_override:
+                bait_bypass = True
+                bait_bypass_reason = "BAIT BYPASS: Liquidity extreme override active"
+
+            if not bait_bypass:
                 result["bias"] = "NEUTRAL"
                 result["confidence"] = "BLOCK"
                 result["entry_allowed"] = False
@@ -9287,10 +9323,10 @@ class BinanceAnalyzer:
                 result["reason"] = f"[BAIT HARD BLOCK] No extreme signal in BAIT phase. " + result.get("reason", "")
                 return result  # Langsung return, skip filter lain
             else:
-                # Jika ada override ekstrem, izinkan trading dengan confidence ABSOLUTE
+                # Ada bypass condition → izinkan trading
                 result["confidence"] = "ABSOLUTE"
                 result["entry_allowed"] = True
-                result["reason"] = f"[BAIT OVERRIDE] Extreme condition detected. " + result.get("reason", "")
+                result["reason"] = f"[{bait_bypass_reason}] " + result.get("reason", "")
                 # Jangan return - lanjut ke filter lain
         
         # Ambil data Greeks dari result (sudah ada dari greeks_final_screen)
@@ -9862,6 +9898,12 @@ class BinanceAnalyzer:
                             priority = liquidity_extreme["priority"]
                             prob_engine.add(liquidity_extreme["bias"], 20.01)
                             _liquidity_extreme_override = True
+                        elif funding_squeeze.get("override"):
+                            _liquidity_extreme_override = True
+                        elif rsi_squeeze.get("override"):
+                            _liquidity_extreme_override = True
+                        elif liq_absolute.get("override"):
+                            _liquidity_extreme_override = True
                         else:
                             _liquidity_extreme_override = False
                         
@@ -9876,6 +9918,7 @@ class BinanceAnalyzer:
                             final_phase = "FUNDING_EXTREME_SQUEEZE"
                             priority = funding_squeeze["priority"]
                             prob_engine.add(funding_squeeze["bias"], 20.0)
+                            _liquidity_extreme_override = True
                         
                         # PRIORITY -1999: RSI6 EXTREME SQUEEZE
                         rsi_squeeze = Rsi6ExtremeSqueeze.detect(
@@ -9888,6 +9931,7 @@ class BinanceAnalyzer:
                             final_phase = "RSI_EXTREME_SQUEEZE"
                             priority = rsi_squeeze["priority"]
                             prob_engine.add(rsi_squeeze["bias"], 19.99)
+                            _liquidity_extreme_override = True
                         
                         # PRIORITY -1998: LIQUIDITY PROXIMITY ABSOLUTE
                         liq_absolute = LiquidityProximityAbsolute.detect(
@@ -9900,6 +9944,7 @@ class BinanceAnalyzer:
                             final_phase = "LIQUIDITY_ABSOLUTE"
                             priority = liq_absolute["priority"]
                             prob_engine.add(liq_absolute["bias"], 19.98)
+                            _liquidity_extreme_override = True
                         
                         # Continue with other detectors only if no extreme override
                         has_extreme_override = (
@@ -12053,6 +12098,9 @@ class BinanceAnalyzer:
                 result["greeks_override"] = True  # tandai bahwa Greeks di-override
 
             # ========== STABILITY FILTERS (Flip Cooldown, Phase Lock, Confirmation, Gamma Delay, Entry) ==========
+            # Simpan flag extreme override ke result sebelum stability filter
+            result["_liquidity_extreme_override"] = locals().get('_liquidity_extreme_override', False)
+            
             result = self._apply_stability_filters(result, phase_result, {})
 
             return result
