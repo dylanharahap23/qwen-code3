@@ -2168,6 +2168,143 @@ class LowVolumeDistributionContinuation:
         return {"override": False}
 
 
+class OverboughtLowVolumeReversal:
+    """
+    🔥 OVERBOUGHT LOW VOLUME REVERSAL (OLVR) – Priority -1106
+    
+    Deteksi pump palsu di area overbought dengan volume kering.
+    
+    Kondisi:
+    - change_5m > 1.5          (harga naik signifikan)
+    - rsi6 > 70                (overbought)
+    - rsi6_5m > 65             (overbought di TF 5m)
+    - volume_ratio < 0.7       (volume rendah/kering)
+    - short_liq < 5.0          (short liquidation dekat)
+    
+    Priority: -1106
+    """
+    @staticmethod
+    def detect(change_5m: float, rsi6: float, rsi6_5m: float,
+               volume_ratio: float, short_liq: float) -> Dict:
+        # Harga naik signifikan, overbought, volume rendah, short liq dekat
+        if (change_5m > 1.5 and
+            rsi6 > 70 and
+            rsi6_5m > 65 and
+            volume_ratio < 0.7 and
+            short_liq < 5.0):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"OVERBOUGHT LOW VOLUME REVERSAL: price up {change_5m:.1f}% with volume {volume_ratio:.2f}x, RSI {rsi6:.1f}/{rsi6_5m:.1f} overbought, short liq {short_liq:.2f}% close → fake pump, dump incoming",
+                "priority": -1106
+            }
+        return {"override": False}
+
+
+class OFIAggSpoofingDetector:
+    """
+    🔥 OFI-AGG SPOOFING DETECTOR – Priority -1100
+    
+    Jika OFI sangat bullish tapi agg sangat bearish (atau sebaliknya), percaya agg.
+    Ini adalah spoofing oleh HFT untuk memancing trader retail.
+    
+    Kondisi SHORT (OFI LONG spoofing):
+    - ofi_bias == "LONG" dan ofi_strength > 0.8
+    - agg < 0.4                 (mayoritas SELL)
+    - volume_ratio < 0.7        (volume rendah)
+    - change_5m > 0             (harga naik sedikit untuk memancing)
+    
+    Kondisi LONG (OFI SHORT spoofing):
+    - ofi_bias == "SHORT" dan ofi_strength > 0.8
+    - agg > 0.6                 (mayoritas BUY)
+    - volume_ratio < 0.7        (volume rendah)
+    - change_5m < 0             (harga turun sedikit untuk memancing)
+    
+    Priority: -1100
+    """
+    @staticmethod
+    def detect(ofi_bias: str, ofi_strength: float, agg: float,
+               volume_ratio: float, change_5m: float) -> Dict:
+        # OFI LONG kuat tapi agg rendah (<0.4) = spoofing
+        if (ofi_bias == "LONG" and ofi_strength > 0.8 and
+            agg < 0.4 and volume_ratio < 0.7 and change_5m > 0):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"OFI-AGG SPOOFING: OFI LONG {ofi_strength:.2f} tapi agg={agg:.2f} (mayoritas SELL), volume rendah → HFT memancing LONG, akan dump",
+                "priority": -1100
+            }
+        # OFI SHORT kuat tapi agg tinggi (>0.6) = spoofing
+        if (ofi_bias == "SHORT" and ofi_strength > 0.8 and
+            agg > 0.6 and volume_ratio < 0.7 and change_5m < 0):
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": f"OFI-AGG SPOOFING: OFI SHORT {ofi_strength:.2f} tapi agg={agg:.2f} (mayoritas BUY), volume rendah → HFT memancing SHORT, akan pump",
+                "priority": -1100
+            }
+        return {"override": False}
+
+
+class KillDirectionWithoutMomentum:
+    """
+    🔥 KILL DIRECTION WITHOUT MOMENTUM – Priority -1104
+    
+    Jangan ikuti kill_direction jika gamma tidak executing dan kill speed terlalu rendah.
+    Ini adalah fake signal dari HFT untuk menjebak trader.
+    
+    Kondisi:
+    - kill_direction in ("LONG", "SHORT")  (ada arah kill)
+    - gamma_executing == False             (gamma belum executing)
+    - kill_speed < 1.0                     (kill speed sangat rendah)
+    - volume_ratio < 0.8                   (volume rendah)
+    
+    Priority: -1104
+    """
+    @staticmethod
+    def detect(kill_direction: str, gamma_executing: bool,
+               kill_speed: float, volume_ratio: float) -> Dict:
+        if (kill_direction in ("LONG", "SHORT") and
+            not gamma_executing and
+            kill_speed < 1.0 and
+            volume_ratio < 0.8):
+            return {
+                "override": True,
+                "bias": "NEUTRAL",
+                "reason": f"KILL DIRECTION WITHOUT MOMENTUM: kill={kill_direction} but gamma_executing=False, kill_speed={kill_speed:.2f}<1.0, volume low → fake signal, WAIT",
+                "priority": -1104
+            }
+        return {"override": False}
+
+
+class VolumeDryUpOverboughtTrap:
+    """
+    🔥 VOLUME DRY-UP OVERBOUGHT TRAP – Priority -1105
+    
+    Kombinasi volume sangat rendah (<0.5x) + overbought + harga naik.
+    Ini adalah tanda exhaustion - harga akan reversal turun.
+    
+    Kondisi:
+    - volume_ratio < 0.5         (volume sangat rendah/kering)
+    - rsi6 > 70                  (overbought)
+    - change_5m > 1.0            (harga naik)
+    
+    Priority: -1105
+    """
+    @staticmethod
+    def detect(volume_ratio: float, rsi6: float, change_5m: float) -> Dict:
+        if (volume_ratio < 0.5 and
+            rsi6 > 70 and
+            change_5m > 1.0):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"VOLUME DRY-UP OVERBOUGHT TRAP: volume {volume_ratio:.2f}x sangat rendah, RSI {rsi6:.1f} overbought, price up {change_5m:.1f}% → exhaustion, reversal down",
+                "priority": -1105
+            }
+        return {"override": False}
+
+
 class DoubleKillSequenceDetector:
     """
     🔥 SYSUSDT PATTERN: Double Kill Setup
@@ -9406,6 +9543,18 @@ class BinanceAnalyzer:
                             priority = post_squeeze["priority"]
                             prob_engine.add(post_squeeze["bias"], 10.09)
 
+                        # ===== PRIORITY -1106: OVERBOUGHT LOW VOLUME REVERSAL (NEW) =====
+                        olvr = OverboughtLowVolumeReversal.detect(
+                            change_5m, rsi6, rsi6_5m, volume_ratio, liq["short_dist"]
+                        )
+                        if not post_squeeze.get("override") and olvr["override"]:
+                            final_bias = olvr["bias"]
+                            final_reason = olvr["reason"]
+                            final_confidence = "ABSOLUTE"
+                            final_phase = "OVERBOUGHT_LOW_VOL_REVERSAL"
+                            priority = olvr["priority"]
+                            prob_engine.add(olvr["bias"], 10.08)
+
                         # ===== PRIORITY -1106: DOUBLE KILL SEQUENCE DETECTOR =====
                         # Note: kill_check_data dan dual_trap_data akan diambil dari result setelah result dibuat
                         # Untuk sementara, gunakan placeholder - akan di-update setelah result tersedia
@@ -9422,13 +9571,13 @@ class BinanceAnalyzer:
                             volume_ratio=volume_ratio,
                             kill_direction=""  # placeholder
                         )
-                        if post_squeeze.get("override") and double_kill["override"]:
+                        if not post_squeeze.get("override") and not olvr.get("override") and double_kill["override"]:
                             final_bias = double_kill["bias"]
                             final_reason = double_kill["reason"]
                             final_confidence = "ABSOLUTE"
                             final_phase = "DOUBLE_KILL_SEQUENCE"
                             priority = double_kill["priority"]
-                            prob_engine.add(double_kill["bias"], 10.08)
+                            prob_engine.add(double_kill["bias"], 10.07)
 
                         # ===== PRIORITY -1106: LOW VOLUME DISTRIBUTION CONTINUATION =====
                         low_vol_dist = LowVolumeDistributionContinuation.detect(
@@ -9437,13 +9586,25 @@ class BinanceAnalyzer:
                             obv_trend, volume_ratio,
                             down_energy, up_energy
                         )
-                        if not post_squeeze.get("override") and not double_kill.get("override") and low_vol_dist["override"]:
+                        if not post_squeeze.get("override") and not olvr.get("override") and not double_kill.get("override") and low_vol_dist["override"]:
                             final_bias = low_vol_dist["bias"]
                             final_reason = low_vol_dist["reason"]
                             final_confidence = "ABSOLUTE"
                             final_phase = "LOW_VOL_DISTRIBUTION_CONT"
                             priority = low_vol_dist["priority"]
-                            prob_engine.add(low_vol_dist["bias"], 10.07)
+                            prob_engine.add(low_vol_dist["bias"], 10.06)
+
+                        # ===== PRIORITY -1105: VOLUME DRY-UP OVERBOUGHT TRAP (NEW) =====
+                        vol_dry_trap = VolumeDryUpOverboughtTrap.detect(
+                            volume_ratio, rsi6, change_5m
+                        )
+                        if not post_squeeze.get("override") and not olvr.get("override") and not double_kill.get("override") and not low_vol_dist.get("override") and vol_dry_trap["override"]:
+                            final_bias = vol_dry_trap["bias"]
+                            final_reason = vol_dry_trap["reason"]
+                            final_confidence = "ABSOLUTE"
+                            final_phase = "VOL_DRY_UP_OVERBOUGHT"
+                            priority = vol_dry_trap["priority"]
+                            prob_engine.add(vol_dry_trap["bias"], 10.05)
 
                         # ===== PRIORITY -1105: PROFIT IMBALANCE REVERSAL (EXCHANGE NEUTRALIZATION) =====
                         # TERTINGGI - di atas semua detector lain karena ini adalah kebijakan exchange level tertinggi
@@ -9452,13 +9613,13 @@ class BinanceAnalyzer:
                             liq["long_dist"], liq["short_dist"],
                             volume_ratio
                         )
-                        if not post_squeeze.get("override") and not double_kill.get("override") and not low_vol_dist.get("override") and profit_reversal["override"]:
+                        if not post_squeeze.get("override") and not olvr.get("override") and not double_kill.get("override") and not low_vol_dist.get("override") and not vol_dry_trap.get("override") and profit_reversal["override"]:
                             final_bias = profit_reversal["bias"]
                             final_reason = profit_reversal["reason"]
                             final_confidence = "ABSOLUTE"
                             final_phase = "PROFIT_IMBALANCE_REVERSAL"
                             priority = profit_reversal["priority"]
-                            prob_engine.add(profit_reversal["bias"], 10.06)
+                            prob_engine.add(profit_reversal["bias"], 10.04)
 
                         # ===== PRIORITY -1105: PROXIMITY CONTINUATION (DUSDT PATTERN) =====
                         proximity_cont = ProximityContinuationOverride.detect(
@@ -9467,13 +9628,40 @@ class BinanceAnalyzer:
                             down_energy=down_energy, up_energy=up_energy,
                             agg=agg, ofi_bias=ofi["bias"]
                         )
-                        if not post_squeeze.get("override") and not double_kill.get("override") and not low_vol_dist.get("override") and not profit_reversal.get("override") and proximity_cont["override"]:
+                        if not post_squeeze.get("override") and not olvr.get("override") and not double_kill.get("override") and not low_vol_dist.get("override") and not vol_dry_trap.get("override") and not profit_reversal.get("override") and proximity_cont["override"]:
                             final_bias = proximity_cont["bias"]
                             final_reason = proximity_cont["reason"]
                             final_confidence = "ABSOLUTE"
                             final_phase = "PROXIMITY_CONTINUATION"
                             priority = proximity_cont["priority"]
-                            prob_engine.add(proximity_cont["bias"], 10.07)
+                            prob_engine.add(proximity_cont["bias"], 10.03)
+
+                        # ===== PRIORITY -1104: KILL DIRECTION WITHOUT MOMENTUM (NEW) =====
+                        greeks_dict = {}  # placeholder, akan diisi setelah greeks_final_screen dipanggil
+                        kill_no_mom = KillDirectionWithoutMomentum.detect(
+                            greeks_dict.get("kill_direction", ""),
+                            greeks_dict.get("gamma_executing", False),
+                            greeks_dict.get("kill_speed", 0),
+                            volume_ratio
+                        )
+                        if not post_squeeze.get("override") and not olvr.get("override") and not double_kill.get("override") and not low_vol_dist.get("override") and not vol_dry_trap.get("override") and not profit_reversal.get("override") and not proximity_cont.get("override") and kill_no_mom["override"]:
+                            final_bias = kill_no_mom["bias"]
+                            final_reason = kill_no_mom["reason"]
+                            final_confidence = "ABSOLUTE"
+                            final_phase = "KILL_NO_MOMENTUM"
+                            priority = kill_no_mom["priority"]
+
+                        # ===== PRIORITY -1100: OFI-AGG SPOOFING DETECTOR (NEW) =====
+                        ofi_agg_spoof = OFIAggSpoofingDetector.detect(
+                            ofi["bias"], ofi["strength"], agg, volume_ratio, change_5m
+                        )
+                        if not post_squeeze.get("override") and not olvr.get("override") and not double_kill.get("override") and not low_vol_dist.get("override") and not vol_dry_trap.get("override") and not profit_reversal.get("override") and not proximity_cont.get("override") and not kill_no_mom.get("override") and ofi_agg_spoof["override"]:
+                            final_bias = ofi_agg_spoof["bias"]
+                            final_reason = ofi_agg_spoof["reason"]
+                            final_confidence = "ABSOLUTE"
+                            final_phase = "OFI_AGG_SPOOFING"
+                            priority = ofi_agg_spoof["priority"]
+                            prob_engine.add(ofi_agg_spoof["bias"], 10.0)
 
                         # ===== PRIORITY -1099: OFI BAIT VALIDATOR =====
                         # Note: dual_trap_data akan diambil dari result setelah result dibuat
