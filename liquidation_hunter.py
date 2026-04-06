@@ -1625,7 +1625,16 @@ def _check_kill_confirmation(data: dict) -> dict:
     volume_ratio = data.get("volume_ratio", 0)
     change_5m = abs(data.get("change_5m", 0))
     gamma_exec_score = data.get("gamma_exec_score", 0)  # NEW
-    
+    who_dies = data.get("greeks_who_dies_first", "")
+
+    # 🔥 TAMBAHAN: jika who_dies masih BOTH_POSSIBLE, kill belum real
+    if who_dies == "BOTH_POSSIBLE":
+        return {
+            "kill_confirmed": False,
+            "kill_score": 0,
+            "reason": "KILL NOT REAL – who_dies still BOTH_POSSIBLE"
+        }
+
     # UPGRADE: score-based confirmation
     kill_score = sum([
         gamma_executing,                    # boolean → 0 atau 1
@@ -8564,6 +8573,70 @@ class BinanceAnalyzer:
             return True
         return False
 
+    def _validate_gamma_execution(self, result: dict) -> dict:
+        """
+        Validasi apakah gamma executing itu real atau fake.
+        Returns dict dengan keys: valid, reason, new_bias (jika perlu override)
+        """
+        gamma_exec = result.get("greeks_gamma_executing", False)
+        who_dies = result.get("greeks_who_dies_first", "")
+        kill_dir = result.get("greeks_kill_direction", "")
+        rsi6_5m = result.get("rsi6_5m", 50.0)
+        volume_ratio = result.get("volume_ratio", 1.0)
+        ofi_bias = result.get("ofi_bias", "")
+        agg = result.get("agg", 0.5)
+        down_energy = result.get("down_energy", 0.0)
+        up_energy = result.get("up_energy", 0.0)
+        short_liq = result.get("short_liq", 99.0)
+        long_liq = result.get("long_liq", 99.0)
+
+        # ===== 1. Fake Gamma Trap =====
+        if gamma_exec and who_dies == "BOTH_POSSIBLE":
+            return {
+                "valid": False,
+                "reason": f"FAKE GAMMA TRAP: gamma_executing=True but who_dies={who_dies} → direction not committed",
+                "new_bias": "NEUTRAL"
+            }
+
+        # ===== 2. Overbought Kill Trap =====
+        if kill_dir == "LONG" and rsi6_5m > 90 and volume_ratio < 0.8:
+            return {
+                "valid": False,
+                "reason": f"OVERBOUGHT KILL TRAP: kill_dir=LONG but RSI5m={rsi6_5m:.1f}>90, volume={volume_ratio:.2f}x → blow-off top, reversal expected",
+                "new_bias": "SHORT"
+            }
+        if kill_dir == "SHORT" and rsi6_5m < 10 and volume_ratio < 0.8:
+            return {
+                "valid": False,
+                "reason": f"OVERSOLD KILL TRAP: kill_dir=SHORT but RSI5m={rsi6_5m:.1f}<10 → capitulation bottom, reversal expected",
+                "new_bias": "LONG"
+            }
+
+        # ===== 3. OFI Spoofing Re-check =====
+        if ofi_bias == "SHORT" and agg > 0.6 and down_energy == 0:
+            # OFI palsu – ikuti agg dan liquidity
+            if short_liq < long_liq:
+                correct_bias = "LONG"
+            else:
+                correct_bias = "SHORT"
+            return {
+                "valid": False,
+                "reason": f"OFI SPOOFING RE-CHECK: OFI={ofi_bias} but agg={agg:.2f}, down_energy=0 → forcing {correct_bias}",
+                "new_bias": correct_bias
+            }
+        if ofi_bias == "LONG" and agg < 0.4 and up_energy == 0:
+            if long_liq < short_liq:
+                correct_bias = "SHORT"
+            else:
+                correct_bias = "LONG"
+            return {
+                "valid": False,
+                "reason": f"OFI SPOOFING RE-CHECK: OFI={ofi_bias} but agg={agg:.2f}, up_energy=0 → forcing {correct_bias}",
+                "new_bias": correct_bias
+            }
+
+        return {"valid": True, "reason": "Gamma execution valid", "new_bias": result.get("bias")}
+
     def _apply_stability_filters(self, result: dict, phase_result, greeks_dict: dict) -> dict:
         """
         Menerapkan 5 filter stabilitas sinyal:
@@ -8678,6 +8751,27 @@ class BinanceAnalyzer:
         if not entry_ok and result["bias"] in ("LONG", "SHORT"):
             if result["confidence"] == "ABSOLUTE":
                 result["confidence"] = "HIGH"
+        
+        # ===== NEW: GAMMA EXECUTION VALIDATION (LECTURER'S SARAN) =====
+        # Validasi apakah gamma executing itu real atau fake
+        gamma_valid = self._validate_gamma_execution(result)
+        if not gamma_valid["valid"]:
+            result["entry_allowed"] = False
+            result["entry_reason"] = gamma_valid["reason"]
+            result["bias"] = gamma_valid["new_bias"]
+            result["confidence"] = "BLOCK"
+            result["priority_level"] = -1100.1  # lebih tinggi dari trap detector
+            result["reason"] = f"[GAMMA VALIDATION BLOCK] {gamma_valid['reason']} | " + result.get("reason", "")
+        
+        # ===== DUAL LIQ TRAP FILTER WITH ADDITIONAL CONDITIONS =====
+        # Periksa dual_liq_trap dengan kondisi tambahan setelah validasi gamma
+        dual_trap = result.get("dual_liq_trap", {})
+        if dual_trap.get("dual_liq_trap", False) and dual_trap.get("trap_score", 0) >= 3:
+            # Jika dual trap aktif, jangan izinkan entry meskipun gamma executing
+            result["entry_allowed"] = False
+            result["entry_reason"] = f"DUAL LIQ TRAP (score {dual_trap['trap_score']}/5) – {dual_trap.get('reason', '')}"
+            result["confidence"] = "BLOCK"
+            result["priority_level"] = -1100.2
         
         # ===== NEW: KILL-ZONE FLIP TRAP DETECTION INTEGRATION =====
         # 1. Track kill direction history
@@ -8823,20 +8917,6 @@ class BinanceAnalyzer:
                 result["bias"] = blowoff_result["bias"]
                 result["reason"] = f"[BLOW-OFF TOP TRAP] {blowoff_result['reason']} | " + result.get("reason", "")
                 result["priority_level"] = blowoff_result.get("priority", -1102)
-            
-            elif dual_trap["dual_liq_trap"]:
-                # DUAL LIQ TRAP EXCEPTION: override jika short_liq < 1.0% dan ada buy signal
-                if short_liq < 1.0 and agg > 0.7 and change_5m > 0:
-                    result["entry_allowed"] = True
-                    result["entry_reason"] = f"TRAP OVERRIDE: extreme short liq ({short_liq:.2f}%) supersedes dual trap"
-                    result["bias"] = "LONG"
-                elif long_liq < 1.0 and agg < 0.3 and change_5m < 0:
-                    result["entry_allowed"] = True
-                    result["entry_reason"] = f"TRAP OVERRIDE: extreme long liq ({long_liq:.2f}%) supersedes dual trap"
-                    result["bias"] = "SHORT"
-                else:
-                    result["entry_allowed"] = False
-                    result["entry_reason"] = f"DUAL LIQ TRAP ({dual_trap['trap_score']}/5) — {dual_trap['reason']}"
             
             # Kill Instability Block: Jika kill direction tidak stabil DAN dual liq trap, force NEUTRAL
             elif dir_stability.get("danger") and dual_trap.get("dual_liq_trap"):
