@@ -9407,23 +9407,22 @@ class BinanceAnalyzer:
                             prob_engine.add(post_squeeze["bias"], 10.09)
 
                         # ===== PRIORITY -1106: DOUBLE KILL SEQUENCE DETECTOR =====
-                        kill_check_data = result.get("kill_confirmation", {})
-                        dual_trap_data = result.get("dual_liq_trap", {})
-
+                        # Note: kill_check_data dan dual_trap_data akan diambil dari result setelah result dibuat
+                        # Untuk sementara, gunakan placeholder - akan di-update setelah result tersedia
                         double_kill = DoubleKillSequenceDetector.detect(
-                            who_dies_first=result.get("greeks_who_dies_first", ""),
-                            dual_liq_trap=dual_trap_data.get("dual_liq_trap", False),
-                            trap_score=dual_trap_data.get("trap_score", 0),
+                            who_dies_first="BOTH_POSSIBLE",  # placeholder - akan diupdate setelah result tersedia
+                            dual_liq_trap=False,  # placeholder
+                            trap_score=0,  # placeholder
                             short_liq=liq["short_dist"],
                             long_liq=liq["long_dist"],
-                            kill_confirmed=kill_check_data.get("kill_confirmed", False),
+                            kill_confirmed=False,  # placeholder
                             ofi_bias=ofi["bias"],
                             ofi_strength=ofi["strength"],
                             agg=agg,
                             volume_ratio=volume_ratio,
-                            kill_direction=result.get("greeks_kill_direction", "")
+                            kill_direction=""  # placeholder
                         )
-                        if not post_squeeze.get("override") and double_kill["override"]:
+                        if post_squeeze.get("override") and double_kill["override"]:
                             final_bias = double_kill["bias"]
                             final_reason = double_kill["reason"]
                             final_confidence = "ABSOLUTE"
@@ -9477,6 +9476,8 @@ class BinanceAnalyzer:
                             prob_engine.add(proximity_cont["bias"], 10.07)
 
                         # ===== PRIORITY -1099: OFI BAIT VALIDATOR =====
+                        # Note: dual_trap_data akan diambil dari result setelah result dibuat
+                        # Untuk sementara, gunakan placeholder
                         ofi_bait_result = OFIBaitValidator.detect(
                             ofi_bias=ofi["bias"],
                             ofi_strength=ofi["strength"],
@@ -9484,8 +9485,8 @@ class BinanceAnalyzer:
                             volume_ratio=volume_ratio,
                             short_liq=liq["short_dist"],
                             long_liq=liq["long_dist"],
-                            who_dies_first=result.get("greeks_who_dies_first", ""),
-                            dual_liq_trap=dual_trap_data.get("dual_liq_trap", False)
+                            who_dies_first="BOTH_POSSIBLE",  # placeholder
+                            dual_liq_trap=False  # placeholder
                         )
                         if not post_squeeze.get("override") and not double_kill.get("override") and not low_vol_dist.get("override") and not profit_reversal.get("override") and not proximity_cont.get("override") and ofi_bait_result["override"]:
                             final_bias = ofi_bait_result["bias"]
