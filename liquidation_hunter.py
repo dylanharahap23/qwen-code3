@@ -8775,6 +8775,60 @@ class OverboughtSqueezeGuard:
         return {"override": False}
 
 
+class FundingCrowdedOverride:
+    """
+    🔥 PRIORITY -1104.6: Koreksi delta_crowded berdasarkan funding rate
+    Funding positif = crowded LONG (banyak posisi long)
+    Funding negatif = crowded SHORT (banyak posisi short)
+    Jika funding positif dan short_liq dekat, HFT akan dump untuk likuidasi LONG, bukan pump.
+    """
+    @staticmethod
+    def detect(funding_rate, short_liq, long_liq, change_5m, rsi6):
+        if funding_rate is None:
+            return {"override": False}
+        # Funding positif (crowded long) + short liq dekat = HFT akan dump
+        if funding_rate > 0.0002 and short_liq < 2.0 and short_liq < long_liq:
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"FUNDING CROWDED OVERRIDE: funding={funding_rate:.5f} (crowded LONG), short_liq={short_liq:.2f}% dekat → HFT akan DUMP untuk likuidasi LONG, bukan pump",
+                "priority": -1104.6
+            }
+        # Funding negatif (crowded short) + long liq dekat = HFT akan pump
+        if funding_rate < -0.0002 and long_liq < 2.0 and long_liq < short_liq:
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": f"FUNDING CROWDED OVERRIDE: funding={funding_rate:.5f} (crowded SHORT), long_liq={long_liq:.2f}% dekat → HFT akan PUMP",
+                "priority": -1104.6
+            }
+        return {"override": False}
+
+
+class BaitPhaseShortLiqTrap:
+    """
+    🔥 PRIORITY -1103.8: Deteksi jebakan LONG di BAIT phase
+    Kondisi: BAIT phase + short_liq super dekat (<1%) + RSI overbought (>70) + funding positif
+    = HFT memancing LONG dengan ilusi squeeze, lalu dump
+    """
+    @staticmethod
+    def detect(market_phase, short_liq, rsi6, funding_rate, change_5m, down_energy):
+        if funding_rate is None:
+            return {"override": False}
+        if (market_phase == "BAIT" and 
+            short_liq < 1.0 and 
+            rsi6 > 70 and 
+            funding_rate > 0.0002 and
+            change_5m > 0):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"BAIT PHASE SHORT LIQ TRAP: short_liq={short_liq:.2f}% super dekat, RSI={rsi6:.1f} overbought, funding={funding_rate:.5f} (crowded long) → HFT jebak LONG, dump imminent",
+                "priority": -1103.8
+            }
+        return {"override": False}
+
+
 class CrowdedDirectionLiquidityResolver:
     """
     KUNCI: delta_crowded + liquidity proximity harus selalu dibaca bersama.
@@ -10256,11 +10310,53 @@ class BinanceAnalyzer:
         )
         result["empty_book_squeeze"] = empty_book_squeeze_result
 
+        # 🔥 PRIORITY -1104.6: FundingCrowdedOverride (koreksi delta_crowded berdasarkan funding rate)
+        funding_rate_val = result.get("funding_rate", 0.0)
+        funding_override = FundingCrowdedOverride.detect(
+            funding_rate=funding_rate_val,
+            short_liq=short_liq,
+            long_liq=long_liq,
+            change_5m=change_5m,
+            rsi6=rsi6_val
+        )
+        result["funding_crowded_override"] = funding_override
+
+        # 🔥 PRIORITY -1103.8: BaitPhaseShortLiqTrap
+        market_phase = phase_result.phase if phase_result else "UNKNOWN"
+        bait_trap = BaitPhaseShortLiqTrap.detect(
+            market_phase=market_phase,
+            short_liq=short_liq,
+            rsi6=rsi6_val,
+            funding_rate=funding_rate_val,
+            change_5m=change_5m,
+            down_energy=down_energy
+        )
+        result["bait_phase_short_liq_trap"] = bait_trap
+
         # 6. Apply semua ke entry_allowed dengan priority ladder
         if result.get("entry_allowed", True):  # hanya block jika belum di-block
             
+            # 🔥 PRIORITY -1104.6: Funding Crowded Override (koreksi delta_crowded) - HIGHEST PRIORITY AFTER RSI100
+            if funding_override.get("override", False):
+                result["bias"] = funding_override["bias"]
+                result["reason"] = f"[FUNDING CROWDED OVERRIDE] {funding_override['reason']} | " + result.get("reason", "")
+                result["priority_level"] = funding_override.get("priority", -1104.6)
+                result["confidence"] = "ABSOLUTE"
+                # Matikan detector lain yang lebih rendah prioritasnya
+                extreme_short_squeeze_result = {"override": False}
+                overbought_guard = {"override": False}
+            
+            # 🔥 PRIORITY -1103.8: BAIT Phase Short Liq Trap (setelah OverboughtSqueezeGuard)
+            elif bait_trap.get("override", False):
+                result["bias"] = bait_trap["bias"]
+                result["reason"] = f"[BAIT PHASE SHORT LIQ TRAP] {bait_trap['reason']} | " + result.get("reason", "")
+                result["priority_level"] = bait_trap.get("priority", -1103.8)
+                result["confidence"] = "ABSOLUTE"
+                # Matikan squeeze detector yang lebih rendah
+                extreme_short_squeeze_result = {"override": False}
+            
             # 🔥🔥 Priority -1104.5: RSI100AbsoluteReversal (HIGHEST - overrides ALL squeeze detectors)
-            if rsi100_rev.get("override", False):
+            elif rsi100_rev.get("override", False):
                 result["bias"] = rsi100_rev["bias"]
                 result["reason"] = f"[RSI100 ABSOLUTE REVERSAL] {rsi100_rev['reason']} | " + result.get("reason", "")
                 result["priority_level"] = rsi100_rev.get("priority", -1104.5)
