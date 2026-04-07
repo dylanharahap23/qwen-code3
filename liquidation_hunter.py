@@ -8739,6 +8739,42 @@ class PostPumpDistribution:
         return {"override": False}
 
 
+class RSI100AbsoluteReversal:
+    """
+    🔥 PRIORITY -1104.5: RSI6 = 100 atau RSI5m = 100
+    Tidak peduli sinyal squeeze apapun, ini adalah blow-off top absolut.
+    Harga tidak bisa naik lagi dalam jangka pendek, pasti reversal.
+    """
+    @staticmethod
+    def detect(rsi6: float, rsi6_5m: float, change_5m: float, 
+               short_liq: float, long_liq: float, volume_ratio: float) -> Dict:
+        if (rsi6 >= 99.5 or rsi6_5m >= 99.5) and change_5m > 2.0:
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"RSI100 ABSOLUTE REVERSAL: RSI6={rsi6:.1f} RSI5m={rsi6_5m:.1f} max overbought, price pumped {change_5m:.1f}% → no room for squeeze, immediate dump",
+                "priority": -1104.5
+            }
+        return {"override": False}
+
+
+class OverboughtSqueezeGuard:
+    """
+    Guard untuk ExtremeShortLiqSqueeze: jika RSI terlalu tinggi (>95),
+    short squeeze tidak akan terjadi karena tidak ada buyer baru.
+    """
+    @staticmethod
+    def detect(rsi6: float, rsi6_5m: float, short_liq: float, change_5m: float) -> Dict:
+        if short_liq < 1.0 and (rsi6 > 95 or rsi6_5m > 90) and change_5m > 2.0:
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"OVERBOUGHT SQUEEZE GUARD: short_liq={short_liq:.2f}% close tapi RSI6={rsi6:.1f} RSI5m={rsi6_5m:.1f} extreme overbought → squeeze fake, reversal imminent",
+                "priority": -1103.5
+            }
+        return {"override": False}
+
+
 class CrowdedDirectionLiquidityResolver:
     """
     KUNCI: delta_crowded + liquidity proximity harus selalu dibaca bersama.
@@ -10163,6 +10199,28 @@ class BinanceAnalyzer:
         )
         result["low_volume_overbought_squeeze"] = low_vol_overbought_result
 
+        # 🔥🔥 PRIORITY -1104.5: RSI100AbsoluteReversal (MUST BE BEFORE squeeze detectors)
+        rsi6_val = result.get("rsi6", 50.0)
+        long_liq_val = result.get("long_dist", 99.0)
+        rsi100_rev = RSI100AbsoluteReversal.detect(
+            rsi6=rsi6_val,
+            rsi6_5m=rsi6_5m,
+            change_5m=change_5m,
+            short_liq=short_liq,
+            long_liq=long_liq_val,
+            volume_ratio=volume_ratio
+        )
+        result["rsi100_absolute_reversal"] = rsi100_rev
+
+        # 🔥🔥 PRIORITY -1103.5: OverboughtSqueezeGuard (guard untuk ExtremeShortLiqSqueeze)
+        overbought_guard = OverboughtSqueezeGuard.detect(
+            rsi6=rsi6_val,
+            rsi6_5m=rsi6_5m,
+            short_liq=short_liq,
+            change_5m=change_5m
+        )
+        result["overbought_squeeze_guard"] = overbought_guard
+
         # 🔥 NEW: ShortLiqSuperCloseOverride Detector (Priority -1104)
         kill_dir = result.get("greeks_kill_direction", "")
         short_liq_super_close_result = ShortLiqSuperCloseOverride.detect(
@@ -10201,8 +10259,17 @@ class BinanceAnalyzer:
         # 6. Apply semua ke entry_allowed dengan priority ladder
         if result.get("entry_allowed", True):  # hanya block jika belum di-block
             
+            # 🔥🔥 Priority -1104.5: RSI100AbsoluteReversal (HIGHEST - overrides ALL squeeze detectors)
+            if rsi100_rev.get("override", False):
+                result["bias"] = rsi100_rev["bias"]
+                result["reason"] = f"[RSI100 ABSOLUTE REVERSAL] {rsi100_rev['reason']} | " + result.get("reason", "")
+                result["priority_level"] = rsi100_rev.get("priority", -1104.5)
+                result["confidence"] = "ABSOLUTE"
+                # Skip semua detector lain yang lebih rendah prioritasnya
+                extreme_short_squeeze_result = {"override": False}  # matikan squeeze detector
+            
             # Priority -1105: LowVolumeOverboughtSqueeze (PALING TINGGI)
-            if low_vol_overbought_result.get("override", False):
+            elif low_vol_overbought_result.get("override", False):
                 result["bias"] = low_vol_overbought_result["bias"]
                 result["reason"] = f"[LOW VOLUME OVERBOUGHT SQUEEZE] {low_vol_overbought_result['reason']} | " + result.get("reason", "")
                 result["priority_level"] = low_vol_overbought_result.get("priority", -1105)
@@ -10212,6 +10279,14 @@ class BinanceAnalyzer:
                 result["bias"] = short_liq_super_close_result["bias"]
                 result["reason"] = f"[SHORT LIQ SUPER CLOSE] {short_liq_super_close_result['reason']} | " + result.get("reason", "")
                 result["priority_level"] = short_liq_super_close_result.get("priority", -1104)
+            
+            # 🔥🔥 Priority -1103.5: OverboughtSqueezeGuard (guard untuk ExtremeShortLiqSqueeze)
+            elif overbought_guard.get("override", False):
+                result["bias"] = overbought_guard["bias"]
+                result["reason"] = f"[OVERBOUGHT SQUEEZE GUARD] {overbought_guard['reason']} | " + result.get("reason", "")
+                result["priority_level"] = overbought_guard.get("priority", -1103.5)
+                # Override hasil squeeze detector jika ada
+                extreme_short_squeeze_result = {"override": False}
             
             # Priority -1103: ExtremeShortLiqSqueezeOverride
             elif extreme_short_squeeze_result.get("override", False):
