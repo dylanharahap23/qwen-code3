@@ -8598,79 +8598,6 @@ class OFISpoofingDetector:
         return {"override": False}
 
 
-class ESPStyleDetector:
-    """
-    🔥 ESP STYLE DETECTOR – Mendeteksi pola false breakout khas ESPUSDT
-    
-    Karakteristik:
-    - RSI 1m > 90 (overbought ekstrem)
-    - RSI 5m < 35 (oversold, trend menengah masih turun)
-    - Volume ratio < 0.7 (volume kering, tidak ada konfirmasi)
-    - Salah satu liquidity < 2.0% (target dekat)
-    - (Opsional) Funding rate negatif (crowded short)
-    - (Opsional) OFI LONG > 0.7 (bait)
-    
-    Jika terpenuhi → BLOCK semua sinyal, bias = NEUTRAL, WAIT.
-    Priority: -2000 (lebih tinggi dari semua detector lain)
-    """
-    
-    @staticmethod
-    def detect(rsi6: float, rsi6_5m: float, volume_ratio: float,
-               short_dist: float, long_dist: float,
-               funding_rate: float = None, ofi_bias: str = "NEUTRAL",
-               ofi_strength: float = 0.0) -> Dict:
-        
-        # Kondisi utama
-        rsi_1m_overbought = rsi6 > 90
-        rsi_5m_oversold = rsi6_5m < 35
-        low_volume = volume_ratio < 0.7
-        liq_close = (short_dist < 2.0) or (long_dist < 2.0)
-        
-        # Kondisi tambahan (memperkuat)
-        funding_neg = funding_rate is not None and funding_rate < -0.001
-        ofi_bait = (ofi_bias == "LONG" and ofi_strength > 0.7)
-        
-        # Skor deteksi (butuh minimal 3 dari 4 utama, atau 2 utama + 2 tambahan)
-        primary_score = sum([rsi_1m_overbought, rsi_5m_oversold, low_volume, liq_close])
-        secondary_score = sum([funding_neg, ofi_bait])
-        
-        # ESP terdeteksi jika primary >= 3, atau primary >= 2 + secondary >= 1
-        is_esp = (primary_score >= 3) or (primary_score >= 2 and secondary_score >= 1)
-        
-        if not is_esp:
-            return {"override": False}
-        
-        # Buat reason yang detail
-        details = []
-        if rsi_1m_overbought:
-            details.append(f"RSI1m={rsi6:.1f}>90")
-        if rsi_5m_oversold:
-            details.append(f"RSI5m={rsi6_5m:.1f}<35")
-        if low_volume:
-            details.append(f"vol_ratio={volume_ratio:.2f}<0.7")
-        if liq_close:
-            target = "short" if short_dist < 2.0 else "long"
-            dist = short_dist if short_dist < 2.0 else long_dist
-            details.append(f"{target}_liq={dist:.2f}%")
-        if funding_neg:
-            details.append(f"funding={funding_rate:.5f}")
-        if ofi_bait:
-            details.append(f"OFI={ofi_bias}({ofi_strength:.2f})")
-        
-        reason = (f"ESP STYLE DETECTED: {' | '.join(details)} → "
-                  f"fake breakout with low volume, direction not committed. "
-                  f"BLOCK ALL SIGNALS, forced NEUTRAL/WAIT.")
-        
-        return {
-            "override": True,
-            "bias": "NEUTRAL",
-            "confidence": "BLOCK",
-            "priority": -2000,      # Tertinggi mutlak
-            "reason": reason,
-            "phase": "ESP_STYLE_BLOCK"
-        }
-
-
 # ================================================================
 # 🔥 LECTURER'S FINAL RESOLVERS (PRIORITY TERTINGGI)
 # ================================================================
@@ -10574,28 +10501,6 @@ class BinanceAnalyzer:
 
                         has_extreme_override = _liquidity_extreme_override
 
-                        # ========== ESP STYLE DETECTOR – PALING TINGGI (PRIORITY -2000) ==========
-                        esp_result = ESPStyleDetector.detect(
-                            rsi6=rsi6,
-                            rsi6_5m=rsi6_5m,
-                            volume_ratio=volume_ratio,
-                            short_dist=liq["short_dist"],
-                            long_dist=liq["long_dist"],
-                            funding_rate=funding_rate,
-                            ofi_bias=ofi["bias"],
-                            ofi_strength=ofi["strength"]
-                        )
-                        if esp_result["override"]:
-                            final_bias = esp_result["bias"]
-                            final_reason = esp_result["reason"]
-                            final_confidence = esp_result["confidence"]
-                            final_phase = esp_result["phase"]
-                            priority = esp_result["priority"]
-                            prob_engine.add(esp_result["bias"], 20.0)  # Highest weight
-                            esp_triggered = True
-                        else:
-                            esp_triggered = False
-
                         # ===== HIGH PRIORITY OVERRIDES (cascading if-else) =====
 
                         # ===== PRIORITY -1107: POST-SQUEEZE REVERSAL =====
@@ -10604,7 +10509,7 @@ class BinanceAnalyzer:
                             volume_ratio, up_energy,
                             liq["long_dist"], down_energy, obv_trend
                         )
-                        if not has_extreme_override and not esp_triggered and post_squeeze["override"]:
+                        if not has_extreme_override and post_squeeze["override"]:
                             final_bias = post_squeeze["bias"]
                             final_reason = post_squeeze["reason"]
                             final_confidence = "ABSOLUTE"
@@ -10616,7 +10521,7 @@ class BinanceAnalyzer:
                         olvr = OverboughtLowVolumeReversal.detect(
                             change_5m, rsi6, rsi6_5m, volume_ratio, liq["short_dist"]
                         )
-                        if not has_extreme_override and not esp_triggered and not post_squeeze.get("override") and olvr["override"]:
+                        if not has_extreme_override and not post_squeeze.get("override") and olvr["override"]:
                             final_bias = olvr["bias"]
                             final_reason = olvr["reason"]
                             final_confidence = "ABSOLUTE"
@@ -10640,7 +10545,7 @@ class BinanceAnalyzer:
                             volume_ratio=volume_ratio,
                             kill_direction=""  # placeholder
                         )
-                        if not has_extreme_override and not esp_triggered and not post_squeeze.get("override") and not olvr.get("override") and double_kill["override"]:
+                        if not has_extreme_override and not post_squeeze.get("override") and not olvr.get("override") and double_kill["override"]:
                             final_bias = double_kill["bias"]
                             final_reason = double_kill["reason"]
                             final_confidence = "ABSOLUTE"
@@ -10655,7 +10560,7 @@ class BinanceAnalyzer:
                             obv_trend, volume_ratio,
                             down_energy, up_energy
                         )
-                        if not has_extreme_override and not esp_triggered and not post_squeeze.get("override") and not olvr.get("override") and not double_kill.get("override") and low_vol_dist["override"]:
+                        if not has_extreme_override and not post_squeeze.get("override") and not olvr.get("override") and not double_kill.get("override") and low_vol_dist["override"]:
                             final_bias = low_vol_dist["bias"]
                             final_reason = low_vol_dist["reason"]
                             final_confidence = "ABSOLUTE"
@@ -10667,7 +10572,7 @@ class BinanceAnalyzer:
                         vol_dry_trap = VolumeDryUpOverboughtTrap.detect(
                             volume_ratio, rsi6, change_5m
                         )
-                        if not has_extreme_override and not esp_triggered and not post_squeeze.get("override") and not olvr.get("override") and not double_kill.get("override") and not low_vol_dist.get("override") and vol_dry_trap["override"]:
+                        if not has_extreme_override and not post_squeeze.get("override") and not olvr.get("override") and not double_kill.get("override") and not low_vol_dist.get("override") and vol_dry_trap["override"]:
                             final_bias = vol_dry_trap["bias"]
                             final_reason = vol_dry_trap["reason"]
                             final_confidence = "ABSOLUTE"
@@ -10682,7 +10587,7 @@ class BinanceAnalyzer:
                             liq["long_dist"], liq["short_dist"],
                             volume_ratio
                         )
-                        if not has_extreme_override and not esp_triggered and not post_squeeze.get("override") and not olvr.get("override") and not double_kill.get("override") and not low_vol_dist.get("override") and not vol_dry_trap.get("override") and profit_reversal["override"]:
+                        if not has_extreme_override and not post_squeeze.get("override") and not olvr.get("override") and not double_kill.get("override") and not low_vol_dist.get("override") and not vol_dry_trap.get("override") and profit_reversal["override"]:
                             final_bias = profit_reversal["bias"]
                             final_reason = profit_reversal["reason"]
                             final_confidence = "ABSOLUTE"
@@ -10697,7 +10602,7 @@ class BinanceAnalyzer:
                             down_energy=down_energy, up_energy=up_energy,
                             agg=agg, ofi_bias=ofi["bias"]
                         )
-                        if not has_extreme_override and not esp_triggered and not post_squeeze.get("override") and not olvr.get("override") and not double_kill.get("override") and not low_vol_dist.get("override") and not vol_dry_trap.get("override") and not profit_reversal.get("override") and proximity_cont["override"]:
+                        if not has_extreme_override and not post_squeeze.get("override") and not olvr.get("override") and not double_kill.get("override") and not low_vol_dist.get("override") and not vol_dry_trap.get("override") and not profit_reversal.get("override") and proximity_cont["override"]:
                             final_bias = proximity_cont["bias"]
                             final_reason = proximity_cont["reason"]
                             final_confidence = "ABSOLUTE"
@@ -10713,7 +10618,7 @@ class BinanceAnalyzer:
                             greeks_dict.get("kill_speed", 0),
                             volume_ratio
                         )
-                        if not has_extreme_override and not esp_triggered and not post_squeeze.get("override") and not olvr.get("override") and not double_kill.get("override") and not low_vol_dist.get("override") and not vol_dry_trap.get("override") and not profit_reversal.get("override") and not proximity_cont.get("override") and kill_no_mom["override"]:
+                        if not has_extreme_override and not post_squeeze.get("override") and not olvr.get("override") and not double_kill.get("override") and not low_vol_dist.get("override") and not vol_dry_trap.get("override") and not profit_reversal.get("override") and not proximity_cont.get("override") and kill_no_mom["override"]:
                             final_bias = kill_no_mom["bias"]
                             final_reason = kill_no_mom["reason"]
                             final_confidence = "ABSOLUTE"
@@ -10722,7 +10627,7 @@ class BinanceAnalyzer:
 
                         # ===== PRIORITY -1105: RSI DIVERGENCE REVERSAL (NEW) =====
                         rsi_div = RsiDivergenceReversal.detect(rsi6, rsi6_5m, volume_ratio)
-                        if not has_extreme_override and not esp_triggered and not post_squeeze.get("override") and not olvr.get("override") and not double_kill.get("override") and not low_vol_dist.get("override") and not vol_dry_trap.get("override") and not profit_reversal.get("override") and not proximity_cont.get("override") and rsi_div["override"]:
+                        if not has_extreme_override and not post_squeeze.get("override") and not olvr.get("override") and not double_kill.get("override") and not low_vol_dist.get("override") and not vol_dry_trap.get("override") and not profit_reversal.get("override") and not proximity_cont.get("override") and rsi_div["override"]:
                             final_bias = rsi_div["bias"]
                             final_reason = rsi_div["reason"]
                             final_confidence = "ABSOLUTE"
@@ -10738,7 +10643,7 @@ class BinanceAnalyzer:
                             greeks_dict.get("gamma_executing", False),
                             greeks_dict.get("who_dies_first", "")
                         )
-                        if not has_extreme_override and not esp_triggered and not post_squeeze.get("override") and not olvr.get("override") and not double_kill.get("override") and not low_vol_dist.get("override") and not vol_dry_trap.get("override") and not profit_reversal.get("override") and not proximity_cont.get("override") and not rsi_div.get("override") and fake_kill["override"]:
+                        if not has_extreme_override and not post_squeeze.get("override") and not olvr.get("override") and not double_kill.get("override") and not low_vol_dist.get("override") and not vol_dry_trap.get("override") and not profit_reversal.get("override") and not proximity_cont.get("override") and not rsi_div.get("override") and fake_kill["override"]:
                             final_bias = fake_kill["bias"]
                             final_reason = fake_kill["reason"]
                             final_confidence = "ABSOLUTE"
@@ -10748,7 +10653,7 @@ class BinanceAnalyzer:
 
                         # ===== PRIORITY -1103: OBV-PRICE DIVERGENCE (NEW) =====
                         obv_div = ObvPriceDivergence.detect(obv_trend, change_5m, volume_ratio)
-                        if not has_extreme_override and not esp_triggered and not post_squeeze.get("override") and not olvr.get("override") and not double_kill.get("override") and not low_vol_dist.get("override") and not vol_dry_trap.get("override") and not profit_reversal.get("override") and not proximity_cont.get("override") and not rsi_div.get("override") and not fake_kill.get("override") and obv_div["override"]:
+                        if not has_extreme_override and not post_squeeze.get("override") and not olvr.get("override") and not double_kill.get("override") and not low_vol_dist.get("override") and not vol_dry_trap.get("override") and not profit_reversal.get("override") and not proximity_cont.get("override") and not rsi_div.get("override") and not fake_kill.get("override") and obv_div["override"]:
                             final_bias = obv_div["bias"]
                             final_reason = obv_div["reason"]
                             final_confidence = "ABSOLUTE"
@@ -10758,7 +10663,7 @@ class BinanceAnalyzer:
 
                         # ===== PRIORITY -1102: EXTREME RSI SQUEEZE (NEW) =====
                         extreme_rsi = ExtremeRsiShortSqueeze.detect(rsi6, liq["short_dist"], liq["long_dist"], volume_ratio)
-                        if not has_extreme_override and not esp_triggered and not post_squeeze.get("override") and not olvr.get("override") and not double_kill.get("override") and not low_vol_dist.get("override") and not vol_dry_trap.get("override") and not profit_reversal.get("override") and not proximity_cont.get("override") and not rsi_div.get("override") and not fake_kill.get("override") and not obv_div.get("override") and extreme_rsi["override"]:
+                        if not has_extreme_override and not post_squeeze.get("override") and not olvr.get("override") and not double_kill.get("override") and not low_vol_dist.get("override") and not vol_dry_trap.get("override") and not profit_reversal.get("override") and not proximity_cont.get("override") and not rsi_div.get("override") and not fake_kill.get("override") and not obv_div.get("override") and extreme_rsi["override"]:
                             final_bias = extreme_rsi["bias"]
                             final_reason = extreme_rsi["reason"]
                             final_confidence = "ABSOLUTE"
@@ -10770,7 +10675,7 @@ class BinanceAnalyzer:
                         ofi_agg_spoof = OFIAggSpoofingDetector.detect(
                             ofi["bias"], ofi["strength"], agg, volume_ratio, change_5m
                         )
-                        if not has_extreme_override and not esp_triggered and not post_squeeze.get("override") and not olvr.get("override") and not double_kill.get("override") and not low_vol_dist.get("override") and not vol_dry_trap.get("override") and not profit_reversal.get("override") and not proximity_cont.get("override") and not kill_no_mom.get("override") and ofi_agg_spoof["override"]:
+                        if not has_extreme_override and not post_squeeze.get("override") and not olvr.get("override") and not double_kill.get("override") and not low_vol_dist.get("override") and not vol_dry_trap.get("override") and not profit_reversal.get("override") and not proximity_cont.get("override") and not kill_no_mom.get("override") and ofi_agg_spoof["override"]:
                             final_bias = ofi_agg_spoof["bias"]
                             final_reason = ofi_agg_spoof["reason"]
                             final_confidence = "ABSOLUTE"
@@ -10791,7 +10696,7 @@ class BinanceAnalyzer:
                             who_dies_first="BOTH_POSSIBLE",  # placeholder
                             dual_liq_trap=False  # placeholder
                         )
-                        if not has_extreme_override and not esp_triggered and not post_squeeze.get("override") and not double_kill.get("override") and not low_vol_dist.get("override") and not profit_reversal.get("override") and not proximity_cont.get("override") and ofi_bait_result["override"]:
+                        if not has_extreme_override and not post_squeeze.get("override") and not double_kill.get("override") and not low_vol_dist.get("override") and not profit_reversal.get("override") and not proximity_cont.get("override") and ofi_bait_result["override"]:
                             final_bias = ofi_bait_result["bias"]
                             final_reason = ofi_bait_result["reason"]
                             final_confidence = "ABSOLUTE"
@@ -10807,7 +10712,7 @@ class BinanceAnalyzer:
                             volume_ratio=volume_ratio,
                             down_energy=down_energy
                         )
-                        if not has_extreme_override and not esp_triggered and not post_squeeze.get("override") and not low_vol_dist.get("override") and not profit_reversal.get("override") and not proximity_cont.get("override") and oversold_bounce["override"]:
+                        if not has_extreme_override and not post_squeeze.get("override") and not low_vol_dist.get("override") and not profit_reversal.get("override") and not proximity_cont.get("override") and oversold_bounce["override"]:
                             final_bias = oversold_bounce["bias"]
                             final_reason = oversold_bounce["reason"]
                             final_confidence = "ABSOLUTE"
@@ -10823,7 +10728,7 @@ class BinanceAnalyzer:
                             volume_ratio=volume_ratio,
                             up_energy=up_energy
                         )
-                        if not has_extreme_override and not esp_triggered and not post_squeeze.get("override") and not low_vol_dist.get("override") and not profit_reversal.get("override") and not proximity_cont.get("override") and not oversold_bounce.get("override") and overbought_dump["override"]:
+                        if not has_extreme_override and not post_squeeze.get("override") and not low_vol_dist.get("override") and not profit_reversal.get("override") and not proximity_cont.get("override") and not oversold_bounce.get("override") and overbought_dump["override"]:
                             final_bias = overbought_dump["bias"]
                             final_reason = overbought_dump["reason"]
                             final_confidence = "ABSOLUTE"
@@ -10842,7 +10747,7 @@ class BinanceAnalyzer:
                             volume_ratio=volume_ratio,
                             down_energy=down_energy
                         )
-                        if not has_extreme_override and not esp_triggered and not post_squeeze.get("override") and not low_vol_dist.get("override") and not profit_reversal.get("override") and not proximity_cont.get("override") and not oversold_bounce.get("override") and not overbought_dump.get("override") and ask_wall_trap["override"]:
+                        if not has_extreme_override and not post_squeeze.get("override") and not low_vol_dist.get("override") and not profit_reversal.get("override") and not proximity_cont.get("override") and not oversold_bounce.get("override") and not overbought_dump.get("override") and ask_wall_trap["override"]:
                             final_bias = ask_wall_trap["bias"]
                             final_reason = ask_wall_trap["reason"]
                             final_confidence = "ABSOLUTE"
@@ -10860,7 +10765,7 @@ class BinanceAnalyzer:
                             volume_ratio=volume_ratio,
                             obv_trend=obv_trend
                         )
-                        if not has_extreme_override and not esp_triggered and not post_squeeze.get("override") and not low_vol_dist.get("override") and not profit_reversal.get("override") and not proximity_cont.get("override") and not oversold_bounce.get("override") and not overbought_dump.get("override") and not ask_wall_trap.get("override") and rsi_tf_trap["override"]:
+                        if not has_extreme_override and not post_squeeze.get("override") and not low_vol_dist.get("override") and not profit_reversal.get("override") and not proximity_cont.get("override") and not oversold_bounce.get("override") and not overbought_dump.get("override") and not ask_wall_trap.get("override") and rsi_tf_trap["override"]:
                             final_bias = rsi_tf_trap["bias"]
                             final_reason = rsi_tf_trap["reason"]
                             final_confidence = "ABSOLUTE"
@@ -10875,7 +10780,7 @@ class BinanceAnalyzer:
                             obv_trend, obv_value, volume_ratio,
                             agg, ofi["bias"]
                         )
-                        if not has_extreme_override and not esp_triggered and not post_squeeze.get("override") and not low_vol_dist.get("override") and not profit_reversal.get("override") and oversold_dist["override"]:
+                        if not has_extreme_override and not post_squeeze.get("override") and not low_vol_dist.get("override") and not profit_reversal.get("override") and oversold_dist["override"]:
                             final_bias = oversold_dist["bias"]
                             final_reason = oversold_dist["reason"]
                             final_confidence = "ABSOLUTE"
@@ -10888,7 +10793,7 @@ class BinanceAnalyzer:
                             funding_rate, oi_delta, volume_ratio,
                             change_5m, liq["short_dist"], liq["long_dist"]
                         )
-                        if not has_extreme_override and not esp_triggered and not post_squeeze.get("override") and not profit_reversal.get("override") and not oversold_dist.get("override") and global_imbalance["override"]:
+                        if not has_extreme_override and not post_squeeze.get("override") and not profit_reversal.get("override") and not oversold_dist.get("override") and global_imbalance["override"]:
                             final_bias = global_imbalance["bias"]
                             final_reason = global_imbalance["reason"]
                             final_confidence = "ABSOLUTE"
@@ -10899,7 +10804,7 @@ class BinanceAnalyzer:
                         # ===== PRIORITY -1104/-1100/-1075: ASYMMETRIC LIQUIDITY MAX PAIN =====
                         # FIX DUSDT: long_liq 34% vs short_liq 6% = ratio 5.8x → SHORT
                         # Market menuju liquidity TERBESAR, bukan terdekat
-                        if not has_extreme_override and not esp_triggered and not post_squeeze.get("override") and not global_imbalance.get("override") and not profit_reversal.get("override") and not oversold_dist.get("override"):  # hanya jika GPI, Profit Reversal, dan Oversold Dist tidak trigger
+                        if not has_extreme_override and not post_squeeze.get("override") and not global_imbalance.get("override") and not profit_reversal.get("override") and not oversold_dist.get("override"):  # hanya jika GPI, Profit Reversal, dan Oversold Dist tidak trigger
                             asym_liq = AsymmetricLiquidityMaxPain.detect(
                                 liq["short_dist"], liq["long_dist"],
                                 volume_ratio, change_5m,
@@ -10961,7 +10866,7 @@ class BinanceAnalyzer:
                                 prob_engine.add(phantom_buy["bias"], 10.01)
 
                         # ===== PRIORITY -1103: EXTREME RSI6 OVERBOUGHT REVERSAL =====
-                        if not has_extreme_override and not esp_triggered and not post_squeeze.get("override") and not profit_reversal.get("override") and not oversold_dist.get("override") and not dip_then_rip.get("override"):
+                        if not has_extreme_override and not post_squeeze.get("override") and not profit_reversal.get("override") and not oversold_dist.get("override") and not dip_then_rip.get("override"):
                             extreme_rsi6_rev = ExtremeRsi6OverboughtReversal.detect(
                                 rsi6, volume_ratio, ofi["bias"], up_energy
                             )
@@ -10974,7 +10879,7 @@ class BinanceAnalyzer:
                                 prob_engine.add(extreme_rsi6_rev["bias"], 10.02)
 
                         # ===== PRIORITY -1103: FUNDING NEGATIVE + SHORT LIQ SUPER CLOSE =====
-                        if not has_extreme_override and not esp_triggered and not post_squeeze.get("override") and not profit_reversal.get("override") and not oversold_dist.get("override") and not dip_then_rip.get("override"):
+                        if not has_extreme_override and not post_squeeze.get("override") and not profit_reversal.get("override") and not oversold_dist.get("override") and not dip_then_rip.get("override"):
                             funding_short_squeeze = FundingNegativeShortLiqSqueeze.detect(
                                 funding_rate, liq["short_dist"], liq["long_dist"],
                                 up_energy, down_energy, rsi6, volume_ratio
@@ -10988,7 +10893,7 @@ class BinanceAnalyzer:
                                 prob_engine.add(funding_short_squeeze["bias"], 10.03)
 
                         # ===== PRIORITY -1102: MOMENTUM VOLUME SPIKE PROTECTION =====
-                        if not has_extreme_override and not esp_triggered and not post_squeeze.get("override") and not profit_reversal.get("override") and not oversold_dist.get("override") and not dip_then_rip.get("override"):
+                        if not has_extreme_override and not post_squeeze.get("override") and not profit_reversal.get("override") and not oversold_dist.get("override") and not dip_then_rip.get("override"):
                             mom_vol_spike = MomentumVolumeSpikeProtection.detect(
                                 change_5m, latest_volume, volume_ma10,
                                 liq["short_dist"], liq["long_dist"],
@@ -11003,7 +10908,7 @@ class BinanceAnalyzer:
                                 prob_engine.add(mom_vol_spike["bias"], 10.015)
 
                         # ===== PRIORITY -1102: MARK PRICE GAP DETECTOR =====
-                        if not has_extreme_override and not esp_triggered and not post_squeeze.get("override") and not profit_reversal.get("override") and not oversold_dist.get("override") and not dip_then_rip.get("override"):
+                        if not has_extreme_override and not post_squeeze.get("override") and not profit_reversal.get("override") and not oversold_dist.get("override") and not dip_then_rip.get("override"):
                             mark_gap = MarkPriceGapDetector.detect(
                                 mark_price, price, funding_rate, change_5m
                             )
@@ -11021,7 +10926,7 @@ class BinanceAnalyzer:
                         )
 
                         # ===== PRIORITY -1101: EXTREME FUNDING RATE LONG/SHORT BAN =====
-                        if not has_extreme_override and not esp_triggered and not post_squeeze.get("override") and not profit_reversal.get("override") and not oversold_dist.get("override") and not dip_then_rip.get("override") and extreme_funding_ban["override"]:
+                        if not has_extreme_override and not post_squeeze.get("override") and not profit_reversal.get("override") and not oversold_dist.get("override") and not dip_then_rip.get("override") and extreme_funding_ban["override"]:
                             final_bias = extreme_funding_ban["bias"]
                             final_reason = extreme_funding_ban["reason"]
                             final_confidence = "ABSOLUTE"
