@@ -9926,10 +9926,10 @@ class BinanceAnalyzer:
 
         # ===== PRIORITY -10003: POST-PUMP DISTRIBUTION (PALING TINGGI) =====
         post_pump_result = PostPumpDistribution.detect(
-            change_5m=change_5m,
+            change_5m=change_5m_val,
             volume_ratio=volume_ratio,
             obv_trend=result.get("obv_trend", "NEUTRAL"),
-            funding_rate=funding_rate
+            funding_rate=funding_rate_val
         )
         if post_pump_result["override"]:
             result["bias"] = post_pump_result["bias"]
@@ -9941,9 +9941,9 @@ class BinanceAnalyzer:
         # ===== PRIORITY -10002: EXTREME FUNDING + OBV CONSENSUS =====
         if not result.get("_post_pump_override", False):
             extreme_funding_result = ExtremeFundingObvConsensus.detect(
-                funding_rate=funding_rate,
+                funding_rate=funding_rate_val,
                 obv_trend=result.get("obv_trend", "NEUTRAL"),
-                change_5m=change_5m,
+                change_5m=change_5m_val,
                 volume_ratio=volume_ratio
             )
             if extreme_funding_result["override"]:
@@ -9957,29 +9957,18 @@ class BinanceAnalyzer:
         # Harus dipanggil SETELAH greeks_final_screen karena butuh greeks_delta_crowded
         # Dan hanya jika tidak ada override dari detector priority lebih tinggi
         if not result.get("_post_pump_override", False) and not result.get("_funding_obv_override", False):
-            short_liq = result.get("short_liq", 99.0)
-            long_liq = result.get("long_liq", 99.0)
-            agg = result.get("agg", 0.5)
-            ofi_bias = result.get("ofi_bias", "NEUTRAL")
-            volume_ratio = result.get("volume_ratio", 1.0)
-            rsi6_val = result.get("rsi6", 50.0)
-            change_5m = result.get("change_5m", 0.0)
-            down_energy = result.get("down_energy", 0.0)
-            up_energy = result.get("up_energy", 0.0)
-            funding_rate = result.get("funding_rate", 0.0)
-            
             crowded_resolver = CrowdedDirectionLiquidityResolver.detect(
                 delta_crowded=result.get("greeks_delta_crowded", "NEUTRAL"),
                 short_liq=short_liq,
                 long_liq=long_liq,
-                agg=agg,
-                ofi_bias=ofi_bias,
+                agg=agg_val,
+                ofi_bias=result.get("ofi_bias", "NEUTRAL"),
                 volume_ratio=volume_ratio,
                 rsi6=rsi6_val,
-                change_5m=change_5m,
+                change_5m=change_5m_val,
                 who_dies_first=result.get("greeks_who_dies_first", ""),
                 greeks_kill_direction=result.get("greeks_kill_direction", ""),
-                funding_rate=funding_rate,
+                funding_rate=funding_rate_val,
                 obv_trend=result.get("obv_trend", "NEUTRAL")
             )
             if crowded_resolver["override"]:
@@ -9992,16 +9981,16 @@ class BinanceAnalyzer:
         # ===== PRIORITY -10000.5: AGG SPOOFING WITH CONTEXT =====
         if not result.get("_crowded_override", False):
             agg_spoof_ctx = AggSpoofingWithLiquidityContext.detect(
-                agg=agg,
+                agg=agg_val,
                 short_liq=short_liq,
                 long_liq=long_liq,
                 obv_trend=result.get("obv_trend", "NEUTRAL"),
                 obv_value=result.get("obv_value", 0.0),
                 volume_ratio=volume_ratio,
-                change_5m=change_5m,
-                down_energy=down_energy,
-                up_energy=up_energy,
-                funding_rate=funding_rate or 0.0
+                change_5m=change_5m_val,
+                down_energy=down_energy_val,
+                up_energy=up_energy_val,
+                funding_rate=funding_rate_val or 0.0
             )
             if agg_spoof_ctx["override"]:
                 result["bias"] = agg_spoof_ctx["bias"]
@@ -10020,9 +10009,9 @@ class BinanceAnalyzer:
                 short_liq=short_liq,
                 long_liq=long_liq,
                 who_dies_first=result.get("greeks_who_dies_first", ""),
-                agg=agg,
+                agg=agg_val,
                 volume_ratio=volume_ratio,
-                change_5m=change_5m
+                change_5m=change_5m_val
             )
             if first_move["override"]:
                 result["bias"] = first_move["bias"]
@@ -10035,8 +10024,8 @@ class BinanceAnalyzer:
         agg = result.get("agg", 0.0)
         ofi_bias = result.get("ofi_bias", "")
         ofi_strength = result.get("ofi_strength", 0.0)
-        change_5m = result.get("change_5m", 0.0)
-        volume_ratio = result.get("volume_ratio", 1.0)
+        change_5m = change_5m_val
+        volume_ratio = volume_ratio
         
         divergence_result = BullishOrderFlowDivergence.detect(
             agg=agg,
