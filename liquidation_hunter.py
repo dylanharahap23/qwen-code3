@@ -8602,6 +8602,71 @@ class OFISpoofingDetector:
 # 🔥 LECTURER'S FINAL RESOLVERS (PRIORITY TERTINGGI)
 # ================================================================
 
+class ExtremeFundingObvConsensus:
+    """
+    Detector: Extreme Funding + OBV Consensus (Priority -10002)
+    
+    Kondisi:
+    - funding_rate < -0.005 (funding negatif ekstrem = crowded short)
+    - obv_trend in ("NEGATIVE_EXTREME", "NEGATIVE") (OBV konfirmasi bearish)
+    - change_5m > 2.0 (harga sudah pump signifikan)
+    - volume_ratio < 0.8 (volume rendah = distribusi diam-diam)
+    
+    Priority: -10002 (lebih tinggi dari CrowdedDirectionLiquidityResolver)
+    Bias: SHORT
+    
+    Logika: Funding negatif ekstrem + OBV negatif + harga pump = distribution trap.
+    Smart money sedang distribute ke retail yang FOMO long, dump incoming.
+    """
+    @staticmethod
+    def detect(funding_rate: float, obv_trend: str, change_5m: float,
+               volume_ratio: float) -> Dict:
+        if funding_rate is None:
+            return {"override": False}
+        if (funding_rate < -0.005 and 
+            obv_trend in ("NEGATIVE_EXTREME", "NEGATIVE") and
+            change_5m > 2.0 and 
+            volume_ratio < 0.8):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"EXTREME FUNDING + OBV NEGATIVE: funding={funding_rate:.5f} (crowded short), OBV={obv_trend}, price up {change_5m:.1f}% low vol → distribution trap, dump incoming",
+                "priority": -10002
+            }
+        return {"override": False}
+
+
+class PostPumpDistribution:
+    """
+    Detector: Post-Pump Distribution (Priority -10003)
+    
+    Kondisi:
+    - change_5m > 2.5 (pump signifikan)
+    - volume_ratio < 0.7 (volume rendah = tidak ada conviction)
+    - obv_trend in ("NEGATIVE_EXTREME", "NEGATIVE") (OBV divergensi negatif)
+    - funding_rate < -0.003 (funding negatif = shorts masih dominan)
+    
+    Priority: -10003 (PALING TINGGI di priority ladder baru)
+    Bias: SHORT
+    
+    Logika: Pump dengan volume rendah + OBV negatif + funding negatif = 
+    smart money distribute positions ke retail FOMO. Dump imminent.
+    """
+    @staticmethod
+    def detect(change_5m: float, volume_ratio: float, obv_trend: str,
+               funding_rate: float) -> Dict:
+        if (change_5m > 2.5 and volume_ratio < 0.7 and 
+            obv_trend in ("NEGATIVE_EXTREME", "NEGATIVE") and
+            funding_rate is not None and funding_rate < -0.003):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"POST-PUMP DISTRIBUTION: pumped {change_5m:.1f}% with low vol {volume_ratio:.2f}x, OBV {obv_trend}, funding {funding_rate:.5f} → dump imminent",
+                "priority": -10003
+            }
+        return {"override": False}
+
+
 class CrowdedDirectionLiquidityResolver:
     """
     KUNCI: delta_crowded + liquidity proximity harus selalu dibaca bersama.
@@ -8618,7 +8683,12 @@ class CrowdedDirectionLiquidityResolver:
     def detect(delta_crowded: str, short_liq: float, long_liq: float,
                agg: float, ofi_bias: str, volume_ratio: float,
                rsi6: float, change_5m: float,
-               who_dies_first: str, greeks_kill_direction: str) -> Dict:
+               who_dies_first: str, greeks_kill_direction: str,
+               funding_rate: float = 0.0, obv_trend: str = "NEUTRAL") -> Dict:
+        
+        # GUARD: funding ekstrem negatif + OBV negatif → jangan override (biarkan detector lain)
+        if funding_rate is not None and funding_rate < -0.005 and obv_trend in ("NEGATIVE_EXTREME", "NEGATIVE"):
+            return {"override": False}
         
         if delta_crowded == "NEUTRAL":
             return {"override": False}
@@ -9854,37 +9924,70 @@ class BinanceAnalyzer:
                     result["confidence"] = "ABSOLUTE"
                     result["priority_level"] = -9998
 
+        # ===== PRIORITY -10003: POST-PUMP DISTRIBUTION (PALING TINGGI) =====
+        post_pump_result = PostPumpDistribution.detect(
+            change_5m=change_5m,
+            volume_ratio=volume_ratio,
+            obv_trend=result.get("obv_trend", "NEUTRAL"),
+            funding_rate=funding_rate
+        )
+        if post_pump_result["override"]:
+            result["bias"] = post_pump_result["bias"]
+            result["reason"] = f"[POST-PUMP DISTRIBUTION] {post_pump_result['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = post_pump_result["priority"]
+            result["_post_pump_override"] = True
+
+        # ===== PRIORITY -10002: EXTREME FUNDING + OBV CONSENSUS =====
+        if not result.get("_post_pump_override", False):
+            extreme_funding_result = ExtremeFundingObvConsensus.detect(
+                funding_rate=funding_rate,
+                obv_trend=result.get("obv_trend", "NEUTRAL"),
+                change_5m=change_5m,
+                volume_ratio=volume_ratio
+            )
+            if extreme_funding_result["override"]:
+                result["bias"] = extreme_funding_result["bias"]
+                result["reason"] = f"[EXTREME FUNDING OBV] {extreme_funding_result['reason']} | " + result.get("reason", "")
+                result["confidence"] = "ABSOLUTE"
+                result["priority_level"] = extreme_funding_result["priority"]
+                result["_funding_obv_override"] = True
+
         # ===== PRIORITY -10001: CROWDED DIRECTION RESOLVER =====
         # Harus dipanggil SETELAH greeks_final_screen karena butuh greeks_delta_crowded
-        short_liq = result.get("short_liq", 99.0)
-        long_liq = result.get("long_liq", 99.0)
-        agg = result.get("agg", 0.5)
-        ofi_bias = result.get("ofi_bias", "NEUTRAL")
-        volume_ratio = result.get("volume_ratio", 1.0)
-        rsi6_val = result.get("rsi6", 50.0)
-        change_5m = result.get("change_5m", 0.0)
-        down_energy = result.get("down_energy", 0.0)
-        up_energy = result.get("up_energy", 0.0)
-        funding_rate = result.get("funding_rate", 0.0)
-        
-        crowded_resolver = CrowdedDirectionLiquidityResolver.detect(
-            delta_crowded=result.get("greeks_delta_crowded", "NEUTRAL"),
-            short_liq=short_liq,
-            long_liq=long_liq,
-            agg=agg,
-            ofi_bias=ofi_bias,
-            volume_ratio=volume_ratio,
-            rsi6=rsi6_val,
-            change_5m=change_5m,
-            who_dies_first=result.get("greeks_who_dies_first", ""),
-            greeks_kill_direction=result.get("greeks_kill_direction", "")
-        )
-        if crowded_resolver["override"]:
-            result["bias"] = crowded_resolver["bias"]
-            result["reason"] = f"[CROWDED RESOLVER] {crowded_resolver['reason']} | " + result.get("reason", "")
-            result["confidence"] = "ABSOLUTE"
-            result["priority_level"] = crowded_resolver["priority"]
-            result["_crowded_override"] = True
+        # Dan hanya jika tidak ada override dari detector priority lebih tinggi
+        if not result.get("_post_pump_override", False) and not result.get("_funding_obv_override", False):
+            short_liq = result.get("short_liq", 99.0)
+            long_liq = result.get("long_liq", 99.0)
+            agg = result.get("agg", 0.5)
+            ofi_bias = result.get("ofi_bias", "NEUTRAL")
+            volume_ratio = result.get("volume_ratio", 1.0)
+            rsi6_val = result.get("rsi6", 50.0)
+            change_5m = result.get("change_5m", 0.0)
+            down_energy = result.get("down_energy", 0.0)
+            up_energy = result.get("up_energy", 0.0)
+            funding_rate = result.get("funding_rate", 0.0)
+            
+            crowded_resolver = CrowdedDirectionLiquidityResolver.detect(
+                delta_crowded=result.get("greeks_delta_crowded", "NEUTRAL"),
+                short_liq=short_liq,
+                long_liq=long_liq,
+                agg=agg,
+                ofi_bias=ofi_bias,
+                volume_ratio=volume_ratio,
+                rsi6=rsi6_val,
+                change_5m=change_5m,
+                who_dies_first=result.get("greeks_who_dies_first", ""),
+                greeks_kill_direction=result.get("greeks_kill_direction", ""),
+                funding_rate=funding_rate,
+                obv_trend=result.get("obv_trend", "NEUTRAL")
+            )
+            if crowded_resolver["override"]:
+                result["bias"] = crowded_resolver["bias"]
+                result["reason"] = f"[CROWDED RESOLVER] {crowded_resolver['reason']} | " + result.get("reason", "")
+                result["confidence"] = "ABSOLUTE"
+                result["priority_level"] = crowded_resolver["priority"]
+                result["_crowded_override"] = True
 
         # ===== PRIORITY -10000.5: AGG SPOOFING WITH CONTEXT =====
         if not result.get("_crowded_override", False):
