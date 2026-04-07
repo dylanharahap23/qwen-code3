@@ -2881,7 +2881,8 @@ class GammaLiquidityAlignment:
     def detect(gamma_intensity: str, kill_direction: str,
                short_dist: float, long_dist: float,
                gamma_executing: bool, volume_ratio: float,
-               market_phase: str = "UNKNOWN") -> Dict:
+               market_phase: str = "UNKNOWN",
+               kill_speed: float = 0.0) -> Dict:
         
         if gamma_intensity != "EXTREME":
             return {"override": False}
@@ -2927,6 +2928,7 @@ class GammaLiquidityAlignment:
         # ============================================================
         # JIKA INKONSISTEN = BARU cek apakah ini spoofing
         # Syarat spoofing: inkonsisten + belum executing + volume rendah
+        # 🔥 SARAN DOSEN: Tambahkan kondisi kill_speed < 2.0 untuk override tanpa peduli gamma_executing
         # ============================================================
         if is_inconsistent:
             
@@ -2936,14 +2938,15 @@ class GammaLiquidityAlignment:
                 short_dist < long_dist and
                 short_dist < 1.5):
                 
-                if not gamma_executing and volume_ratio < 0.8:
+                # 🔥 TAMBAHAN: Jika kill_speed < 2.0 dan volume_ratio < 0.8, override tanpa peduli gamma_executing
+                if (not gamma_executing and volume_ratio < 0.8) or (kill_speed < 2.0 and volume_ratio < 0.8):
                     return {
                         "override": True,
                         "bias": "LONG",
                         "reason": (
                             f"GAMMA SPOOFING: kill=SHORT tapi short_liq={short_dist:.2f}% "
                             f"lebih dekat → inkonsisten, HFT spoof SHORT, "
-                            f"sebenarnya LONG squeeze"
+                            f"sebenarnya LONG squeeze (kill_speed={kill_speed:.1f})"
                         ),
                         "priority": -10000
                     }
@@ -2954,14 +2957,15 @@ class GammaLiquidityAlignment:
                 long_dist < short_dist and
                 long_dist < 1.5):
                 
-                if not gamma_executing and volume_ratio < 0.8:
+                # 🔥 TAMBAHAN: Jika kill_speed < 2.0 dan volume_ratio < 0.8, override tanpa peduli gamma_executing
+                if (not gamma_executing and volume_ratio < 0.8) or (kill_speed < 2.0 and volume_ratio < 0.8):
                     return {
                         "override": True,
                         "bias": "SHORT",
                         "reason": (
                             f"GAMMA SPOOFING: kill=LONG tapi long_liq={long_dist:.2f}% "
                             f"lebih dekat → inkonsisten, HFT spoof LONG, "
-                            f"sebenarnya SHORT dump"
+                            f"sebenarnya SHORT dump (kill_speed={kill_speed:.1f})"
                         ),
                         "priority": -10000
                     }
@@ -4245,7 +4249,8 @@ class FreshShortTrapDetector:
                long_liq: float, short_liq: float, agg: float, up_energy: float,
                down_energy: float = 0.0) -> Dict:
         # Kondisi utama: fresh short trap (LONG bias)
-        if (change_5m < -2.0          # baru dump
+        # 🔥 SARAN DOSEN: Turunkan threshold change_5m dari -2.0 ke -1.5 agar lebih sensitif
+        if (change_5m < -1.5          # baru dump (turunkan threshold dari -2.0)
                 and rsi6 < 30          # oversold
                 and ofi_bias == "LONG" # buyer mulai masuk (market STOP turun)
                 and volume_ratio < 0.8 # volume rendah (market tipis)
@@ -8636,6 +8641,73 @@ class ExtremeFundingObvConsensus:
         return {"override": False}
 
 
+class AskWallSpoofedOFI:
+    """
+    🔥 SPOOFED OFI + AGG DENGAN ASK WALL RAKSASA (Pola PLAYUSDT & RLSUSDT)
+    
+    Apa yang terjadi:
+    - OFI = 1.00 (100% buy order flow) dan agg = 1.00 (100% trades buy) → sistem pikir bullish kuat.
+    - Tapi ask_slope >> bid_slope (ask wall 5-10x lebih tebal) → harga tidak bisa naik.
+    - HFT memancing entry LONG dengan micro-trades, lalu menjebak dengan sell wall.
+    
+    Data bukti (dari file Anda):
+    "agg": 1.0, "ofi_bias": "LONG", "ofi_strength": 1.0,
+    "ask_slope": 239416867460.3, "bid_slope": 188807008333.32,  // ask/bid > 1.2x
+    "change_5m": -1.74  // harga TURUN meski 100% buy trades
+    
+    Priority: -9999.5
+    Bias: SHORT
+    """
+    @staticmethod
+    def detect(ofi_bias: str, agg: float, ask_slope: float, bid_slope: float,
+               change_5m: float, volume_ratio: float) -> Dict:
+        if bid_slope <= 0:
+            return {"override": False}
+        
+        if (ofi_bias == "LONG" and agg > 0.85 and 
+            ask_slope > bid_slope * 1.5 and 
+            change_5m < 0 and volume_ratio < 0.7):
+            ratio = ask_slope / bid_slope
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"SPOOFED OFI: OFI LONG {ofi_bias}, agg={agg:.2f} tapi ask_slope={ask_slope:.0f} > bid_slope={bid_slope:.0f} (ratio {ratio:.1f}x), price down {change_5m:.1f}% → HFT jebak LONG",
+                "priority": -9999.5
+            }
+        return {"override": False}
+
+
+class BlowOffTopNoOBV:
+    """
+    🔥 POST-PUMP DISTRIBUTION DENGAN VOLUME KERING (Pola CUSDT & BULLAUSDT)
+    
+    Apa yang terjadi:
+    - Harga sudah pump >5% dalam 5 menit.
+    - Volume turun drastis (<0.6x) → tidak ada pembeli baru.
+    - RSI 5m > 85, RSI 1m > 90 → blow-off top.
+    - Sistem sering salah menginterpretasi sebagai "squeeze continuation".
+    
+    Data bukti (dari file BULLAUSDT):
+    "change_5m": 6.67, "volume_ratio": 0.45, "rsi6": 89.0, "rsi6_5m": 47.2
+    // RSI 1m 89 (overbought), tapi RSI 5m 47 (netral) → divergence
+    "bias": "LONG", "greeks_kill_direction": "LONG"  // sistem bilang LONG
+    // TAPI user bilang "ini dia malah short 8% kebawah" → error
+    
+    Priority: -10004 (LEBIH TINGGI dari PostPumpDistribution)
+    Bias: SHORT
+    """
+    @staticmethod
+    def detect(change_5m: float, volume_ratio: float, rsi6_5m: float, short_dist: float) -> Dict:
+        if change_5m > 5.0 and volume_ratio < 0.6 and rsi6_5m > 80:
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"BLOW-OFF TOP (no OBV): pump {change_5m:.1f}%, volume {volume_ratio:.2f}x, RSI5m={rsi6_5m:.1f} overbought → force SHORT",
+                "priority": -10004
+            }
+        return {"override": False}
+
+
 class PostPumpDistribution:
     """
     Detector: Post-Pump Distribution (Priority -10003)
@@ -12633,7 +12705,8 @@ class BinanceAnalyzer:
                 liq["short_dist"], liq["long_dist"],
                 result.get("greeks_gamma_executing", False),
                 volume_ratio,
-                result.get("market_phase", "UNKNOWN")
+                result.get("market_phase", "UNKNOWN"),
+                kill_speed=result.get("greeks_kill_speed", 0.0)  # TAMBAHAN: kill_speed untuk validasi spoofing
             )
             if gamma_spoof["override"]:
                 # Override hasil Greeks dengan priority -10000
