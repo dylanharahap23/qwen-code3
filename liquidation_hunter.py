@@ -1376,6 +1376,29 @@ def _greeks_absolute_score(
         }
 
     if vega["active"] and gamma_intensity in ("LOW", "MODERATE"):
+        # ===== VEGA-KILL CONFLICT GUARD (LECTURER'S FIX) =====
+        # Jika who_dies_first == "BOTH_POSSIBLE" dan gamma belum executing,
+        # maka jangan ikuti kill_direction, gunakan first_move dari dual_liq_trap
+        who_dies_first_local = delta.get("who_dies_first", "")
+        gamma_executing_local = gamma.get("gamma_executing", False)
+        kill_speed_local = gamma.get("kill_speed", 0.0)
+        
+        if VegaKillConflictGuard.should_block_vega_kill_conflict(
+            who_dies_first_local, gamma_executing_local, kill_speed_local
+        ):
+            # Coba gunakan first_move dari dual trap jika tersedia
+            dual_trap_data = data.get("dual_liq_trap", {})
+            first_move = dual_trap_data.get("first_move_direction", "UNKNOWN")
+            if first_move in ("UP", "DOWN"):
+                fallback_bias = "LONG" if first_move == "UP" else "SHORT"
+                return {
+                    "final_bias": fallback_bias,
+                    "override": True,
+                    "confidence": "ABSOLUTE",
+                    "priority": -9991.6,
+                    "score_reason": f"VEGA-KILL CONFLICT GUARD: who_dies={who_dies_first_local}, kill_direction={kill_direction} tidak reliable. Mengikuti first_move={first_move} → {fallback_bias}"
+                }
+        
         fade_direction = "SHORT" if vega["bait_direction"] == "UP" else "LONG"
         
         # VEGA OVERRIDE GUARD (Priority -9991.8)
@@ -1539,6 +1562,9 @@ def greeks_final_screen(result: dict) -> dict:
         # result["greeks_bias"], result["greeks_who_dies_first"], dll
     """
     output = result.copy()
+
+    # Tambahkan _dual_trap_data untuk digunakan di _greeks_absolute_score
+    result["_dual_trap_data"] = result.get("dual_liq_trap", {})
 
     theta = _theta_check(result)
     vega  = _vega_check(result)
@@ -8500,6 +8526,239 @@ class OFISpoofingDetector:
         return {"override": False}
 
 
+# ================================================================
+# 🔥 LECTURER'S FINAL RESOLVERS (PRIORITY TERTINGGI)
+# ================================================================
+
+class CrowdedDirectionLiquidityResolver:
+    """
+    KUNCI: delta_crowded + liquidity proximity harus selalu dibaca bersama.
+    
+    delta_crowded = LONG artinya:
+    - CASE A: long_liq < short_liq → longs yang crowded akan dieksekusi → SHORT
+    - CASE B: short_liq < long_liq → longs masuk sebagai counter-trend,
+              shorts yang sebenarnya crowded (mereka short karena RSI tinggi)
+              → LONG (squeeze shorts)
+    
+    Priority: -10001 (TERTINGGI ABSOLUT)
+    """
+    @staticmethod
+    def detect(delta_crowded: str, short_liq: float, long_liq: float,
+               agg: float, ofi_bias: str, volume_ratio: float,
+               rsi6: float, change_5m: float,
+               who_dies_first: str, greeks_kill_direction: str) -> Dict:
+        
+        if delta_crowded == "NEUTRAL":
+            return {"override": False}
+        
+        liq_diff = abs(short_liq - long_liq)
+        if liq_diff < 0.3:
+            return {"override": False}  # terlalu simetris
+        
+        # CASE A: delta_crowded LONG + long_liq lebih dekat
+        # = longs terlalu banyak, akan dieksekusi → SHORT
+        if (delta_crowded == "LONG" and 
+            long_liq < short_liq and 
+            long_liq < 2.0):
+            
+            is_bait = (agg > 0.8 and ofi_bias == "LONG" and volume_ratio < 0.9)
+            
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"CROWDED DIRECTION RESOLVER: delta_crowded=LONG + long_liq={long_liq:.2f}% < short_liq={short_liq:.2f}% "
+                    f"→ longs akan dieksekusi, bait_active={is_bait} "
+                    f"(agg={agg:.2f}, OFI={ofi_bias}) → SHORT"
+                ),
+                "priority": -10001
+            }
+        
+        # CASE B: delta_crowded LONG + short_liq lebih dekat
+        # = shorts crowded (retail short karena RSI tinggi/overbought)
+        # longs masuk sebagai counter → HFT akan squeeze shorts → LONG
+        if (delta_crowded == "LONG" and
+            short_liq < long_liq and
+            short_liq < 2.0):
+            
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": (
+                    f"CROWDED DIRECTION RESOLVER: delta_crowded=LONG + short_liq={short_liq:.2f}% < long_liq={long_liq:.2f}% "
+                    f"→ shorts crowded (overbought trap), HFT akan squeeze → LONG"
+                ),
+                "priority": -10001
+            }
+        
+        # Mirror untuk delta_crowded SHORT
+        if (delta_crowded == "SHORT" and
+            short_liq < long_liq and
+            short_liq < 2.0):
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": (
+                    f"CROWDED DIRECTION RESOLVER: delta_crowded=SHORT + short_liq={short_liq:.2f}% closer "
+                    f"→ shorts akan dieksekusi → LONG"
+                ),
+                "priority": -10001
+            }
+        
+        if (delta_crowded == "SHORT" and
+            long_liq < short_liq and
+            long_liq < 2.0):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"CROWDED DIRECTION RESOLVER: delta_crowded=SHORT + long_liq={long_liq:.2f}% closer "
+                    f"→ longs crowded (oversold trap), HFT akan dump → SHORT"
+                ),
+                "priority": -10001
+            }
+        
+        return {"override": False}
+
+
+class AggSpoofingWithLiquidityContext:
+    """
+    agg=1.00 bisa berarti DUA hal yang berlawanan:
+    
+    BULLISH (squeeze): agg=1.00 + short_liq dekat + down_energy=0
+    BEARISH (bait):    agg=1.00 + long_liq dekat + OBV negatif/netral
+    
+    Sistem sekarang selalu interpret agg=1.00 sebagai LONG.
+    Ini yang membunuh SYSUSDT prediction.
+    
+    Priority: -10000.5
+    """
+    @staticmethod
+    def detect(agg: float, short_liq: float, long_liq: float,
+               obv_trend: str, obv_value: float,
+               volume_ratio: float, change_5m: float,
+               down_energy: float, up_energy: float,
+               funding_rate: float) -> Dict:
+        
+        if agg < 0.85:
+            return {"override": False}
+        
+        # agg=1.00 BEARISH: long_liq dekat + OBV tidak confirm + volume rendah
+        # = HFT inject microtrades BUY untuk tarik LONG masuk, sebelum dump
+        if (long_liq < short_liq and
+            long_liq < 2.0 and
+            volume_ratio < 0.9 and
+            obv_trend not in ["POSITIVE_EXTREME", "POSITIVE"] and
+            change_5m < 0):
+            
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"AGG SPOOFING WITH LIQ CONTEXT: agg={agg:.2f} (100% buy microtrades) "
+                    f"TAPI long_liq={long_liq:.2f}% < short_liq={short_liq:.2f}%, "
+                    f"OBV={obv_trend}, change={change_5m:.1f}% → "
+                    f"HFT inject buy trades untuk jebak LONG sebelum dump"
+                ),
+                "priority": -10000.5
+            }
+        
+        # agg=1.00 BULLISH: short_liq dekat + down_energy=0 + harga tidak turun
+        if (short_liq < long_liq and
+            short_liq < 2.0 and
+            down_energy < 0.01 and
+            change_5m >= -1.0):
+            
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": (
+                    f"AGG REAL SQUEEZE: agg={agg:.2f} genuine buy pressure, "
+                    f"short_liq={short_liq:.2f}% dekat, no sellers → LONG"
+                ),
+                "priority": -10000.5
+            }
+        
+        return {"override": False}
+
+
+class DualLiqFirstMoveFollower:
+    """
+    Ketika dual_liq_trap aktif, sistem sudah tahu first_move_direction.
+    Tapi sekarang sistem mengabaikannya karena block entry.
+    
+    Fix: jika dual_liq_trap aktif DAN first_move_direction clear,
+    gunakan itu sebagai bias (bukan NEUTRAL/BLOCK).
+    
+    SYSUSDT: first_move=DOWN → SHORT (benar!)
+    AIOTUSDT: first_move=UP → LONG (benar!)
+    
+    Priority: -10000
+    """
+    @staticmethod
+    def detect(dual_liq_trap: bool, trap_score: int,
+               first_move_direction: str,
+               short_liq: float, long_liq: float,
+               who_dies_first: str,
+               agg: float, volume_ratio: float,
+               change_5m: float) -> Dict:
+        
+        if not dual_liq_trap or trap_score < 3:
+            return {"override": False}
+        
+        if first_move_direction == "UNKNOWN":
+            return {"override": False}
+        
+        # Validasi first_move dengan liq proximity
+        liq_consistent = (
+            (first_move_direction == "UP" and short_liq < long_liq) or
+            (first_move_direction == "DOWN" and long_liq < short_liq)
+        )
+        
+        if not liq_consistent:
+            return {"override": False}
+        
+        closer_liq = min(short_liq, long_liq)
+        if closer_liq > 2.0:
+            return {"override": False}
+        
+        bias = "LONG" if first_move_direction == "UP" else "SHORT"
+        
+        return {
+            "override": True,
+            "bias": bias,
+            "reason": (
+                f"DUAL LIQ FIRST MOVE FOLLOWER: trap_score={trap_score}/5, "
+                f"first_move={first_move_direction}, "
+                f"short_liq={short_liq:.2f}% vs long_liq={long_liq:.2f}% "
+                f"→ HFT akan gerak {first_move_direction} dulu, bias={bias}"
+            ),
+            "priority": -10000,
+            "is_first_move": True
+        }
+
+
+class VegaKillConflictGuard:
+    """
+    AIOTUSDT bug: VEGA-KILL CONFLICT memaksa SHORT karena kill_direction=SHORT.
+    Tapi who_dies_first = BOTH_POSSIBLE = direction belum committed.
+    
+    Rule: jika who_dies = BOTH_POSSIBLE, kill_direction tidak reliable.
+    Ikuti first_move_direction dari dual_liq_trap sebagai gantinya.
+    
+    (Method ini akan dipanggil dari dalam _greeks_absolute_score)
+    """
+    @staticmethod
+    def should_block_vega_kill_conflict(who_dies_first: str,
+                                         gamma_executing: bool,
+                                         kill_speed: float) -> bool:
+        if who_dies_first == "BOTH_POSSIBLE" and not gamma_executing:
+            return True
+        if kill_speed < 1.0 and not gamma_executing:
+            return True
+        return False
+
+
 class LiquidityAmbiguityResolver:
     """
     🔥 POLA LICIK HFT: Liquidity Ambiguity / Inducement Phase
@@ -9509,6 +9768,79 @@ class BinanceAnalyzer:
                     )
                     result["confidence"] = "ABSOLUTE"
                     result["priority_level"] = -9998
+
+        # ===== PRIORITY -10001: CROWDED DIRECTION RESOLVER =====
+        # Harus dipanggil SETELAH greeks_final_screen karena butuh greeks_delta_crowded
+        short_liq = result.get("short_liq", 99.0)
+        long_liq = result.get("long_liq", 99.0)
+        agg = result.get("agg", 0.5)
+        ofi_bias = result.get("ofi_bias", "NEUTRAL")
+        volume_ratio = result.get("volume_ratio", 1.0)
+        rsi6_val = result.get("rsi6", 50.0)
+        change_5m = result.get("change_5m", 0.0)
+        down_energy = result.get("down_energy", 0.0)
+        up_energy = result.get("up_energy", 0.0)
+        funding_rate = result.get("funding_rate", 0.0)
+        
+        crowded_resolver = CrowdedDirectionLiquidityResolver.detect(
+            delta_crowded=result.get("greeks_delta_crowded", "NEUTRAL"),
+            short_liq=short_liq,
+            long_liq=long_liq,
+            agg=agg,
+            ofi_bias=ofi_bias,
+            volume_ratio=volume_ratio,
+            rsi6=rsi6_val,
+            change_5m=change_5m,
+            who_dies_first=result.get("greeks_who_dies_first", ""),
+            greeks_kill_direction=result.get("greeks_kill_direction", "")
+        )
+        if crowded_resolver["override"]:
+            result["bias"] = crowded_resolver["bias"]
+            result["reason"] = f"[CROWDED RESOLVER] {crowded_resolver['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = crowded_resolver["priority"]
+            result["_crowded_override"] = True
+
+        # ===== PRIORITY -10000.5: AGG SPOOFING WITH CONTEXT =====
+        if not result.get("_crowded_override", False):
+            agg_spoof_ctx = AggSpoofingWithLiquidityContext.detect(
+                agg=agg,
+                short_liq=short_liq,
+                long_liq=long_liq,
+                obv_trend=result.get("obv_trend", "NEUTRAL"),
+                obv_value=result.get("obv_value", 0.0),
+                volume_ratio=volume_ratio,
+                change_5m=change_5m,
+                down_energy=down_energy,
+                up_energy=up_energy,
+                funding_rate=funding_rate or 0.0
+            )
+            if agg_spoof_ctx["override"]:
+                result["bias"] = agg_spoof_ctx["bias"]
+                result["reason"] = f"[AGG CONTEXT] {agg_spoof_ctx['reason']} | " + result.get("reason", "")
+                result["confidence"] = "ABSOLUTE"
+                result["priority_level"] = agg_spoof_ctx["priority"]
+                result["_agg_override"] = True
+
+        # ===== PRIORITY -10000: DUAL LIQ FIRST MOVE =====
+        if not result.get("_crowded_override", False) and not result.get("_agg_override", False):
+            dual_trap_data = result.get("dual_liq_trap", {})
+            first_move = DualLiqFirstMoveFollower.detect(
+                dual_liq_trap=dual_trap_data.get("dual_liq_trap", False),
+                trap_score=dual_trap_data.get("trap_score", 0),
+                first_move_direction=dual_trap_data.get("first_move_direction", "UNKNOWN"),
+                short_liq=short_liq,
+                long_liq=long_liq,
+                who_dies_first=result.get("greeks_who_dies_first", ""),
+                agg=agg,
+                volume_ratio=volume_ratio,
+                change_5m=change_5m
+            )
+            if first_move["override"]:
+                result["bias"] = first_move["bias"]
+                result["reason"] = f"[DUAL LIQ FIRST MOVE] {first_move['reason']} | " + result.get("reason", "")
+                result["confidence"] = "ABSOLUTE"
+                result["priority_level"] = first_move["priority"]
 
         # 5. NEW DETECTORS FROM LECTURER FEEDBACK
         # 5a. Bullish Order Flow Divergence Detector
