@@ -9670,24 +9670,33 @@ class BinanceAnalyzer:
         4. Gamma Delay (Gamma EXTREME tapi delta exposure < 0.95 => tunda)
         5. Entry Filter (tambahkan rekomendasi entry di output)
         """
+        # ========== AMBIL SEMUA VARIABEL YANG DIPERLUKAN DI AWAL METHOD ==========
+        short_liq = result.get("short_liq", 99.0)
+        long_liq = result.get("long_liq", 99.0)
+        agg_val = result.get("agg", 0.5)
+        ofi_bias = result.get("ofi_bias", "NEUTRAL")
+        ofi_strength = result.get("ofi_strength", 0.0)
+        volume_ratio = result.get("volume_ratio", 1.0)
+        rsi6_val = result.get("rsi6", 50.0)
+        change_5m_val = result.get("change_5m", 0.0)
+        down_energy_val = result.get("down_energy", 0.0)
+        up_energy_val = result.get("up_energy", 0.0)
+        funding_rate_val = result.get("funding_rate", 0.0)
+        obv_trend = result.get("obv_trend", "NEUTRAL")
+        obv_value = result.get("obv_value", 0.0)
+        kill_direction = result.get("greeks_kill_direction", "")
+        who_dies_first = result.get("greeks_who_dies_first", "")
+        delta_crowded = result.get("greeks_delta_crowded", "NEUTRAL")
+        gamma_executing = result.get("greeks_gamma_executing", False)
+        kill_speed = result.get("greeks_kill_speed", 0.0)
+        gamma_intensity = result.get("greeks_gamma_intensity", "LOW")
+        
         new_bias = result["bias"]
         now = time.time()
         market_phase = phase_result.phase if phase_result else "UNKNOWN"
         
         # ===== BAIT PHASE SOFT BLOCK (tidak langsung block, tapi turunkan confidence) =====
         if market_phase == "BAIT":
-            short_liq = result.get("short_liq", 99.0)
-            long_liq = result.get("long_liq", 99.0)
-            rsi6_val = result.get("rsi6", 50.0)
-            gamma_intensity = result.get("greeks_gamma_intensity", "LOW")
-            kill_speed = abs(result.get("greeks_kill_speed", 0))
-            volume_ratio = result.get("volume_ratio", 1.0)
-            down_energy_val = result.get("down_energy", 1.0)
-            up_energy_val = result.get("up_energy", 0.0)
-            agg_val = result.get("agg", 0.5)
-            funding_rate_val = result.get("funding_rate", 0.0)
-            change_5m_val = result.get("change_5m", 0.0)
-            
             # 🔥 EXCEPTION: short_liq super dekat + no sellers + kill_direction LONG
             kill_dir = result.get("greeks_kill_direction", "")
             
