@@ -484,10 +484,10 @@ class ExtremeShortLiqSqueezeOverride:
     Detector: Extreme Short Liquidity Squeeze Override (Priority -1103)
     
     Kondisi:
-    - short_dist < 1.0% (short liq super dekat)
+    - short_dist < 1.5% (short liq super dekat)
     - short_dist < long_dist (short lebih dekat dari long)
-    - agg > 0.7 (buy pressure dominant)
-    - up_energy == 0 (tidak ada resistance di atas)
+    - agg > 0.6 atau up_energy > 0.1 (buy pressure)
+    - down_energy < 0.01 (tidak ada resistance di atas)
     - change_5m > 0 (harga sedang naik)
     
     Priority: -1103 (tertinggi di priority ladder)
@@ -498,18 +498,90 @@ class ExtremeShortLiqSqueezeOverride:
     """
     @staticmethod
     def detect(short_dist: float, long_dist: float, agg: float, 
-               up_energy: float, change_5m: float) -> Dict:
+               down_energy: float, change_5m: float, up_energy: float = 0) -> Dict:
         # Short liq super dekat + buy pressure + tidak ada resistance
-        if (short_dist < 1.0 and 
+        if (short_dist < 1.5 and 
             short_dist < long_dist and
-            agg > 0.7 and 
-            up_energy == 0 and 
+            down_energy < 0.01 and      # tidak ada seller di book
+            (agg > 0.6 or up_energy > 0.1) and  # ada buy pressure
+            change_5m > 0):             # harga naik
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": f"EXTREME SHORT LIQ SQUEEZE: short liq {short_dist:.2f}% super close, down_energy={down_energy:.3f} (no sellers), agg={agg:.2f}, price up {change_5m:.1f}% → HFT will sweep short stops regardless of RSI/volume",
+                "priority": -1103
+            }
+        return {"override": False}
+
+
+class ShortLiqSuperCloseOverride:
+    """
+    Detector: Short Liquidity Super Close Override (Priority -1104)
+    
+    Kondisi:
+    - short_dist < 1.5% (short liq super dekat)
+    - short_dist < long_dist (short lebih dekat)
+    - down_energy < 0.01 (tidak ada seller resistance)
+    - kill_direction == "LONG" (Greeks konfirmasi arah LONG)
+    - change_5m > 0 (harga sudah naik)
+    
+    Priority: -1104 (lebih tinggi dari ExtremeShortLiqSqueezeOverride)
+    Bias: LONG
+    
+    Logika: Ketika short liq super dekat + no sellers + Greeks konfirmasi LONG,
+    paksa LONG tanpa peduli BAIT phase atau indikator lain.
+    Ini adalah kondisi squeeze paling kuat.
+    """
+    @staticmethod
+    def detect(short_dist: float, long_dist: float, down_energy: float,
+               kill_direction: str, change_5m: float, agg: float) -> Dict:
+        if (short_dist < 1.5 and 
+            short_dist < long_dist and
+            down_energy < 0.01 and
+            kill_direction == "LONG" and
             change_5m > 0):
             return {
                 "override": True,
                 "bias": "LONG",
-                "reason": f"EXTREME SHORT LIQ SQUEEZE: short liq {short_dist:.2f}% super close, agg={agg:.2f} buy dominant, up_energy=0 (no resistance) → HFT will sweep short stops regardless of RSI/vega",
-                "priority": -1103
+                "reason": f"SHORT LIQ SUPER CLOSE OVERRIDE: short_liq={short_dist:.2f}%, kill_dir={kill_direction}, down_energy=0 → forced LONG even in BAIT phase",
+                "priority": -1104
+            }
+        return {"override": False}
+
+
+class LowVolumeOverboughtSqueeze:
+    """
+    Detector: Low Volume Overbought Squeeze (Priority -1105)
+    
+    Kondisi:
+    - volume_ratio < 0.6 (volume sangat rendah)
+    - rsi6_5m > 75 (overbought di 5m)
+    - short_dist < 2.0 (short liq dekat)
+    - down_energy < 0.01 (tidak ada seller)
+    - agg > 0.5 (buy pressure ada)
+    - change_5m > 0 (harga naik)
+    
+    Priority: -1105 (PALING TINGGI - prioritas absolut)
+    Bias: LONG
+    
+    Logika: Kasus khusus di mana overbought + volume rendah biasanya berarti reversal,
+    TAPI karena short liq dekat + no sellers, ini justru squeeze continuation.
+    HFT menggunakan volume rendah untuk push harga ke short liq tanpa resistance.
+    """
+    @staticmethod
+    def detect(volume_ratio: float, rsi6_5m: float, short_dist: float,
+               down_energy: float, agg: float, change_5m: float) -> Dict:
+        if (volume_ratio < 0.6 and 
+            rsi6_5m > 75 and 
+            short_dist < 2.0 and 
+            down_energy < 0.01 and 
+            agg > 0.5 and 
+            change_5m > 0):
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": f"LOW VOLUME OVERBOUGHT SQUEEZE: vol={volume_ratio:.2f}x, RSI5m={rsi6_5m:.1f} overbought, short_liq={short_dist:.2f}%, no sellers → squeeze continuation, NOT reversal",
+                "priority": -1105
             }
         return {"override": False}
 
@@ -9546,55 +9618,68 @@ class BinanceAnalyzer:
             funding_rate_val = result.get("funding_rate", 0.0)
             change_5m_val = result.get("change_5m", 0.0)
             
-            # Kondisi di mana sinyal di BAIT phase dianggap cukup kuat untuk tetap dipertahankan
-            strong_conditions = []
+            # 🔥 EXCEPTION: short_liq super dekat + no sellers + kill_direction LONG
+            kill_dir = result.get("greeks_kill_direction", "")
             
-            # Kondisi 1: Liquidity sangat dekat (<1%)
-            if short_liq < 1.0 and short_liq < long_liq:
-                strong_conditions.append(f"short_liq={short_liq:.2f}%")
-            elif long_liq < 1.0 and long_liq < short_liq:
-                strong_conditions.append(f"long_liq={long_liq:.2f}%")
-            
-            # Kondisi 2: Gamma EXTREME dengan kill_speed tinggi (≥5)
-            if gamma_intensity == "EXTREME" and kill_speed >= 5.0:
-                strong_conditions.append(f"gamma_extreme+speed={kill_speed:.1f}")
-            
-            # Kondisi 3: RSI6 ekstrem (>=98 atau <=2) dengan volume rendah
-            if (rsi6_val >= 98 or rsi6_val <= 2) and volume_ratio < 0.7:
-                strong_conditions.append(f"rsi_extreme={rsi6_val:.1f}")
-            
-            # Kondisi 4: Funding ekstrem + liquidity dekat
-            if funding_rate_val is not None:
-                if (funding_rate_val < -0.005 and short_liq < 2.0) or (funding_rate_val > 0.005 and long_liq < 2.0):
-                    strong_conditions.append(f"funding_extreme={funding_rate_val:.5f}")
-            
-            # Kondisi 5: Volume spike > 3x + momentum kuat (>2%)
-            latest_vol = result.get("latest_volume", 0)
-            vol_ma10 = result.get("volume_ma10", 1)
-            vol_spike = latest_vol / vol_ma10 if vol_ma10 > 0 else 1
-            if vol_spike > 3.0 and abs(change_5m_val) > 2.0:
-                strong_conditions.append(f"vol_spike={vol_spike:.1f}x")
-            
-            # Kondisi 6: Overbought/oversold ekstrem dengan liquidity dekat
-            if (rsi6_val > 85 and short_liq < 2.0) or (rsi6_val < 15 and long_liq < 2.0):
-                strong_conditions.append(f"rsi_liq_extreme")
-            
-            # Jika ada kondisi kuat, izinkan sinyal dengan penalti confidence
-            if strong_conditions:
-                # Turunkan confidence jika terlalu tinggi (ABSOLUTE -> HIGH)
+            if (short_liq < 1.5 and 
+                down_energy_val < 0.01 and 
+                kill_dir == "LONG" and 
+                change_5m_val > 0):
+                # Jangan block, izinkan sinyal dengan penalti confidence
                 if result.get("confidence") == "ABSOLUTE":
                     result["confidence"] = "HIGH"
-                # Tambahkan informasi ke reason
-                result["reason"] = f"[BAIT PHASE - STRONG SIGNAL: {', '.join(strong_conditions)}] " + result.get("reason", "")
-                # Jangan block, lanjutkan ke filter lain
+                result["reason"] = f"[BAIT EXCEPTION: short_liq super close] " + result.get("reason", "")
+                # Jangan return, lanjut ke filter lain
             else:
-                # Tidak ada kondisi kuat → block sinyal, paksa NEUTRAL
-                result["bias"] = "NEUTRAL"
-                result["confidence"] = "BLOCK"
-                result["entry_allowed"] = False
-                result["greeks_override"] = False
-                result["reason"] = f"[BAIT SOFT BLOCK] No strong signal in BAIT phase. " + result.get("reason", "")
-                return result  # Langsung return, tidak lanjut ke filter lain
+                # Kondisi di mana sinyal di BAIT phase dianggap cukup kuat untuk tetap dipertahankan
+                strong_conditions = []
+                
+                # Kondisi 1: Liquidity sangat dekat (<1%)
+                if short_liq < 1.0 and short_liq < long_liq:
+                    strong_conditions.append(f"short_liq={short_liq:.2f}%")
+                elif long_liq < 1.0 and long_liq < short_liq:
+                    strong_conditions.append(f"long_liq={long_liq:.2f}%")
+                
+                # Kondisi 2: Gamma EXTREME dengan kill_speed tinggi (≥5)
+                if gamma_intensity == "EXTREME" and kill_speed >= 5.0:
+                    strong_conditions.append(f"gamma_extreme+speed={kill_speed:.1f}")
+                
+                # Kondisi 3: RSI6 ekstrem (>=98 atau <=2) dengan volume rendah
+                if (rsi6_val >= 98 or rsi6_val <= 2) and volume_ratio < 0.7:
+                    strong_conditions.append(f"rsi_extreme={rsi6_val:.1f}")
+                
+                # Kondisi 4: Funding ekstrem + liquidity dekat
+                if funding_rate_val is not None:
+                    if (funding_rate_val < -0.005 and short_liq < 2.0) or (funding_rate_val > 0.005 and long_liq < 2.0):
+                        strong_conditions.append(f"funding_extreme={funding_rate_val:.5f}")
+                
+                # Kondisi 5: Volume spike > 3x + momentum kuat (>2%)
+                latest_vol = result.get("latest_volume", 0)
+                vol_ma10 = result.get("volume_ma10", 1)
+                vol_spike = latest_vol / vol_ma10 if vol_ma10 > 0 else 1
+                if vol_spike > 3.0 and abs(change_5m_val) > 2.0:
+                    strong_conditions.append(f"vol_spike={vol_spike:.1f}x")
+                
+                # Kondisi 6: Overbought/oversold ekstrem dengan liquidity dekat
+                if (rsi6_val > 85 and short_liq < 2.0) or (rsi6_val < 15 and long_liq < 2.0):
+                    strong_conditions.append(f"rsi_liq_extreme")
+                
+                # Jika ada kondisi kuat, izinkan sinyal dengan penalti confidence
+                if strong_conditions:
+                    # Turunkan confidence jika terlalu tinggi (ABSOLUTE -> HIGH)
+                    if result.get("confidence") == "ABSOLUTE":
+                        result["confidence"] = "HIGH"
+                    # Tambahkan informasi ke reason
+                    result["reason"] = f"[BAIT PHASE - STRONG SIGNAL: {', '.join(strong_conditions)}] " + result.get("reason", "")
+                    # Jangan block, lanjutkan ke filter lain
+                else:
+                    # Tidak ada kondisi kuat → block sinyal, paksa NEUTRAL
+                    result["bias"] = "NEUTRAL"
+                    result["confidence"] = "BLOCK"
+                    result["entry_allowed"] = False
+                    result["greeks_override"] = False
+                    result["reason"] = f"[BAIT SOFT BLOCK] No strong signal in BAIT phase. " + result.get("reason", "")
+                    return result  # Langsung return, tidak lanjut ke filter lain
         
         # Ambil data Greeks dari result (sudah ada dari greeks_final_screen)
         gamma_intensity = result.get("greeks_gamma_intensity", "LOW")
@@ -9893,19 +9978,43 @@ class BinanceAnalyzer:
         )
         result["volume_dryup_reversal"] = volume_dryup_result
 
-        # 5e. ExtremeShortLiqSqueezeOverride Detector (Priority -1103) - HIGHEST PRIORITY
+        # 🔥 NEW: LowVolumeOverboughtSqueeze Detector (Priority -1105) - HIGHEST PRIORITY
+        down_energy = result.get("down_energy", 0.0)
+        low_vol_overbought_result = LowVolumeOverboughtSqueeze.detect(
+            volume_ratio=volume_ratio,
+            rsi6_5m=rsi6_5m,
+            short_dist=short_liq,
+            down_energy=down_energy,
+            agg=agg,
+            change_5m=change_5m
+        )
+        result["low_volume_overbought_squeeze"] = low_vol_overbought_result
+
+        # 🔥 NEW: ShortLiqSuperCloseOverride Detector (Priority -1104)
+        kill_dir = result.get("greeks_kill_direction", "")
+        short_liq_super_close_result = ShortLiqSuperCloseOverride.detect(
+            short_dist=short_liq,
+            long_dist=long_liq,
+            down_energy=down_energy,
+            kill_direction=kill_dir,
+            change_5m=change_5m,
+            agg=agg
+        )
+        result["short_liq_super_close"] = short_liq_super_close_result
+
+        # 5e. ExtremeShortLiqSqueezeOverride Detector (Priority -1103) - UPDATED WITH down_energy
         up_energy = result.get("up_energy", 0.0)
         extreme_short_squeeze_result = ExtremeShortLiqSqueezeOverride.detect(
             short_dist=short_liq,
             long_dist=long_liq,
             agg=agg,
-            up_energy=up_energy,
-            change_5m=change_5m
+            down_energy=down_energy,
+            change_5m=change_5m,
+            up_energy=up_energy
         )
         result["extreme_short_liq_squeeze"] = extreme_short_squeeze_result
 
         # 5f. EmptyBookSqueezeContinuation Detector (Priority -1102)
-        down_energy = result.get("down_energy", 0.0)
         empty_book_squeeze_result = EmptyBookSqueezeContinuation.detect(
             up_energy=up_energy,
             down_energy=down_energy,
@@ -9919,8 +10028,20 @@ class BinanceAnalyzer:
         # 6. Apply semua ke entry_allowed dengan priority ladder
         if result.get("entry_allowed", True):  # hanya block jika belum di-block
             
-            # Priority -1103: ExtremeShortLiqSqueezeOverride (HIGHEST PRIORITY)
-            if extreme_short_squeeze_result.get("override", False):
+            # Priority -1105: LowVolumeOverboughtSqueeze (PALING TINGGI)
+            if low_vol_overbought_result.get("override", False):
+                result["bias"] = low_vol_overbought_result["bias"]
+                result["reason"] = f"[LOW VOLUME OVERBOUGHT SQUEEZE] {low_vol_overbought_result['reason']} | " + result.get("reason", "")
+                result["priority_level"] = low_vol_overbought_result.get("priority", -1105)
+            
+            # Priority -1104: ShortLiqSuperCloseOverride
+            elif short_liq_super_close_result.get("override", False):
+                result["bias"] = short_liq_super_close_result["bias"]
+                result["reason"] = f"[SHORT LIQ SUPER CLOSE] {short_liq_super_close_result['reason']} | " + result.get("reason", "")
+                result["priority_level"] = short_liq_super_close_result.get("priority", -1104)
+            
+            # Priority -1103: ExtremeShortLiqSqueezeOverride
+            elif extreme_short_squeeze_result.get("override", False):
                 result["bias"] = extreme_short_squeeze_result["bias"]
                 result["reason"] = f"[EXTREME SHORT LIQ SQUEEZE] {extreme_short_squeeze_result['reason']} | " + result.get("reason", "")
                 result["priority_level"] = extreme_short_squeeze_result.get("priority", -1103)
