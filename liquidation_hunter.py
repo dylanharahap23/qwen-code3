@@ -146,6 +146,8 @@ def _check_bait_phase(data: dict) -> Optional[PhaseResult]:
       • up_energy > 0 AND down_energy == 0 (atau sebaliknya) → energy satu arah tapi sepi
       • RSI multi-TF divergence (RSI 1m > 70 & RSI 5m < 30, atau sebaliknya)
       • ask_wall_dominant (ask_slope / bid_slope > 5.0)
+    
+    TAMBAHAN FIX 1: Deteksi BAIT untuk move besar (>2%) dengan volume sangat rendah
     """
     change_5m = abs(data.get("change_5m", 0.0))
     volume_ratio = data.get("volume_ratio", 1.0)
@@ -177,24 +179,41 @@ def _check_bait_phase(data: dict) -> Optional[PhaseResult]:
 
     triggered = {k: v for k, v in conditions.items() if v}
 
-    if len(triggered) < 3:
-        return None
+    if len(triggered) >= 3:
+        reason = (
+            f"BAIT PHASE — Gerakan kecil ({change_5m:.2f}%) tanpa volume (ratio={volume_ratio:.2f}x). "
+            f"OBV tidak konfirmasi ({obv_trend}). Kemungkinan fake move untuk jebak posisi. "
+            f"Signals: {list(triggered.keys())}"
+        )
 
-    reason = (
-        f"BAIT PHASE — Gerakan kecil ({change_5m:.2f}%) tanpa volume (ratio={volume_ratio:.2f}x). "
-        f"OBV tidak konfirmasi ({obv_trend}). Kemungkinan fake move untuk jebak posisi. "
-        f"Signals: {list(triggered.keys())}"
-    )
+        return PhaseResult(
+            phase="BAIT",
+            override=False,
+            bias="NEUTRAL",
+            confidence="CAUTION",
+            priority=-500,
+            reason=reason,
+            sub_signals=triggered,
+        )
+    
+    # 🔥 FIX 1: Tambahan untuk move besar tapi volume kering (BAIT)
+    # Kondisi: move 2-5%, volume <0.6x, OBV netral, one-sided energy
+    if (abs(data.get("change_5m", 0.0)) >= 2.0 and abs(data.get("change_5m", 0.0)) < 5.0 and
+        volume_ratio < 0.6 and
+        obv_trend == "NEUTRAL" and
+        (up_energy == 0 or down_energy == 0)):
+        # Ini adalah bait dengan move besar
+        return PhaseResult(
+            phase="BAIT",
+            override=False,
+            bias="NEUTRAL",
+            confidence="CAUTION",
+            priority=-500,
+            reason=f"BAIT PHASE (large move) — Gerakan {abs(data.get('change_5m', 0.0)):.1f}% tanpa volume ({volume_ratio:.2f}x), OBV netral → fake move",
+            sub_signals={"large_fake_move": True, "low_volume": True}
+        )
 
-    return PhaseResult(
-        phase="BAIT",
-        override=False,
-        bias="NEUTRAL",
-        confidence="CAUTION",
-        priority=-500,
-        reason=reason,
-        sub_signals=triggered,
-    )
+    return None
 
 
 def _check_kill_phase(data: dict) -> Optional[PhaseResult]:
@@ -8739,6 +8758,29 @@ class PostPumpDistribution:
         return {"override": False}
 
 
+class VegaActiveShortOverride:
+    """
+    🔥 PRIORITY -10002: Ketika Vega aktif (BAIT phase), volume rendah,
+    harga sudah pump >2%, short liq dekat sebagai umpan → paksa SHORT
+    (karena HFT akan fade the move)
+    """
+    @staticmethod
+    def detect(vega_active: bool, volume_ratio: float, change_5m: float,
+               short_liq: float, obv_trend: str, agg: float) -> Dict:
+        if (vega_active and
+            volume_ratio < 0.7 and
+            change_5m > 2.0 and
+            short_liq < 2.0 and
+            obv_trend != "POSITIVE_EXTREME"):  # OBV positif ekstrem kadang juga palsu, tapi kita biarkan dulu
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"VEGA ACTIVE SHORT OVERRIDE: Vega aktif (BAIT phase), volume {volume_ratio:.2f}x rendah, price up {change_5m:.1f}%, short liq {short_liq:.2f}% → HFT fade to SHORT",
+                "priority": -10002
+            }
+        return {"override": False}
+
+
 class RSI100AbsoluteReversal:
     """
     🔥 PRIORITY -1104.5: RSI6 = 100 atau RSI5m = 100
@@ -8898,7 +8940,13 @@ class CrowdedDirectionLiquidityResolver:
                agg: float, ofi_bias: str, volume_ratio: float,
                rsi6: float, change_5m: float,
                who_dies_first: str, greeks_kill_direction: str,
-               funding_rate: float = 0.0, obv_trend: str = "NEUTRAL") -> Dict:
+               funding_rate: float = 0.0, obv_trend: str = "NEUTRAL",
+               vega_active: bool = False) -> Dict:
+        
+        # 🔥 FIX 2: GUARD - Jangan override jika Vega aktif (BAIT phase) dan volume rendah
+        # Karena di BAIT phase, arah sebenarnya adalah fade (kebalikan dari move)
+        if vega_active and volume_ratio < 0.7:
+            return {"override": False}
         
         # GUARD: funding ekstrem negatif + OBV negatif → jangan override (biarkan detector lain)
         if funding_rate is not None and funding_rate < -0.005 and obv_trend in ("NEGATIVE_EXTREME", "NEGATIVE"):
@@ -10202,9 +10250,51 @@ class BinanceAnalyzer:
                 result["priority_level"] = extreme_funding_result["priority"]
                 result["_funding_obv_override"] = True
 
+        # ===== PRIORITY -10002: VEGA FADE OVERRIDE (BAIT + DUAL TRAP) =====
+        # FIX 3: Jika Vega aktif dan (BAIT phase atau dual trap) dengan volume rendah,
+        # paksa bias mengikuti greeks_bias (yang biasanya fade direction) dan skip crowded resolver
+        vega_fade_triggered = False
+        vega_active = result.get("greeks_vega_active", False)
+        dual_trap_active = result.get("dual_liq_trap", {}).get("dual_liq_trap", False)
+        market_phase = phase_result.phase if phase_result else "UNKNOWN"
+        
+        if vega_active and (market_phase == "BAIT" or dual_trap_active) and volume_ratio < 0.7:
+            greeks_bias = result.get("greeks_bias", "NEUTRAL")
+            if greeks_bias in ("LONG", "SHORT"):
+                result["bias"] = greeks_bias
+                result["reason"] = f"[VEGA FADE OVERRIDE] BAIT phase + dual trap aktif, mengikuti Greeks fade ke {greeks_bias} | " + result.get("reason", "")
+                result["confidence"] = "ABSOLUTE"
+                result["priority_level"] = -10002
+                result["_vega_fade_override"] = True
+                # Skip crowded resolver nanti
+                vega_fade_triggered = True
+            else:
+                vega_fade_triggered = False
+        else:
+            vega_fade_triggered = False
+        
+        # ===== PRIORITY -10002: VEGA ACTIVE SHORT OVERRIDE =====
+        # FIX 4: Detector baru yang secara eksplisit memaksa SHORT ketika Vega aktif
+        if not vega_fade_triggered and not result.get("_post_pump_override", False):
+            vega_short_override = VegaActiveShortOverride.detect(
+                vega_active=vega_active,
+                volume_ratio=volume_ratio,
+                change_5m=change_5m_val,
+                short_liq=short_liq,
+                obv_trend=result.get("obv_trend", "NEUTRAL"),
+                agg=agg_val
+            )
+            if vega_short_override["override"]:
+                result["bias"] = vega_short_override["bias"]
+                result["reason"] = f"[VEGA SHORT OVERRIDE] {vega_short_override['reason']} | " + result.get("reason", "")
+                result["confidence"] = "ABSOLUTE"
+                result["priority_level"] = vega_short_override["priority"]
+                result["_vega_short_override"] = True
+                vega_fade_triggered = True  # Skip crowded resolver
+
         # ===== PRIORITY -10001.5: PRESWEEP MISINTERPRETATION GUARD =====
         presweep_triggered = False
-        if not result.get("_post_pump_override", False) and not result.get("_funding_obv_override", False):
+        if not result.get("_post_pump_override", False) and not result.get("_funding_obv_override", False) and not vega_fade_triggered:
             presweep_guard = PresweepMisinterpretationGuard.detect(
                 long_liq=long_liq,
                 short_liq=short_liq,
@@ -10226,7 +10316,7 @@ class BinanceAnalyzer:
         # ===== PRIORITY -10001: CROWDED DIRECTION RESOLVER =====
         # Harus dipanggil SETELAH greeks_final_screen karena butuh greeks_delta_crowded
         # Dan hanya jika tidak ada override dari detector priority lebih tinggi
-        if not result.get("_post_pump_override", False) and not result.get("_funding_obv_override", False) and not presweep_triggered:
+        if not result.get("_post_pump_override", False) and not result.get("_funding_obv_override", False) and not presweep_triggered and not vega_fade_triggered:
             crowded_resolver = CrowdedDirectionLiquidityResolver.detect(
                 delta_crowded=result.get("greeks_delta_crowded", "NEUTRAL"),
                 short_liq=short_liq,
@@ -10239,7 +10329,8 @@ class BinanceAnalyzer:
                 who_dies_first=result.get("greeks_who_dies_first", ""),
                 greeks_kill_direction=result.get("greeks_kill_direction", ""),
                 funding_rate=funding_rate_val,
-                obv_trend=result.get("obv_trend", "NEUTRAL")
+                obv_trend=result.get("obv_trend", "NEUTRAL"),
+                vega_active=vega_active  # FIX 2: Pass vega_active parameter
             )
             if crowded_resolver["override"]:
                 result["bias"] = crowded_resolver["bias"]
