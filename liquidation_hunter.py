@@ -10534,8 +10534,8 @@ class BinanceAnalyzer:
             kill_direction=kill_dir,
             change_5m=change_5m,
             agg=agg,
-            ofi_bias=ofi["bias"],           # tambahan
-            ofi_strength=ofi["strength"]    # tambahan
+            ofi_bias=result.get("ofi_bias", "NEUTRAL"),
+            ofi_strength=result.get("ofi_strength", 0.0)
         )
         result["short_liq_super_close"] = short_liq_super_close_result
 
@@ -10548,8 +10548,8 @@ class BinanceAnalyzer:
             down_energy=down_energy,
             change_5m=change_5m,
             up_energy=up_energy,
-            ofi_bias=ofi["bias"],           # tambahan
-            ofi_strength=ofi["strength"]    # tambahan
+            ofi_bias=result.get("ofi_bias", "NEUTRAL"),
+            ofi_strength=result.get("ofi_strength", 0.0)
         )
         result["extreme_short_liq_squeeze"] = extreme_short_squeeze_result
 
