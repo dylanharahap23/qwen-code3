@@ -8829,6 +8829,58 @@ class BaitPhaseShortLiqTrap:
         return {"override": False}
 
 
+class PresweepMisinterpretationGuard:
+    """
+    🔥 Deteksi: long_liq sangat dekat TAPI OFI/agg sangat bullish
+    = HFT bukan mau dump, tapi mau pump setelah sweep long liq tipis
+
+    Kondisi: long_liq < 0.3% + agg > 0.75 + ofi_bias == "LONG" 
+    → BLOCK semua SHORT signal, paksa ke LONG
+    Priority: -10001.5 (antara CrowdedResolver dan DualLiqFirstMove)
+    """
+    @staticmethod
+    def detect(long_liq: float, short_liq: float, agg: float,
+               ofi_bias: str, ofi_strength: float,
+               funding_rate: float, rsi6: float, change_5m: float) -> dict:
+
+        # Guard 1: long_liq sangat tipis tapi order flow bullish
+        # Ini bukan setup dump, tapi "micro-dip sweep lalu pump"
+        if (long_liq < 0.3 and
+            long_liq < short_liq * 5 and  # short liq jauh lebih besar
+            agg > 0.75 and
+            ofi_bias == "LONG" and
+            ofi_strength > 0.6):
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": (
+                    f"PRESWEEP MISINTERPRETATION GUARD: long_liq={long_liq:.2f}% "
+                    f"sangat dekat tapi agg={agg:.2f} + OFI LONG {ofi_strength:.2f} "
+                    f"→ HFT akan micro-dip sweep long liq LALU pump ke short_liq={short_liq:.2f}%"
+                ),
+                "priority": -10001.5
+            }
+
+        # Guard 2: Dual liq trap tapi funding sangat negatif
+        # Funding negatif = semua orang short → HFT akan squeeze short, bukan dump
+        if (funding_rate is not None and
+            funding_rate < -0.003 and
+            short_liq < long_liq * 2 and  # short liq lebih dekat atau sebanding
+            agg > 0.7):
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": (
+                    f"PRESWEEP FUNDING SQUEEZE GUARD: funding={funding_rate:.5f} "
+                    f"(crowded SHORT), agg={agg:.2f} bullish "
+                    f"→ HFT squeeze shorts, BUKAN dump"
+                ),
+                "priority": -10001.5
+            }
+
+        return {"override": False}
+
+
 class CrowdedDirectionLiquidityResolver:
     """
     KUNCI: delta_crowded + liquidity proximity harus selalu dibaca bersama.
@@ -8864,6 +8916,22 @@ class CrowdedDirectionLiquidityResolver:
         if (delta_crowded == "LONG" and 
             long_liq < short_liq and 
             long_liq < 2.0):
+            
+            # 🔥 PRESWEEP EXCEPTION: Jika long_liq sangat tipis (<0.3%) DAN 
+            # order flow bullish kuat → ini bukan setup dump
+            # HFT akan micro-sweep long liq lalu pump ke short liq yang lebih besar
+            if (long_liq < 0.3 and 
+                agg > 0.75 and 
+                ofi_bias == "LONG"):
+                return {
+                    "override": True,
+                    "bias": "LONG",
+                    "reason": (
+                        f"CROWDED RESOLVER EXCEPTION: long_liq={long_liq:.2f}% sangat tipis "
+                        f"+ agg={agg:.2f} + OFI LONG → bukan dump setup, HFT micro-sweep lalu pump"
+                    ),
+                    "priority": -10001
+                }
             
             is_bait = (agg > 0.8 and ofi_bias == "LONG" and volume_ratio < 0.9)
             
@@ -9005,10 +9073,20 @@ class DualLiqFirstMoveFollower:
                short_liq: float, long_liq: float,
                who_dies_first: str,
                agg: float, volume_ratio: float,
-               change_5m: float) -> Dict:
+               change_5m: float,
+               funding_rate: float = 0.0,
+               ofi_bias: str = "NEUTRAL") -> Dict:
         
         if not dual_liq_trap or trap_score < 3:
             return {"override": False}
+        
+        # 🔥 Jika funding sangat negatif (crowded short) dan agg bullish,
+        # maka first_move seharusnya UP (squeeze short), bukan DOWN
+        if (funding_rate is not None and 
+            funding_rate < -0.003 and 
+            agg > 0.65):
+            # Override first_move_direction ke UP
+            first_move_direction = "UP"
         
         if first_move_direction == "UNKNOWN":
             return {"override": False}
@@ -10124,10 +10202,31 @@ class BinanceAnalyzer:
                 result["priority_level"] = extreme_funding_result["priority"]
                 result["_funding_obv_override"] = True
 
+        # ===== PRIORITY -10001.5: PRESWEEP MISINTERPRETATION GUARD =====
+        presweep_triggered = False
+        if not result.get("_post_pump_override", False) and not result.get("_funding_obv_override", False):
+            presweep_guard = PresweepMisinterpretationGuard.detect(
+                long_liq=long_liq,
+                short_liq=short_liq,
+                agg=agg_val,
+                ofi_bias=result.get("ofi_bias", "NEUTRAL"),
+                ofi_strength=result.get("ofi_strength", 0.0),
+                funding_rate=funding_rate_val,
+                rsi6=rsi6_val,
+                change_5m=change_5m_val
+            )
+            if presweep_guard["override"]:
+                result["bias"] = presweep_guard["bias"]
+                result["reason"] = f"[PRESWEEP GUARD] {presweep_guard['reason']} | " + result.get("reason", "")
+                result["confidence"] = "ABSOLUTE"
+                result["priority_level"] = presweep_guard["priority"]
+                result["_presweep_override"] = True
+                presweep_triggered = True
+
         # ===== PRIORITY -10001: CROWDED DIRECTION RESOLVER =====
         # Harus dipanggil SETELAH greeks_final_screen karena butuh greeks_delta_crowded
         # Dan hanya jika tidak ada override dari detector priority lebih tinggi
-        if not result.get("_post_pump_override", False) and not result.get("_funding_obv_override", False):
+        if not result.get("_post_pump_override", False) and not result.get("_funding_obv_override", False) and not presweep_triggered:
             crowded_resolver = CrowdedDirectionLiquidityResolver.detect(
                 delta_crowded=result.get("greeks_delta_crowded", "NEUTRAL"),
                 short_liq=short_liq,
@@ -10182,7 +10281,9 @@ class BinanceAnalyzer:
                 who_dies_first=result.get("greeks_who_dies_first", ""),
                 agg=agg_val,
                 volume_ratio=volume_ratio,
-                change_5m=change_5m_val
+                change_5m=change_5m_val,
+                funding_rate=funding_rate_val,      # tambahan
+                ofi_bias=result.get("ofi_bias", "NEUTRAL")   # tambahan
             )
             if first_move["override"]:
                 result["bias"] = first_move["bias"]
@@ -13105,6 +13206,10 @@ class OutputFormatter:
                 print(f"   └─ Bias-Kill Conflict: {conflict_icon}")
                 if bkc.get('has_conflict'):
                     print(f"      └─ Corrected Direction: {bkc.get('correct_direction', 'N/A')}")
+            
+            # 🔥 PRESWEEP GUARD OUTPUT
+            if result.get('_presweep_override'):
+                print("   └─ 🔥 PRESWEEP GUARD ACTIVE")
 
         print(f"\n{'='*40}")
         print("📊 KEY METRICS:")
