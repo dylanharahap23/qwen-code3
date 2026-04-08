@@ -517,7 +517,12 @@ class ExtremeShortLiqSqueezeOverride:
     """
     @staticmethod
     def detect(short_dist: float, long_dist: float, agg: float, 
-               down_energy: float, change_5m: float, up_energy: float = 0) -> Dict:
+               down_energy: float, change_5m: float, up_energy: float = 0,
+               ofi_bias: str = "NEUTRAL", ofi_strength: float = 0.0) -> Dict:
+        # 🔥 GUARD: Jangan paksa LONG jika bearish confluence (agg sangat rendah + OFI SHORT)
+        if agg < 0.3 and ofi_bias == "SHORT" and ofi_strength > 0.6:
+            return {"override": False}
+        
         # Short liq super dekat + buy pressure + tidak ada resistance
         if (short_dist < 1.5 and 
             short_dist < long_dist and
@@ -553,7 +558,12 @@ class ShortLiqSuperCloseOverride:
     """
     @staticmethod
     def detect(short_dist: float, long_dist: float, down_energy: float,
-               kill_direction: str, change_5m: float, agg: float) -> Dict:
+               kill_direction: str, change_5m: float, agg: float,
+               ofi_bias: str = "NEUTRAL", ofi_strength: float = 0.0) -> Dict:
+        # 🔥 GUARD: Jangan paksa LONG jika bearish confluence (agg sangat rendah + OFI SHORT)
+        if agg < 0.3 and ofi_bias == "SHORT" and ofi_strength > 0.6:
+            return {"override": False}
+        
         if (short_dist < 1.5 and 
             short_dist < long_dist and
             down_energy < 0.01 and
@@ -8800,6 +8810,29 @@ class RSI100AbsoluteReversal:
         return {"override": False}
 
 
+class AggOFIBearishOverride:
+    """
+    🔥 PRIORITY -1104.5: Ketika agg < 0.3 (majoritas sell trades), OFI SHORT kuat,
+    short_liq dekat (<2%) sebagai umpan, dan harga naik (pump tipis)
+    → HFT sedang distribusi, paksa SHORT
+    """
+    @staticmethod
+    def detect(agg: float, ofi_bias: str, ofi_strength: float,
+               short_liq: float, change_5m: float) -> Dict:
+        if (agg < 0.3 and
+            ofi_bias == "SHORT" and
+            ofi_strength > 0.7 and
+            short_liq < 2.0 and
+            change_5m > 0):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"AGG-OFI BEARISH OVERRIDE: agg={agg:.2f} (87%+ sell trades), OFI SHORT {ofi_strength:.2f}, short_liq={short_liq:.2f}% umpan → HFT distribusi, dump incoming",
+                "priority": -1104.5
+            }
+        return {"override": False}
+
+
 class OverboughtSqueezeGuard:
     """
     Guard untuk ExtremeShortLiqSqueeze: jika RSI terlalu tinggi (>95),
@@ -8937,7 +8970,7 @@ class CrowdedDirectionLiquidityResolver:
     """
     @staticmethod
     def detect(delta_crowded: str, short_liq: float, long_liq: float,
-               agg: float, ofi_bias: str, volume_ratio: float,
+               agg: float, ofi_bias: str, ofi_strength: float, volume_ratio: float,
                rsi6: float, change_5m: float,
                who_dies_first: str, greeks_kill_direction: str,
                funding_rate: float = 0.0, obv_trend: str = "NEUTRAL",
@@ -9000,6 +9033,11 @@ class CrowdedDirectionLiquidityResolver:
         if (delta_crowded == "LONG" and
             short_liq < long_liq and
             short_liq < 2.0):
+            
+            # 🔥 BEARISH CONFLUENCE GUARD
+            if agg < 0.3 and ofi_bias == "SHORT" and ofi_strength > 0.6:
+                # Jangan paksa LONG, biarkan sinyal lain (misal Vega fade) yang menentukan
+                return {"override": False}
             
             return {
                 "override": True,
@@ -10292,6 +10330,25 @@ class BinanceAnalyzer:
                 result["_vega_short_override"] = True
                 vega_fade_triggered = True  # Skip crowded resolver
 
+        # 🔥 PRIORITY -1104.5: Agg-OFI Bearish Override
+        # Ketika agg < 0.3 (majoritas sell), OFI SHORT kuat, short_liq dekat sebagai umpan
+        bearish_override = AggOFIBearishOverride.detect(
+            agg=agg_val,
+            ofi_bias=result.get("ofi_bias", "NEUTRAL"),
+            ofi_strength=result.get("ofi_strength", 0.0),
+            short_liq=short_liq,
+            change_5m=change_5m_val
+        )
+        if bearish_override["override"]:
+            result["bias"] = bearish_override["bias"]
+            result["reason"] = f"[AGG-OFI BEARISH] {bearish_override['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = bearish_override["priority"]
+            # Matikan squeeze override
+            extreme_short_squeeze_result = {"override": False}
+            short_liq_super_close_result = {"override": False}
+            # Lanjutkan, jangan return agar filter lain tetap jalan
+
         # ===== PRIORITY -10001.5: PRESWEEP MISINTERPRETATION GUARD =====
         presweep_triggered = False
         if not result.get("_post_pump_override", False) and not result.get("_funding_obv_override", False) and not vega_fade_triggered:
@@ -10323,6 +10380,7 @@ class BinanceAnalyzer:
                 long_liq=long_liq,
                 agg=agg_val,
                 ofi_bias=result.get("ofi_bias", "NEUTRAL"),
+                ofi_strength=result.get("ofi_strength", 0.0),
                 volume_ratio=volume_ratio,
                 rsi6=rsi6_val,
                 change_5m=change_5m_val,
@@ -10475,7 +10533,9 @@ class BinanceAnalyzer:
             down_energy=down_energy,
             kill_direction=kill_dir,
             change_5m=change_5m,
-            agg=agg
+            agg=agg,
+            ofi_bias=ofi["bias"],           # tambahan
+            ofi_strength=ofi["strength"]    # tambahan
         )
         result["short_liq_super_close"] = short_liq_super_close_result
 
@@ -10487,7 +10547,9 @@ class BinanceAnalyzer:
             agg=agg,
             down_energy=down_energy,
             change_5m=change_5m,
-            up_energy=up_energy
+            up_energy=up_energy,
+            ofi_bias=ofi["bias"],           # tambahan
+            ofi_strength=ofi["strength"]    # tambahan
         )
         result["extreme_short_liq_squeeze"] = extreme_short_squeeze_result
 
