@@ -128,7 +128,7 @@ def _check_prep_phase(data: dict) -> Optional[PhaseResult]:
         override=True,
         bias="NEUTRAL",
         confidence="BLOCK",
-        priority=-2000,
+        priority=-20000,  # LECTURER FIX 1: Lebih tinggi dari semua detector lain
         reason=reason,
         sub_signals=triggered,
     )
@@ -10033,6 +10033,17 @@ class BinanceAnalyzer:
         now = time.time()
         market_phase = phase_result.phase if phase_result else "UNKNOWN"
         
+        # ========== PREP PHASE HARD BLOCK (LECTURER FIX 2) ==========
+        # Jika market phase PREP, netralkan semua sinyal dan langsung return
+        if result.get("market_phase") == "PREP":
+            result["bias"] = "NEUTRAL"
+            result["confidence"] = "BLOCK"
+            result["entry_allowed"] = False
+            result["priority_level"] = -20000
+            result["reason"] = f"[PREP HARD BLOCK] Market dalam fase PREP (akumulasi) → NO TRADE | " + result.get("reason", "")
+            # Tidak perlu proses filter lain
+            return result
+        
         # ===== BAIT PHASE SOFT BLOCK (tidak langsung block, tapi turunkan confidence) =====
         if market_phase == "BAIT":
             # 🔥 EXCEPTION: short_liq super dekat + no sellers + kill_direction LONG
@@ -10161,6 +10172,20 @@ class BinanceAnalyzer:
         # Terapkan bias akhir
         result["bias"] = new_bias
         
+        # ========== OBV-VOLUME VETO (LECTURER FIX 3) ==========
+        # Jika OBV NEGATIVE_EXTREME + volume_ratio < 0.4 dan bias = LONG → paksa SHORT
+        if obv_trend == "NEGATIVE_EXTREME" and volume_ratio < 0.4 and result.get("bias") == "LONG":
+            result["bias"] = "SHORT"
+            result["reason"] = f"[OBV-VOLUME VETO] OBV {obv_trend}, volume {volume_ratio:.2f}x → LONG override ditolak, paksa SHORT | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = -1104.6
+        
+        # Mirror: OBV POSITIVE_EXTREME + volume_ratio < 0.4 dan bias = SHORT → paksa LONG
+        if obv_trend == "POSITIVE_EXTREME" and volume_ratio < 0.4 and result.get("bias") == "SHORT":
+            result["bias"] = "LONG"
+            result["reason"] = f"[OBV-VOLUME VETO] OBV {obv_trend}, volume {volume_ratio:.2f}x → SHORT override ditolak, paksa LONG | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = -1104.6
         # ========== OBV CONFLICT GUARD (SOLV case) ==========
         # Cek apakah OBV bertentangan keras dengan bias di BAIT phase
         final_bias = result.get("bias", "NEUTRAL")
@@ -10429,6 +10454,16 @@ class BinanceAnalyzer:
                 result["confidence"] = "ABSOLUTE"
                 result["priority_level"] = agg_spoof_ctx["priority"]
                 result["_agg_override"] = True
+        
+        # ===== AGG PERSISTENCE CHECK (LECTURER FIX 6) =====
+        agg_val = result.get("agg", 0.5)
+        if agg_val > 0.85 and self._is_agg_sustained(agg_val, threshold=0.8, min_period=5):
+            # Jika ada AGG spoofing override yang memaksa SHORT, batalkan
+            if result.get("_agg_override") and result.get("bias") == "SHORT":
+                result["bias"] = "LONG"
+                result["reason"] = f"[AGG SUSTAINED] agg={agg_val:.2f} konsisten selama 5 menit → genuine accumulation, override SHORT menjadi LONG | " + result.get("reason", "")
+                result["priority_level"] = -10000.6
+                result["_agg_override"] = False
 
         # ===== PRIORITY -10000: DUAL LIQ FIRST MOVE =====
         if not result.get("_crowded_override", False) and not result.get("_agg_override", False):
@@ -10703,6 +10738,21 @@ class BinanceAnalyzer:
                 result["bias"] = volume_dryup_result["bias"]
                 result["reason"] = f"[VOLUME DRY-UP REVERSAL] {volume_dryup_result['reason']} | " + result.get("reason", "")
                 result["priority_level"] = volume_dryup_result.get("priority", -1080)
+        
+        # ========== CONFLICT SCORE THRESHOLD (LECTURER FIX 5) ==========
+        # Hitung jumlah override yang aktif
+        override_count = 0
+        for key in ['_crowded_override', '_agg_override', '_vega_fade_override', '_presweep_override', 
+                    '_post_pump_override', '_post_pump_override', '_funding_obv_override', '_liquidity_extreme_override', '_obv_veto_long']:
+            if result.get(key):
+                override_count += 1
+        
+        if override_count >= 3:
+            result["bias"] = "NEUTRAL"
+            result["confidence"] = "BLOCK"
+            result["entry_allowed"] = False
+            result["reason"] = f"[CONFLICT THRESHOLD] {override_count} override aktif → kemungkinan TRAP, NO TRADE | " + result.get("reason", "")
+            result["priority_level"] = -1105
         
         return result
 
