@@ -13332,16 +13332,6 @@ class BinanceAnalyzer:
                 "exchange_safe_direction": exchange_risk["safe_direction"]
             }
 
-            # Stability filter (global anti‑flip)
-            global LAST_BIAS, LAST_BIAS_TIME
-            now = time.time()
-            if LAST_BIAS is not None and result["bias"] != LAST_BIAS and (now - LAST_BIAS_TIME) < 1.0:
-                result["bias"] = LAST_BIAS
-                result["reason"] += " | Stability lock (anti-flip)"
-            if result["bias"] in ["LONG", "SHORT"]:
-                LAST_BIAS = result["bias"]
-                LAST_BIAS_TIME = now
-
             # ========== MARKET PHASE DETECTOR INTEGRATION ==========
             phase_data = {
                 "change_5m": change_5m,
@@ -13485,16 +13475,6 @@ class BinanceAnalyzer:
             "predicted_price": 0.0,
             "position_multiplier": 1.0
         }
-
-        # Stability filter (global anti‑flip)
-        global LAST_BIAS, LAST_BIAS_TIME
-        now = time.time()
-        if LAST_BIAS is not None and result["bias"] != LAST_BIAS and (now - LAST_BIAS_TIME) < 1.0:
-            result["bias"] = LAST_BIAS
-            result["reason"] += " | Stability lock (anti-flip)"
-        if result["bias"] in ["LONG", "SHORT"]:
-            LAST_BIAS = result["bias"]
-            LAST_BIAS_TIME = now
 
         return result
 
