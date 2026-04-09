@@ -8974,6 +8974,37 @@ class PresweepMisinterpretationGuard:
         return {"override": False}
 
 
+class FundingExtremeDualTrapOverride:
+    """
+    🔥 PRIORITY -10001.5: Ketika funding rate ekstrem dan dual_liq_trap aktif,
+    ikuti greeks_kill_direction (bukan first_move_direction dari liquidity proximity)
+    
+    Kondisi:
+    - dual_liq_trap aktif (trap_score >= 3)
+    - abs(funding_rate) > 0.003 (funding ekstrem, crowded)
+    - greeks_kill_direction in ("LONG", "SHORT")
+    - volume_ratio < 0.8 (market tipis)
+    
+    Karena funding ekstrem menunjukkan crowding yang sudah pasti, HFT akan eksekusi
+    kill_direction, bukan first_move.
+    """
+    @staticmethod
+    def detect(dual_liq_trap: bool, trap_score: int,
+               funding_rate: float, greeks_kill_direction: str,
+               volume_ratio: float) -> Dict:
+        if (dual_liq_trap and trap_score >= 3 and
+            funding_rate is not None and abs(funding_rate) > 0.003 and
+            greeks_kill_direction in ("LONG", "SHORT") and
+            volume_ratio < 0.8):
+            return {
+                "override": True,
+                "bias": greeks_kill_direction,
+                "reason": f"FUNDING EXTREME DUAL TRAP: funding={funding_rate:.5f} (crowded), dual trap score={trap_score}, kill_direction={greeks_kill_direction} → ikuti kill direction, abaikan first_move",
+                "priority": -10001.5
+            }
+        return {"override": False}
+
+
 class GreeksShortTrapOverride:
     """
     🔥 PRIORITY -9996: Deteksi jebakan Greeks DELTA: SHORT_TRADERS_DIE tapi kondisi bearish
@@ -10488,6 +10519,25 @@ class BinanceAnalyzer:
                 result["_presweep_override"] = True
                 presweep_triggered = True
 
+        # ===== FUNDING EXTREME DUAL TRAP OVERRIDE (PRIORITY -10001.5) =====
+        dual_trap = result.get("dual_liq_trap", {})
+        funding_extreme_override = FundingExtremeDualTrapOverride.detect(
+            dual_liq_trap=dual_trap.get("dual_liq_trap", False),
+            trap_score=dual_trap.get("trap_score", 0),
+            funding_rate=funding_rate_val,
+            greeks_kill_direction=result.get("greeks_kill_direction", ""),
+            volume_ratio=volume_ratio
+        )
+        if funding_extreme_override["override"]:
+            result["bias"] = funding_extreme_override["bias"]
+            result["reason"] = f"[FUNDING EXTREME DUAL TRAP] {funding_extreme_override['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = funding_extreme_override["priority"]
+            result["_funding_extreme_override"] = True
+            # Skip crowded resolver dan dual liq first move
+            presweep_triggered = True  # reuse flag untuk skip
+            vega_fade_triggered = True
+
         # ===== PRIORITY -10001: CROWDED DIRECTION RESOLVER =====
         # Harus dipanggil SETELAH greeks_final_screen karena butuh greeks_delta_crowded
         # Dan hanya jika tidak ada override dari detector priority lebih tinggi
@@ -10825,7 +10875,7 @@ class BinanceAnalyzer:
         override_count = 0
         for key in ['_crowded_override', '_agg_override', '_vega_fade_override', '_presweep_override', 
                     '_post_pump_override', '_funding_obv_override', '_liquidity_extreme_override', 
-                    '_obv_veto_long', '_pump_fake_override', '_greeks_short_trap']:
+                    '_obv_veto_long', '_pump_fake_override', '_greeks_short_trap', '_funding_extreme_override']:
             if result.get(key):
                 override_count += 1
         
