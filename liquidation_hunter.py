@@ -8880,6 +8880,24 @@ class FundingCrowdedOverride:
         return {"override": False}
 
 
+class PumpFakeShortLiqTrap:
+    """
+    🔥 PRIORITY -1104.8: Deteksi pump palsu dengan short liq dekat sebagai umpan
+    Kondisi: short_liq < 1.5%, change_5m > 2%, rsi6 > 70, volume_ratio < 0.7, agg < 0.45
+    HFT membuat short liq dekat untuk memancing LONG, lalu dump.
+    """
+    @staticmethod
+    def detect(short_liq: float, change_5m: float, rsi6: float, volume_ratio: float, agg: float) -> Dict:
+        if (short_liq < 1.5 and change_5m > 2.0 and rsi6 > 70 and volume_ratio < 0.7 and agg < 0.45):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"PUMP FAKE SHORT LIQ TRAP: short_liq={short_liq:.2f}% dekat, price up {change_5m:.1f}%, RSI={rsi6:.1f} overbought, volume {volume_ratio:.2f}x rendah, agg={agg:.2f} sell dominant → HFT jebak LONG, dump imminent",
+                "priority": -1104.8
+            }
+        return {"override": False}
+
+
 class BaitPhaseShortLiqTrap:
     """
     🔥 PRIORITY -1103.8: Deteksi jebakan LONG di BAIT phase
@@ -10186,6 +10204,26 @@ class BinanceAnalyzer:
             result["reason"] = f"[OBV-VOLUME VETO] OBV {obv_trend}, volume {volume_ratio:.2f}x → SHORT override ditolak, paksa LONG | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = -1104.6
+        
+        # ========== PUMP FAKE SHORT LIQ TRAP (LECTURER FIX - NEW DETECTOR) ==========
+        # Priority -1104.8: Deteksi pump palsu dengan short liq dekat sebagai umpan
+        pump_fake_trap = PumpFakeShortLiqTrap.detect(
+            short_liq=short_liq,
+            change_5m=change_5m_val,
+            rsi6=rsi6_val,
+            volume_ratio=volume_ratio,
+            agg=agg_val
+        )
+        if pump_fake_trap["override"]:
+            result["bias"] = pump_fake_trap["bias"]
+            result["reason"] = f"[PUMP FAKE TRAP] {pump_fake_trap['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = pump_fake_trap["priority"]
+            # Matikan squeeze override yang mungkin sudah ada
+            extreme_short_squeeze_result = {"override": False}
+            short_liq_super_close_result = {"override": False}
+            # Tandai agar tidak diproses lebih lanjut oleh override lain
+            result["_pump_fake_override"] = True
         # ========== OBV CONFLICT GUARD (SOLV case) ==========
         # Cek apakah OBV bertentangan keras dengan bias di BAIT phase
         final_bias = result.get("bias", "NEUTRAL")
@@ -10743,7 +10781,8 @@ class BinanceAnalyzer:
         # Hitung jumlah override yang aktif
         override_count = 0
         for key in ['_crowded_override', '_agg_override', '_vega_fade_override', '_presweep_override', 
-                    '_post_pump_override', '_post_pump_override', '_funding_obv_override', '_liquidity_extreme_override', '_obv_veto_long']:
+                    '_post_pump_override', '_funding_obv_override', '_liquidity_extreme_override', 
+                    '_obv_veto_long', '_pump_fake_override']:   # tambahkan _pump_fake_override
             if result.get(key):
                 override_count += 1
         
