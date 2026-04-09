@@ -9907,9 +9907,21 @@ class BinanceAnalyzer:
         self.confirmation_count = 0            # hitungan konfirmasi berturut-turut
         self.confirmation_required = 2         # butuh 2 tick konsisten
 
+        # History untuk AGG persistence (Fix 2)
+        self.agg_history = deque(maxlen=20)   # simpan 20 candle terakhir (1m per candle = 20 menit)
+        self.last_agg_update = 0
+        self.bait_start_time = None   # untuk Time-Weighted Patience Detector (Fix 4)
+
     def __del__(self):
         if hasattr(self, 'ws') and self.ws is not None:
             self.ws.stop()
+
+    def _is_agg_sustained(self, agg_current: float, threshold: float = 0.75, min_period: int = 5) -> bool:
+        """Cek apakah agg >= threshold selama minimal min_period candle terakhir (dalam history)"""
+        if len(self.agg_history) < min_period:
+            return False
+        recent = list(self.agg_history)[-min_period:]
+        return all(a >= threshold for a in recent)
 
     def _is_strong_signal(self, ofi, up_energy, down_energy, change_5m, rsi6) -> bool:
         if (ofi is not None
@@ -10804,6 +10816,8 @@ class BinanceAnalyzer:
                     else:
                         buys += 1
                 agg = safe_div(buys, buys + sells, 0.5)
+                # Fix 2: Simpan agg ke history untuk persistence check
+                self.agg_history.append(agg)
                 flow = agg
             else:
                 agg, flow = 0.5, 0.5
@@ -13119,6 +13133,12 @@ class BinanceAnalyzer:
             }
             phase_result = detect_market_phase(phase_data)
             result = apply_phase_override(result, phase_result)
+
+            # Fix 4: Update bait_start_time untuk Time-Weighted Patience Detector
+            if phase_result.phase == "BAIT" and self.bait_start_time is None:
+                self.bait_start_time = time.time()
+            elif phase_result.phase != "BAIT":
+                self.bait_start_time = None
 
             # ========== GREEKS FINAL SCREENER INTEGRATION ==========
             result = greeks_final_screen(result)
