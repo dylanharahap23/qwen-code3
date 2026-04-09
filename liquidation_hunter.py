@@ -8974,6 +8974,30 @@ class PresweepMisinterpretationGuard:
         return {"override": False}
 
 
+class GreeksShortTrapOverride:
+    """
+    🔥 PRIORITY -9996: Deteksi jebakan Greeks DELTA: SHORT_TRADERS_DIE tapi kondisi bearish
+    Kondisi: greeks_liq_7pct == "SHORT_TRADERS_DIE", agg < 0.4, ofi_bias == "SHORT",
+    volume_ratio < 0.8, rsi6 > 70, change_5m > 3% → HFT distribusi, paksa SHORT
+    """
+    @staticmethod
+    def detect(greeks_liq_7pct: str, agg: float, ofi_bias: str,
+               volume_ratio: float, rsi6: float, change_5m: float) -> Dict:
+        if (greeks_liq_7pct == "SHORT_TRADERS_DIE" and
+            agg < 0.4 and
+            ofi_bias == "SHORT" and
+            volume_ratio < 0.8 and
+            rsi6 > 70 and
+            change_5m > 3.0):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"GREEKS SHORT TRAP: greeks_liq_7pct={greeks_liq_7pct}, agg={agg:.2f} (sell dominant), OFI={ofi_bias}, volume {volume_ratio:.2f}x, RSI {rsi6:.1f} overbought, price up {change_5m:.1f}% → distribution trap, HFT akan dump, force SHORT",
+                "priority": -9996
+            }
+        return {"override": False}
+
+
 class CrowdedDirectionLiquidityResolver:
     """
     KUNCI: delta_crowded + liquidity proximity harus selalu dibaca bersama.
@@ -10205,6 +10229,25 @@ class BinanceAnalyzer:
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = -1104.6
         
+        # ===== GREEKS SHORT TRAP OVERRIDE (PRIORITY -9996) =====
+        greeks_short_trap = GreeksShortTrapOverride.detect(
+            greeks_liq_7pct=result.get("greeks_liq_7pct", ""),
+            agg=agg_val,
+            ofi_bias=result.get("ofi_bias", "NEUTRAL"),
+            volume_ratio=volume_ratio,
+            rsi6=rsi6_val,
+            change_5m=change_5m_val
+        )
+        if greeks_short_trap["override"]:
+            result["bias"] = greeks_short_trap["bias"]
+            result["reason"] = f"[GREEKS SHORT TRAP] {greeks_short_trap['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = greeks_short_trap["priority"]
+            # Matikan override dari Greeks (karena sudah kita override)
+            result["greeks_override"] = False
+            # Tandai agar tidak diproses ulang
+            result["_greeks_short_trap"] = True
+        
         # ========== PUMP FAKE SHORT LIQ TRAP (LECTURER FIX - NEW DETECTOR) ==========
         # Priority -1104.8: Deteksi pump palsu dengan short liq dekat sebagai umpan
         pump_fake_trap = PumpFakeShortLiqTrap.detect(
@@ -10782,7 +10825,7 @@ class BinanceAnalyzer:
         override_count = 0
         for key in ['_crowded_override', '_agg_override', '_vega_fade_override', '_presweep_override', 
                     '_post_pump_override', '_funding_obv_override', '_liquidity_extreme_override', 
-                    '_obv_veto_long', '_pump_fake_override']:   # tambahkan _pump_fake_override
+                    '_obv_veto_long', '_pump_fake_override', '_greeks_short_trap']:
             if result.get(key):
                 override_count += 1
         
