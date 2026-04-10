@@ -9025,6 +9025,98 @@ class CapitulationTrapGuard:
         return {"override": False}
 
 
+# ================= NEW DETECTOR MODULES (LECTURER INTEGRATION) =================
+
+class GreeksKillDirectionHardOverride:
+    """
+    🔥 PRIORITY -10001.8: Jika greeks_kill_direction konsisten dengan who_dies_first,
+    dan berlawanan dengan bias, paksa ke kill_direction.
+    """
+    @staticmethod
+    def detect(kill_direction: str, current_bias: str, who_dies_first: str,
+               kill_speed: float, delta_crowded: str) -> Dict:
+        if who_dies_first in ("BOTH_POSSIBLE", "UNCLEAR", ""):
+            return {"override": False}
+        # Kill SHORT = LONG_TRADERS mati, Kill LONG = SHORT_TRADERS mati
+        kill_consistent = (
+            (kill_direction == "SHORT" and who_dies_first == "LONG_TRADERS") or
+            (kill_direction == "LONG" and who_dies_first == "SHORT_TRADERS")
+        )
+        if not kill_consistent:
+            return {"override": False}
+        if kill_direction != current_bias and kill_speed > 0.5:
+            return {
+                "override": True,
+                "bias": kill_direction,
+                "reason": f"GREEKS KILL HARD OVERRIDE: kill={kill_direction}, who_dies={who_dies_first}, kill_speed={kill_speed:.1f} → paksa ke {kill_direction}",
+                "priority": -10001.8
+            }
+        return {"override": False}
+
+
+class AggBearishShortLiqTrapGuard:
+    """
+    🔥 PRIORITY -10001.6: Ketika agg rendah (<0.4), OFI SHORT kuat, short_liq dekat,
+    dan HFT/Algo SHORT → short_liq adalah umpan LONG, harus SHORT.
+    """
+    @staticmethod
+    def detect(agg: float, ofi_bias: str, ofi_strength: float,
+               short_liq: float, long_liq: float,
+               hft_bias: str, algo_bias: str, change_5m: float) -> Dict:
+        if (agg < 0.4 and ofi_bias == "SHORT" and ofi_strength > 0.6 and
+            short_liq < long_liq and short_liq < 2.0 and
+            (hft_bias == "SHORT" or algo_bias == "SHORT") and
+            change_5m < 1.0):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"AGG BEARISH SHORT LIQ TRAP: agg={agg:.2f} (sell dominant), OFI SHORT {ofi_strength:.2f}, HFT/Algo SHORT → short_liq={short_liq:.2f}% adalah umpan LONG, dump incoming",
+                "priority": -10001.6
+            }
+        return {"override": False}
+
+
+class FundingPositiveShortLiqTrap:
+    """
+    🔥 PRIORITY -10001.7: Funding positif (crowded long) + short_liq dekat + volume rendah
+    → HFT akan dump, force SHORT.
+    """
+    @staticmethod
+    def detect(funding_rate: float, short_liq: float, volume_ratio: float,
+               agg: float, change_5m: float) -> Dict:
+        if funding_rate is None:
+            return {"override": False}
+        if (funding_rate > 0.0002 and short_liq < 1.5 and
+            volume_ratio < 0.7 and agg < 0.7 and change_5m > 0):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"FUNDING POSITIVE SHORT LIQ TRAP: funding={funding_rate:.5f} (crowded long), short_liq={short_liq:.2f}% dekat, volume kering → HFT akan dump, force SHORT",
+                "priority": -10001.7
+            }
+        return {"override": False}
+
+
+class BinanceLongWaitTrap:
+    """
+    🔥 Warning detector (tidak override bias, tapi rekomendasi exit/flip).
+    Memerlukan tracking entry time dan floating PnL di StateManager.
+    """
+    @staticmethod
+    def detect(floating_pnl: float, entry_age_hours: float, funding_rate: float,
+               change_5m: float, rsi6: float) -> Dict:
+        if (floating_pnl < -2.0 and entry_age_hours > 2.0 and
+            abs(change_5m) < 0.5 and funding_rate is not None and
+            funding_rate > -0.0001):
+            return {
+                "warning": True,
+                "action": "EXIT_OR_FLIP_SHORT",
+                "reason": f"BINANCE LONG WAIT TRAP: floating {floating_pnl:.1f}%, {entry_age_hours:.1f}h elapsed, price stuck, funding={funding_rate:.5f} → Binance menunggu long kelelahan sebelum dump",
+                "priority": -10001.5
+            }
+        return {"warning": False}
+
+
 class GreeksShortTrapOverride:
     """
     🔥 PRIORITY -9996: Deteksi jebakan Greeks DELTA: SHORT_TRADERS_DIE tapi kondisi bearish
@@ -9067,7 +9159,33 @@ class CrowdedDirectionLiquidityResolver:
                rsi6: float, change_5m: float,
                who_dies_first: str, greeks_kill_direction: str,
                funding_rate: float = 0.0, obv_trend: str = "NEUTRAL",
-               vega_active: bool = False) -> Dict:
+               vega_active: bool = False,
+               kill_speed: float = 0.0) -> Dict:   # tambahkan parameter kill_speed
+        
+        # 🔥 GUARD BARU: Jika greeks_kill_direction sudah jelas dan konsisten,
+        # trust Greeks bukan proximity (prioritas lebih tinggi dari Case A/B)
+        if (greeks_kill_direction in ("LONG", "SHORT") and
+            who_dies_first not in ("BOTH_POSSIBLE", "UNCLEAR", "") and
+            kill_speed > 1.0):
+            return {
+                "override": True,
+                "bias": greeks_kill_direction,
+                "reason": f"CROWDED RESOLVER: greeks kill={greeks_kill_direction} clear (who_dies={who_dies_first}, speed={kill_speed:.1f}) → trust Greeks over proximity",
+                "priority": -10001
+            }
+        
+        # Jika kill_direction jelas meskipun who_dies masih BOTH_POSSIBLE,
+        # dan kill_speed > 0.5, trust kill_direction
+        if (greeks_kill_direction in ("LONG", "SHORT") and
+            kill_speed > 0.5 and
+            ((greeks_kill_direction == "SHORT" and short_liq < long_liq) or
+             (greeks_kill_direction == "LONG" and long_liq < short_liq))):
+            return {
+                "override": True,
+                "bias": greeks_kill_direction,
+                "reason": f"CROWDED RESOLVER: kill_direction={greeks_kill_direction} clear despite BOTH_POSSIBLE, kill_speed={kill_speed:.1f} → trust Greeks",
+                "priority": -10001
+            }
         
         # 🔥 FIX 2: GUARD - Jangan override jika Vega aktif (BAIT phase) dan volume rendah
         # Karena di BAIT phase, arah sebenarnya adalah fade (kebalikan dari move)
@@ -10299,6 +10417,53 @@ class BinanceAnalyzer:
             extreme_oversold_bounce = {"override": False}
             result["_capitulation_trap"] = True
 
+        # ===== GREEKS KILL HARD OVERRIDE (PRIORITY -10001.8) =====
+        kill_override = GreeksKillDirectionHardOverride.detect(
+            kill_direction=result.get("greeks_kill_direction", ""),
+            current_bias=result.get("bias", "NEUTRAL"),
+            who_dies_first=result.get("greeks_who_dies_first", ""),
+            kill_speed=result.get("greeks_kill_speed", 0.0),
+            delta_crowded=result.get("greeks_delta_crowded", "")
+        )
+        if kill_override["override"]:
+            result["bias"] = kill_override["bias"]
+            result["reason"] = f"[GREEKS KILL OVERRIDE] {kill_override['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = kill_override["priority"]
+            # Matikan crowded resolver dan override lainnya
+            result["_kill_override"] = True
+
+        # ===== AGG BEARISH SHORT LIQ TRAP (PRIORITY -10001.6) =====
+        agg_bearish_trap = AggBearishShortLiqTrapGuard.detect(
+            agg=agg_val,
+            ofi_bias=result.get("ofi_bias", "NEUTRAL"),
+            ofi_strength=result.get("ofi_strength", 0.0),
+            short_liq=short_liq,
+            long_liq=long_liq,
+            hft_bias=result.get("hft_6pct_bias", "NEUTRAL"),
+            algo_bias=result.get("algo_type_bias", "NEUTRAL"),
+            change_5m=change_5m_val
+        )
+        if agg_bearish_trap["override"]:
+            result["bias"] = agg_bearish_trap["bias"]
+            result["reason"] = f"[AGG BEARISH TRAP] {agg_bearish_trap['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = agg_bearish_trap["priority"]
+
+        # ===== FUNDING POSITIVE SHORT LIQ TRAP (PRIORITY -10001.7) =====
+        funding_trap = FundingPositiveShortLiqTrap.detect(
+            funding_rate=funding_rate_val,
+            short_liq=short_liq,
+            volume_ratio=volume_ratio,
+            agg=agg_val,
+            change_5m=change_5m_val
+        )
+        if funding_trap["override"]:
+            result["bias"] = funding_trap["bias"]
+            result["reason"] = f"[FUNDING POSITIVE TRAP] {funding_trap['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = funding_trap["priority"]
+
         # ===== GREEKS SHORT TRAP OVERRIDE (PRIORITY -9996) =====
         greeks_short_trap = GreeksShortTrapOverride.detect(
             greeks_liq_7pct=result.get("greeks_liq_7pct", ""),
@@ -10595,7 +10760,8 @@ class BinanceAnalyzer:
                 greeks_kill_direction=result.get("greeks_kill_direction", ""),
                 funding_rate=funding_rate_val,
                 obv_trend=result.get("obv_trend", "NEUTRAL"),
-                vega_active=vega_active  # FIX 2: Pass vega_active parameter
+                vega_active=vega_active,  # FIX 2: Pass vega_active parameter
+                kill_speed=result.get("greeks_kill_speed", 0.0)  # NEW: pass kill_speed
             )
             if crowded_resolver["override"]:
                 result["bias"] = crowded_resolver["bias"]
@@ -10857,9 +11023,15 @@ class BinanceAnalyzer:
             
             # Priority -1103: ExtremeShortLiqSqueezeOverride
             elif extreme_short_squeeze_result.get("override", False):
-                result["bias"] = extreme_short_squeeze_result["bias"]
-                result["reason"] = f"[EXTREME SHORT LIQ SQUEEZE] {extreme_short_squeeze_result['reason']} | " + result.get("reason", "")
-                result["priority_level"] = extreme_short_squeeze_result.get("priority", -1103)
+                # ===== GUARD: Vega + Dual Trap Block untuk ExtremeShortLiqSqueeze =====
+                if (result.get("greeks_vega_active") and
+                    result.get("dual_liq_trap", {}).get("trap_score", 0) >= 4):
+                    extreme_short_squeeze_result = {"override": False}
+                    result["reason"] = f"[VEGA+DUAL TRAP BLOCK] ExtremeShortLiqSqueeze dibatalkan karena Vega aktif + dual trap score={result['dual_liq_trap']['trap_score']}/5 | " + result.get("reason", "")
+                else:
+                    result["bias"] = extreme_short_squeeze_result["bias"]
+                    result["reason"] = f"[EXTREME SHORT LIQ SQUEEZE] {extreme_short_squeeze_result['reason']} | " + result.get("reason", "")
+                    result["priority_level"] = extreme_short_squeeze_result.get("priority", -1103)
             
             # Priority -1102: EmptyBookSqueezeContinuation
             elif empty_book_squeeze_result.get("override", False):
@@ -13175,6 +13347,21 @@ class BinanceAnalyzer:
 
             # ========== Compute floating PnL ===========
             floating_pnl = self.state_mgr.get_floating_pnl_pct(price)
+
+            # ===== LONG WAIT TRAP (WARNING) =====
+            if self.state_mgr.last_entry_time > 0:
+                entry_age_hours = (time.time() - self.state_mgr.last_entry_time) / 3600.0
+                long_wait = BinanceLongWaitTrap.detect(
+                    floating_pnl=floating_pnl,
+                    entry_age_hours=entry_age_hours,
+                    funding_rate=funding_rate,
+                    change_5m=change_5m,
+                    rsi6=rsi6
+                )
+                if long_wait["warning"]:
+                    result["long_wait_warning"] = long_wait
+                    # Tidak mengubah bias, hanya menambahkan warning di output
+                    final_reason += f" | ⚠️ {long_wait['reason']}"
 
             # ========== FIXED Volume Filter: Jangan reverse jika bias sudah searah liquidity atau sinyal HFT/Algo kuat ==========
             if final_bias in ["LONG", "SHORT"] and len(volumes_1m) >= 10:
