@@ -9008,18 +9008,42 @@ class FundingExtremeDualTrapOverride:
 class CapitulationTrapGuard:
     """
     🔥 PRIORITY -1104.95: Deteksi jebakan capitulation bottom palsu
-    Kondisi: RSI6 < 15, long_liq < 2.0%, change_5m < -2.5%, OBV NEGATIVE_EXTREME, volume_ratio < 0.7
+    Kondisi: RSI6 < 15, long_liq < 2.0%, change_5m < -1.5%, OBV NEGATIVE_EXTREME, volume_ratio < 0.7
     HFT membuat long liq dekat untuk memancing LONG, tapi distribusi masih aktif → dump lanjut
     """
     @staticmethod
     def detect(rsi6: float, long_liq: float, change_5m: float,
                obv_trend: str, volume_ratio: float) -> Dict:
-        if (rsi6 < 15 and long_liq < 2.0 and change_5m < -2.5 and
+        if (rsi6 < 15 and long_liq < 2.0 and change_5m < -1.5 and
             obv_trend == "NEGATIVE_EXTREME" and volume_ratio < 0.7):
             return {
                 "override": True,
                 "bias": "SHORT",
                 "reason": f"CAPITULATION TRAP GUARD: RSI6={rsi6:.1f} capitulation, long_liq={long_liq:.2f}% dekat, price down {change_5m:.1f}%, OBV {obv_trend}, volume {volume_ratio:.2f}x kering → distribusi masih aktif, dump lanjut, force SHORT",
+                "priority": -1104.95
+            }
+        return {"override": False}
+
+
+class ExtremeCapitulationBounceGuard:
+    """
+    🔥 PRIORITY -1104.95: Deteksi capitulation bottom dengan RSI < 5, long_liq < 1.5%,
+    OBV NEGATIVE_EXTREME, volume kering → paksa LONG meskipun change_5m tidak terlalu besar.
+    Mengatasi kasus RAVEUSDT di mana RSI=1.1 tapi change_5m hanya -2.11%.
+    """
+    @staticmethod
+    def detect(rsi6: float, long_liq: float, obv_trend: str,
+               volume_ratio: float, change_5m: float) -> Dict:
+        # Kondisi: RSI sangat oversold, long liq super dekat, OBV negatif ekstrem, volume rendah
+        if (rsi6 < 5 and
+            long_liq < 1.5 and
+            obv_trend == "NEGATIVE_EXTREME" and
+            volume_ratio < 0.8 and
+            change_5m < 0):  # harga sedang turun (tidak perlu -2.5)
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": f"EXTREME CAPITULATION BOUNCE: RSI6={rsi6:.1f} (<5), long_liq={long_liq:.2f}% dekat, OBV {obv_trend}, volume {volume_ratio:.2f}x → capitulation bottom, bounce imminent, force LONG",
                 "priority": -1104.95
             }
         return {"override": False}
@@ -10417,6 +10441,22 @@ class BinanceAnalyzer:
             extreme_oversold_bounce = {"override": False}
             result["_capitulation_trap"] = True
 
+        # ===== EXTREME CAPITULATION BOUNCE GUARD (PRIORITY -1104.95) =====
+        extreme_capitulation = ExtremeCapitulationBounceGuard.detect(
+            rsi6=rsi6_val,
+            long_liq=long_liq,
+            obv_trend=result.get("obv_trend", "NEUTRAL"),
+            volume_ratio=volume_ratio,
+            change_5m=change_5m_val
+        )
+        if extreme_capitulation["override"]:
+            result["bias"] = extreme_capitulation["bias"]
+            result["reason"] = f"[EXTREME CAPITULATION] {extreme_capitulation['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = extreme_capitulation["priority"]
+            # Matikan override lain yang memaksa SHORT
+            result["_extreme_capitulation"] = True
+
         # ===== GREEKS KILL HARD OVERRIDE (PRIORITY -10001.8) =====
         kill_override = GreeksKillDirectionHardOverride.detect(
             kill_direction=result.get("greeks_kill_direction", ""),
@@ -11086,7 +11126,8 @@ class BinanceAnalyzer:
         override_count = 0
         for key in ['_crowded_override', '_agg_override', '_vega_fade_override', '_presweep_override', 
                     '_post_pump_override', '_funding_obv_override', '_liquidity_extreme_override', 
-                    '_obv_veto_long', '_pump_fake_override', '_greeks_short_trap', '_funding_extreme_override', '_capitulation_trap']:
+                    '_obv_veto_long', '_pump_fake_override', '_greeks_short_trap', '_funding_extreme_override', '_capitulation_trap', 
+                    '_extreme_capitulation']:
             if result.get(key):
                 override_count += 1
         
