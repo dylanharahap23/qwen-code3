@@ -9131,6 +9131,256 @@ class FundingExtremeDualTrapOverride:
         return {"override": False}
 
 
+# ================================================================
+# 🔥 LECTURER'S SARAN LOGIC - EXHAUSTED SQUEEZE & FAKE PUMP DETECTORS
+# ================================================================
+
+class ExhaustedSqueezePostSweep:
+    """
+    🔥 RAVEUSDT EXACT PATTERN: Short liq sudah tersapu tapi sistem masih LONG
+    
+    Tanda short liq sudah tersapu:
+    - change_5m > short_liq (harga sudah melewati target)
+    - RSI6 > 90 (overbought ekstrem = semua short sudah liquidated)
+    - OBV tidak POSITIVE_EXTREME (tidak ada accumulation nyata)
+    - Volume rendah (<0.9x) = tidak ada buyer baru
+    
+    Setelah short liq tersapu → tidak ada target lagi di atas
+    → HFT PASTI akan dump untuk ambil long liq
+    
+    Priority: -10010 (TERTINGGI ABSOLUT - di atas semua detector)
+    """
+    @staticmethod
+    def detect(change_5m: float, short_liq: float, rsi6: float,
+               obv_trend: str, volume_ratio: float,
+               rsi6_5m: float, long_liq: float,
+               funding_rate: float = 0.0) -> dict:
+        
+        # Core: harga sudah melewati short liq target
+        sweep_completed = change_5m >= short_liq * 0.7  # 70% dari jarak = sudah dekat/lewat
+        
+        if not sweep_completed:
+            return {"override": False}
+        
+        # Konfirmasi RSI overbought ekstrem (short sudah mati)
+        rsi_extreme = rsi6 > 90 or rsi6_5m > 85
+        
+        # OBV tidak confirm (pump palsu, tidak ada akumulasi nyata)
+        obv_not_confirm = obv_trend not in ("POSITIVE_EXTREME",)
+        
+        # Volume rendah (tidak ada buyer baru yang masuk)
+        low_volume = volume_ratio < 0.9
+        
+        # Semua kondisi terpenuhi
+        if sweep_completed and rsi_extreme and obv_not_confirm and low_volume:
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"EXHAUSTED SQUEEZE POST-SWEEP: change={change_5m:.1f}% >= "
+                    f"short_liq={short_liq:.1f}% (sweep completed), "
+                    f"RSI6={rsi6:.1f} extreme overbought, OBV={obv_trend} "
+                    f"(no accumulation), volume={volume_ratio:.2f}x → "
+                    f"short stops already swept, HFT will DUMP to collect long liq "
+                    f"at -{long_liq:.1f}%"
+                ),
+                "priority": -10010
+            }
+        
+        return {"override": False}
+
+
+class LowVolumeFakePumpTrap:
+    """
+    🔥 BULLAUSDT EXACT PATTERN: Pump besar dengan volume kering = SELALU fake
+    
+    HFT logic:
+    1. Pump harga 4-8% dengan volume sangat rendah (0.3-0.5x)
+    2. RSI 1m naik tinggi (>60) tapi RSI 5m masih rendah (<40) → divergence
+    3. Retail yang lihat RSI 1m tinggi + harga pump → masuk LONG
+    4. Setelah LONG terisi → HFT dump
+    
+    Key insight: Pump yang nyata SELALU disertai volume tinggi.
+    Pump dengan volume rendah = HFT menggerakkan harga murah untuk jebak retail.
+    
+    Bukti dari BULLAUSDT:
+    - change_5m: +4.85% (pump signifikan)
+    - volume_ratio: 0.37x (SANGAT rendah)
+    - RSI6(1m): 60 vs RSI6(5m): 34.2 → divergence 25.8 poin
+    - Hasil: SHORT 8% setelah sinyal LONG
+    
+    Priority: -10009 (di bawah ExhaustedSqueeze -10010)
+    """
+    @staticmethod
+    def detect(change_5m: float, volume_ratio: float,
+               rsi6: float, rsi6_5m: float,
+               short_liq: float, long_liq: float,
+               obv_trend: str, funding_rate: float = 0.0,
+               dual_liq_trap: bool = False) -> dict:
+        
+        # Core: pump besar dengan volume sangat rendah
+        big_pump_low_vol = change_5m > 3.5 and volume_ratio < 0.55
+        
+        if not big_pump_low_vol:
+            return {"override": False}
+        
+        # RSI divergence: 1m overbought tapi 5m masih rendah/netral
+        rsi_divergence = rsi6 - rsi6_5m > 15  # divergence lebih dari 15 poin
+        
+        # OBV tidak konfirmasi (volume rendah berarti OBV tidak bisa ekstrem positif dengan benar)
+        obv_weak = obv_trend not in ("POSITIVE_EXTREME", "POSITIVE")
+        
+        # Funding tidak sangat negatif (jika sangat negatif, mungkin genuine squeeze)
+        not_genuine_squeeze = funding_rate is None or funding_rate > -0.005
+        
+        # Dual liq trap aktif = semakin berbahaya
+        trap_confirmed = dual_liq_trap or (short_liq < 8.0 and long_liq < 8.0)
+        
+        if big_pump_low_vol and (rsi_divergence or obv_weak) and not_genuine_squeeze:
+            confidence_level = "HIGH" if rsi_divergence and obv_weak else "MODERATE"
+            
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"LOW VOLUME FAKE PUMP TRAP: pump {change_5m:.1f}% dengan "
+                    f"volume {volume_ratio:.2f}x (sangat rendah), "
+                    f"RSI divergence 1m={rsi6:.1f} vs 5m={rsi6_5m:.1f} "
+                    f"(gap {rsi6-rsi6_5m:.1f} poin), OBV={obv_trend} → "
+                    f"HFT spoof pump untuk jebak LONG retail, dump imminent. "
+                    f"Confidence: {confidence_level}"
+                ),
+                "priority": -10009
+            }
+        
+        return {"override": False}
+
+
+class OBVPumpDivergenceFilter:
+    """
+    🔥 OBV NEUTRAL/NEGATIF saat pump besar = distribusi terselubung
+    
+    Pump nyata: harga naik + OBV naik (volume beli nyata)
+    Pump palsu: harga naik + OBV NEUTRAL/NEGATIF (tidak ada volume beli nyata)
+    
+    RAVEUSDT: change_5m=+7.06%, OBV=NEUTRAL → pump palsu
+    BULLAUSDT: change_5m=+4.85%, OBV=POSITIVE_EXTREME tapi volume=0.37x 
+               → OBV positif palsu karena volume rendah
+    
+    Priority: -10008.5
+    """
+    @staticmethod
+    def detect(change_5m: float, obv_trend: str, volume_ratio: float,
+               rsi6: float, short_liq: float,
+               latest_volume: float, volume_ma10: float) -> dict:
+        
+        if volume_ma10 <= 0:
+            return {"override": False}
+        
+        vol_spike = latest_volume / volume_ma10
+        
+        # Pump besar tapi OBV tidak mengkonfirmasi
+        pump_without_obv = (
+            change_5m > 5.0 and
+            obv_trend in ("NEUTRAL", "NEGATIVE", "NEGATIVE_EXTREME") and
+            volume_ratio < 0.9
+        )
+        
+        # OBV "positif" tapi volume terlalu rendah = OBV palsu
+        # (OBV bisa positif dengan volume kecil jika harga naik terus)
+        fake_obv_positive = (
+            change_5m > 4.0 and
+            obv_trend == "POSITIVE_EXTREME" and
+            volume_ratio < 0.5 and  # volume sangat rendah
+            vol_spike < 1.5  # tidak ada volume spike nyata
+        )
+        
+        if pump_without_obv:
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"OBV-PUMP DIVERGENCE: pump {change_5m:.1f}% tapi OBV={obv_trend} "
+                    f"(tidak confirm), volume={volume_ratio:.2f}x → "
+                    f"tidak ada buying pressure nyata, pump palsu, dump imminent"
+                ),
+                "priority": -10008
+            }
+        
+        if fake_obv_positive:
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"FAKE OBV POSITIVE: OBV={obv_trend} tapi volume={volume_ratio:.2f}x "
+                    f"sangat rendah, vol_spike={vol_spike:.1f}x → "
+                    f"OBV naik karena harga naik bukan karena volume beli nyata, "
+                    f"pump={change_5m:.1f}% adalah HFT manipulation"
+                ),
+                "priority": -10008
+            }
+        
+        return {"override": False}
+
+
+class RSIDivergenceHighMomentumTrap:
+    """
+    🔥 RSI 1m vs 5m divergence ekstrem saat pump = sinyal paling kuat bahwa pump akan balik
+    
+    Logic:
+    - RSI 1m tinggi (>55) = harga baru saja naik cepat di timeframe pendek
+    - RSI 5m rendah (<40) = trend jangka menengah masih turun
+    - Gap > 20 poin = divergence ekstrem = reversal sangat mungkin
+    
+    Ini adalah "dead cat bounce" detector yang lebih sensitif.
+    
+    BULLAUSDT exact: RSI6(1m)=60 vs RSI6(5m)=34.2 → gap 25.8 → LONG (SALAH)
+    Harusnya: gap > 20 dengan pump > 3% dan volume rendah = SHORT
+    
+    Priority: -10007.5
+    """
+    @staticmethod
+    def detect(rsi6: float, rsi6_5m: float, change_5m: float,
+               volume_ratio: float, short_liq: float,
+               long_liq: float, obv_trend: str) -> dict:
+        
+        rsi_gap = rsi6 - rsi6_5m
+        
+        # Divergence ekstrem: 1m jauh lebih tinggi dari 5m saat pump
+        extreme_divergence = (
+            rsi_gap > 20 and
+            rsi6 > 55 and
+            rsi6_5m < 45 and
+            change_5m > 3.0 and
+            volume_ratio < 0.7
+        )
+        
+        if not extreme_divergence:
+            return {"override": False}
+        
+        # Konfirmasi: OBV tidak support pump
+        obv_weak = obv_trend not in ("POSITIVE_EXTREME", "POSITIVE")
+        
+        # Konfirmasi: long liq lebih dekat atau sebanding (ada target dump)
+        liq_target_exists = long_liq < short_liq * 2.0 or long_liq < 10.0
+        
+        if extreme_divergence and (obv_weak or liq_target_exists):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"RSI DIVERGENCE HIGH MOMENTUM TRAP: RSI1m={rsi6:.1f} vs "
+                    f"RSI5m={rsi6_5m:.1f} (gap={rsi_gap:.1f} poin > 20), "
+                    f"pump={change_5m:.1f}% dengan volume={volume_ratio:.2f}x → "
+                    f"dead cat bounce, trend 5m lebih dominan, "
+                    f"OBV={obv_trend}, long_liq={long_liq:.2f}% → SHORT"
+                ),
+                "priority": -10007
+            }
+        
+        return {"override": False}
+
+
 class CapitulationTrapGuard:
     """
     🔥 PRIORITY -1104.95: Deteksi jebakan capitulation bottom palsu
@@ -10618,6 +10868,80 @@ class BinanceAnalyzer:
             result["reason"] = f"[OBV-VOLUME VETO] OBV {obv_trend}, volume {volume_ratio:.2f}x → SHORT override ditolak, paksa LONG | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = -1104.6
+        
+        # ===== PRIORITY -10010: EXHAUSTED SQUEEZE POST-SWEEP (TERTINGGI ABSOLUT) =====
+        exhausted_sweep = ExhaustedSqueezePostSweep.detect(
+            change_5m=change_5m_val,
+            short_liq=short_liq,
+            rsi6=rsi6_val,
+            obv_trend=result.get("obv_trend", "NEUTRAL"),
+            volume_ratio=volume_ratio,
+            rsi6_5m=result.get("rsi6_5m", 50.0),
+            long_liq=long_liq,
+            funding_rate=funding_rate_val or 0.0
+        )
+        if exhausted_sweep["override"]:
+            result["bias"] = exhausted_sweep["bias"]
+            result["reason"] = f"[EXHAUSTED SWEEP] {exhausted_sweep['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = exhausted_sweep["priority"]
+            result["_exhausted_sweep"] = True
+            return result  # Hard return, tidak ada yang bisa override ini
+        
+        # ===== PRIORITY -10009: LOW VOLUME FAKE PUMP TRAP =====
+        dual_trap_data = result.get("dual_liq_trap", {})
+        fake_pump = LowVolumeFakePumpTrap.detect(
+            change_5m=change_5m_val,
+            volume_ratio=volume_ratio,
+            rsi6=rsi6_val,
+            rsi6_5m=result.get("rsi6_5m", 50.0),
+            short_liq=short_liq,
+            long_liq=long_liq,
+            obv_trend=result.get("obv_trend", "NEUTRAL"),
+            funding_rate=funding_rate_val or 0.0,
+            dual_liq_trap=dual_trap_data.get("dual_liq_trap", False)
+        )
+        if fake_pump["override"] and not result.get("_exhausted_sweep"):
+            result["bias"] = fake_pump["bias"]
+            result["reason"] = f"[FAKE PUMP TRAP] {fake_pump['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = fake_pump["priority"]
+            result["_fake_pump"] = True
+        
+        # ===== PRIORITY -10008: OBV-PUMP DIVERGENCE =====
+        if not result.get("_exhausted_sweep") and not result.get("_fake_pump"):
+            obv_pump_div = OBVPumpDivergenceFilter.detect(
+                change_5m=change_5m_val,
+                obv_trend=result.get("obv_trend", "NEUTRAL"),
+                volume_ratio=volume_ratio,
+                rsi6=rsi6_val,
+                short_liq=short_liq,
+                latest_volume=result.get("latest_volume", 0),
+                volume_ma10=result.get("volume_ma10", 1)
+            )
+            if obv_pump_div["override"]:
+                result["bias"] = obv_pump_div["bias"]
+                result["reason"] = f"[OBV PUMP DIV] {obv_pump_div['reason']} | " + result.get("reason", "")
+                result["confidence"] = "ABSOLUTE"
+                result["priority_level"] = obv_pump_div["priority"]
+                result["_obv_pump_div"] = True
+        
+        # ===== PRIORITY -10007: RSI DIVERGENCE MOMENTUM TRAP =====
+        if not any(result.get(k) for k in ["_exhausted_sweep", "_fake_pump", "_obv_pump_div"]):
+            rsi_div_trap = RSIDivergenceHighMomentumTrap.detect(
+                rsi6=rsi6_val,
+                rsi6_5m=result.get("rsi6_5m", 50.0),
+                change_5m=change_5m_val,
+                volume_ratio=volume_ratio,
+                short_liq=short_liq,
+                long_liq=long_liq,
+                obv_trend=result.get("obv_trend", "NEUTRAL")
+            )
+            if rsi_div_trap["override"]:
+                result["bias"] = rsi_div_trap["bias"]
+                result["reason"] = f"[RSI DIV TRAP] {rsi_div_trap['reason']} | " + result.get("reason", "")
+                result["confidence"] = "ABSOLUTE"
+                result["priority_level"] = rsi_div_trap["priority"]
         
         # ===== CAPITULATION TRAP GUARD (PRIORITY -1104.95) =====
         capitulation_trap = CapitulationTrapGuard.detect(
