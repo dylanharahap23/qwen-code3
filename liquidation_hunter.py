@@ -2271,6 +2271,42 @@ class ExtremeOverboughtVolumeDryReversal:
         return {"override": False}
 
 
+class OverboughtOBVDivergenceTrap:
+    """
+    🔥 OVERBOUGHT + OBV NEGATIVE EXTREME + VOLUME DRY = DISTRIBUTION TRAP
+    Priority -10006 (TERTINGGI, di atas CrowdedResolver -10001)
+    Memaksa SHORT ketika overbought ekstrem tapi OBV negatif (smart money jual).
+    Overrides semua sinyal squeeze karena ini adalah blow-off top dengan distribusi.
+    """
+    @staticmethod
+    def detect(rsi6_5m: float, volume_ratio: float, obv_trend: str,
+               short_liq: float, change_5m: float,
+               funding_rate: float = 0.0, gamma_intensity: str = "LOW",
+               kill_speed: float = 0.0) -> Dict:
+        if funding_rate is None:
+            funding_rate = 0.0
+        
+        # Jangan override jika squeeze nyata (crowded short atau gamma extreme)
+        if funding_rate < -0.003:
+            return {"override": False}
+        if gamma_intensity == "EXTREME" and kill_speed > 5.0:
+            return {"override": False}
+        
+        # Kondisi distribution trap
+        if (rsi6_5m > 85 and
+            volume_ratio < 0.7 and
+            obv_trend == "NEGATIVE_EXTREME" and
+            short_liq < 2.0 and
+            change_5m > 1.5):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"OVERBOUGHT OBV DIVERGENCE TRAP: RSI5m={rsi6_5m:.1f}>85, volume={volume_ratio:.2f}x kering, OBV {obv_trend} (smart money jual), short_liq={short_liq:.2f}% umpan → distribution trap, forced SHORT",
+                "priority": -10006
+            }
+        return {"override": False}
+
+
 class PostSqueezeReversal:
     """
     🔥 MENDETEKSI AKHIR SQUEEZE: Harga sudah melewati target likuiditas
@@ -10900,6 +10936,27 @@ class BinanceAnalyzer:
             result["_capitulation_override"] = True
             # Skip semua detector dengan priority lebih rendah
             presweep_triggered = True  # reuse flag untuk skip crowded resolver
+
+        # ===== PRIORITY -10006: OVERBOUGHT OBV DIVERGENCE TRAP =====
+        # Letakkan SEBELUM CrowdedDirectionLiquidityResolver (-10001) dan DualLiqFirstMoveFollower (-10000)
+        obv_div_trap = OverboughtOBVDivergenceTrap.detect(
+            rsi6_5m=result.get("rsi6_5m", 0),
+            volume_ratio=volume_ratio,
+            obv_trend=result.get("obv_trend", "NEUTRAL"),
+            short_liq=short_liq,
+            change_5m=change_5m_val,
+            funding_rate=funding_rate_val,
+            gamma_intensity=result.get("greeks_gamma_intensity", "LOW"),
+            kill_speed=result.get("greeks_kill_speed", 0)
+        )
+        if obv_div_trap["override"]:
+            result["bias"] = obv_div_trap["bias"]
+            result["reason"] = f"[OBV DIV TRAP] {obv_div_trap['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = obv_div_trap["priority"]
+            result["_obv_div_trap"] = True
+            # Skip semua detector dengan priority lebih rendah (crowded resolver, dll)
+            presweep_triggered = True  # reuse flag untuk skip
 
         # ===== PRIORITY -10001: CROWDED DIRECTION RESOLVER =====
         # Harus dipanggil SETELAH greeks_final_screen karena butuh greeks_delta_crowded
