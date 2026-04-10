@@ -10313,6 +10313,10 @@ class BinanceAnalyzer:
         # ========== AMBIL SEMUA VARIABEL YANG DIPERLUKAN DI AWAL METHOD ==========
         short_liq = result.get("short_liq", 99.0)
         long_liq = result.get("long_liq", 99.0)
+        
+        # FIX: Definisi dictionary liq untuk kompatibilitas dengan detector yang masih menggunakan liq["..."]
+        liq = {"short_dist": short_liq, "long_dist": long_liq}
+        
         agg_val = result.get("agg", 0.5)
         ofi_bias = result.get("ofi_bias", "NEUTRAL")
         ofi_strength = result.get("ofi_strength", 0.0)
