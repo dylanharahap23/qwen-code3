@@ -9415,6 +9415,33 @@ class FakeShortSqueezeTrap:
         return {"override": False}
 
 
+class CapitulationBottomReversal:
+    """
+    🔥 CAPITULATION BOTTOM REVERSAL – Priority -10004
+    Memaksa LONG ketika long_liq sangat dekat, harga sudah turun drastis,
+    volume kering, tidak ada seller, tapi ada pembeli (retail capitulation).
+    Ini adalah setup "sweep long stop lalu pump".
+    """
+    @staticmethod
+    def detect(long_liq: float, change_5m: float, rsi6: float,
+               volume_ratio: float, down_energy: float, agg: float,
+               obv_trend: str) -> Dict:
+        if (long_liq < 1.5 and
+            change_5m < -3.0 and
+            rsi6 < 30 and
+            volume_ratio < 0.8 and
+            down_energy < 0.1 and
+            agg > 0.6 and
+            obv_trend in ("NEGATIVE_EXTREME", "NEGATIVE")):
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": f"CAPITULATION BOTTOM REVERSAL: long_liq={long_liq:.2f}% super close, price dropped {change_5m:.1f}%, RSI {rsi6:.1f} oversold, volume {volume_ratio:.2f}x dry, down_energy=0, agg={agg:.2f} buyers stepping in → HFT will sweep long stops then pump",
+                "priority": -10004
+            }
+        return {"override": False}
+
+
 class DualLiqFirstMoveFollower:
     """
     Ketika dual_liq_trap aktif, sistem sudah tahu first_move_direction.
@@ -10584,11 +10611,13 @@ class BinanceAnalyzer:
             result["_pump_fake_override"] = True
         # ========== OBV CONFLICT GUARD (SOLV case) ==========
         # Cek apakah OBV bertentangan keras dengan bias di BAIT phase
+        # EXCEPTION: Skip untuk Capitulation Bottom Reversal override
         final_bias = result.get("bias", "NEUTRAL")
-        if _check_obv_conflict(result, final_bias) and market_phase == "BAIT":
-            entry_ok = False
-            result["reason"] += f" | OBV CONFLICT IN BAIT PHASE — high risk of trap (bias={final_bias}, obv={result.get('obv_trend', 'N/A')})"
-        
+        if not result.get("_capitulation_override", False):
+            if _check_obv_conflict(result, final_bias) and market_phase == "BAIT":
+                entry_ok = False
+                result["reason"] += f" | OBV CONFLICT IN BAIT PHASE — high risk of trap (bias={final_bias}, obv={result.get('obv_trend', 'N/A')})"
+
         # ========== FILTER 5: Entry Filter + Delayed Entry Logic ==========
         # Tambahkan rekomendasi entry berdasarkan phase + delayed entry system
         kill_check = _check_kill_confirmation(result)
@@ -10821,6 +10850,25 @@ class BinanceAnalyzer:
             # Skip crowded resolver dan dual liq first move
             presweep_triggered = True  # reuse flag untuk skip
             vega_fade_triggered = True
+
+        # ===== PRIORITY -10004: CAPITULATION BOTTOM REVERSAL =====
+        capitulation = CapitulationBottomReversal.detect(
+            long_liq=liq["long_dist"],
+            change_5m=change_5m_val,
+            rsi6=rsi6_val,
+            volume_ratio=volume_ratio,
+            down_energy=down_energy_val,
+            agg=agg_val,
+            obv_trend=result.get("obv_trend", "NEUTRAL")
+        )
+        if capitulation["override"]:
+            result["bias"] = capitulation["bias"]
+            result["reason"] = f"[CAPITULATION BOTTOM REVERSAL] {capitulation['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = capitulation["priority"]
+            result["_capitulation_override"] = True
+            # Skip semua detector dengan priority lebih rendah
+            presweep_triggered = True  # reuse flag untuk skip crowded resolver
 
         # ===== PRIORITY -10001: CROWDED DIRECTION RESOLVER =====
         # Harus dipanggil SETELAH greeks_final_screen karena butuh greeks_delta_crowded
