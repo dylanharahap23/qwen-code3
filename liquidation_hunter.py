@@ -2244,6 +2244,33 @@ class LiquidityProximityAbsolute:
 
 # ========== END LIQUIDITY EXTREME OVERRIDE DETECTORS ==========
 
+class ExtremeOverboughtVolumeDryReversal:
+    """
+    🔥 EXTREME OVERBOUGHT + VOLUME DRY + CROWDED LONG = BLOW-OFF TOP REVERSAL
+    Priority -10005 (TERTINGGI, di atas CrowdedResolver -10001)
+    Memaksa SHORT ketika RSI5m > 90, volume kering, dan funding positif (crowded long).
+    Overrides semua sinyal squeeze karena ini adalah blow-off top.
+    """
+    @staticmethod
+    def detect(rsi6_5m: float, volume_ratio: float, funding_rate: float,
+               obv_trend: str, short_liq: float, change_5m: float) -> Dict:
+        if funding_rate is None:
+            funding_rate = 0.0
+        # Kondisi blow-off top
+        if (rsi6_5m > 90 and
+            volume_ratio < 0.4 and
+            (funding_rate > 0.001 or obv_trend == "POSITIVE_EXTREME") and
+            short_liq < 2.0 and
+            change_5m > 1.5):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"EXTREME OVERBOUGHT VOLUME DRY REVERSAL: RSI5m={rsi6_5m:.1f}>90, vol={volume_ratio:.2f}x, funding={funding_rate:.5f} (crowded long), short_liq={short_liq:.2f}% → blow-off top, dump",
+                "priority": -10005
+            }
+        return {"override": False}
+
+
 class PostSqueezeReversal:
     """
     🔥 MENDETEKSI AKHIR SQUEEZE: Harga sudah melewati target likuiditas
@@ -11022,6 +11049,18 @@ class BinanceAnalyzer:
         )
         result["volume_dryup_reversal"] = volume_dryup_result
 
+        # 🔥🔥 PRIORITY -10005: EXTREME OVERBOUGHT VOLUME DRY REVERSAL (BLOW-OFF TOP) - HIGHEST PRIORITY
+        funding_rate_val = result.get("funding_rate", 0.0)
+        extreme_overbought_rev = ExtremeOverboughtVolumeDryReversal.detect(
+            rsi6_5m=rsi6_5m,
+            volume_ratio=volume_ratio,
+            funding_rate=funding_rate_val,
+            obv_trend=result.get("obv_trend", "NEUTRAL"),
+            short_liq=short_liq,
+            change_5m=change_5m
+        )
+        result["extreme_overbought_volume_dry_reversal"] = extreme_overbought_rev
+
         # 🔥 NEW: LowVolumeOverboughtSqueeze Detector (Priority -1105) - HIGHEST PRIORITY
         down_energy = result.get("down_energy", 0.0)
         low_vol_overbought_result = LowVolumeOverboughtSqueeze.detect(
@@ -11148,6 +11187,16 @@ class BinanceAnalyzer:
                 result["confidence"] = "ABSOLUTE"
                 # Skip semua detector lain yang lebih rendah prioritasnya
                 extreme_short_squeeze_result = {"override": False}  # matikan squeeze detector
+            
+            # 🔥🔥 PRIORITY -10005: EXTREME OVERBOUGHT VOLUME DRY REVERSAL (BLOW-OFF TOP) - HIGHEST PRIORITY
+            elif extreme_overbought_rev.get("override", False):
+                result["bias"] = extreme_overbought_rev["bias"]
+                result["reason"] = f"[EXTREME OVERBOUGHT VOLUME DRY] {extreme_overbought_rev['reason']} | " + result.get("reason", "")
+                result["priority_level"] = extreme_overbought_rev.get("priority", -10005)
+                result["confidence"] = "ABSOLUTE"
+                # Skip semua detector dengan priority lebih rendah
+                extreme_short_squeeze_result = {"override": False}
+                low_vol_overbought_result = {"override": False}
             
             # Priority -1105: LowVolumeOverboughtSqueeze (PALING TINGGI)
             elif low_vol_overbought_result.get("override", False):
