@@ -2271,6 +2271,32 @@ class ExtremeOverboughtVolumeDryReversal:
         return {"override": False}
 
 
+class FlatPriceDistributionTrap:
+    """
+    🔥 FLAT PRICE DISTRIBUTION TRAP: OBV positive extreme, funding positive, volume dry, flat price, bid wall besar
+    HFT memasang bid wall untuk ilusi support, tapi sebenarnya distribusi.
+    Priority -10007 (TERTINGGI)
+    """
+    @staticmethod
+    def detect(change_5m: float, volume_ratio: float, down_energy: float,
+               obv_trend: str, funding_rate: float, up_energy: float) -> Dict:
+        if funding_rate is None:
+            funding_rate = 0.0
+        if (abs(change_5m) < 0.5 and
+            volume_ratio < 0.5 and
+            down_energy < 0.01 and
+            obv_trend == "POSITIVE_EXTREME" and
+            funding_rate > 0.001 and
+            up_energy > 1.0):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"FLAT PRICE DISTRIBUTION TRAP: price flat {change_5m:.2f}%, volume {volume_ratio:.2f}x kering, no sellers, OBV {obv_trend}, funding {funding_rate:.5f} (crowded long), bid wall {up_energy:.2f} → fake support, dump imminent",
+                "priority": -10007
+            }
+        return {"override": False}
+
+
 class OverboughtOBVDivergenceTrap:
     """
     🔥 OVERBOUGHT + OBV NEGATIVE EXTREME + VOLUME DRY = DISTRIBUTION TRAP
@@ -10936,6 +10962,25 @@ class BinanceAnalyzer:
             result["_capitulation_override"] = True
             # Skip semua detector dengan priority lebih rendah
             presweep_triggered = True  # reuse flag untuk skip crowded resolver
+
+        # ===== PRIORITY -10007: FLAT PRICE DISTRIBUTION TRAP =====
+        # Letakkan SEBELUM OverboughtOBVDivergenceTrap (-10006) dan CrowdedDirectionLiquidityResolver (-10001)
+        flat_dist_trap = FlatPriceDistributionTrap.detect(
+            change_5m=change_5m_val,
+            volume_ratio=volume_ratio,
+            down_energy=down_energy_val,
+            obv_trend=result.get("obv_trend", "NEUTRAL"),
+            funding_rate=funding_rate_val,
+            up_energy=up_energy_val
+        )
+        if flat_dist_trap["override"]:
+            result["bias"] = flat_dist_trap["bias"]
+            result["reason"] = f"[FLAT DIST TRAP] {flat_dist_trap['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = flat_dist_trap["priority"]
+            result["_flat_dist_trap"] = True
+            # Skip semua detector dengan priority lebih rendah (crowded resolver, dll)
+            presweep_triggered = True  # reuse flag untuk skip
 
         # ===== PRIORITY -10006: OVERBOUGHT OBV DIVERGENCE TRAP =====
         # Letakkan SEBELUM CrowdedDirectionLiquidityResolver (-10001) dan DualLiqFirstMoveFollower (-10000)
