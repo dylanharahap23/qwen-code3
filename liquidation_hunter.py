@@ -2549,6 +2549,43 @@ class OverboughtLowVolumeReversal:
         return {"override": False}
 
 
+class ShortSqueezeBaitReversal:
+    """
+    🔥 SHORT SQUEEZE BAIT REVERSAL: dual trap dengan first_move=DOWN tapi crowded long + oversold + volume kering
+    HFT membuat ilusi dump (long liq dekat) untuk memancing SHORT, lalu pump.
+    Priority -10008 (lebih tinggi dari DualLiqFirstMoveFollower -10000)
+    
+    Kondisi trigger (override first_move DOWN menjadi LONG):
+      • dual_liq_trap == True dan trap_score >= 3
+      • first_move_direction == "DOWN" (karena long_liq lebih dekat)
+      • funding_rate > 0.001 (crowded long)
+      • volume_ratio < 0.7 (volume kering)
+      • rsi6_5m < 40 (oversold di 5m – potensi bounce)
+      • agg < 0.4 (mayoritas sell – banyak yang sudah short)
+      • ofi_bias == "SHORT" (order flow bearish – umpan)
+    """
+    @staticmethod
+    def detect(dual_liq_trap: bool, trap_score: int, first_move_direction: str,
+               funding_rate: float, volume_ratio: float, rsi6_5m: float,
+               agg: float, ofi_bias: str) -> Dict:
+        if funding_rate is None:
+            funding_rate = 0.0
+        if (dual_liq_trap and trap_score >= 3 and
+            first_move_direction == "DOWN" and
+            funding_rate > 0.001 and
+            volume_ratio < 0.7 and
+            rsi6_5m < 40 and
+            agg < 0.4 and
+            ofi_bias == "SHORT"):
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": f"SHORT SQUEEZE BAIT REVERSAL: dual trap score={trap_score}, first_move=DOWN tapi funding={funding_rate:.5f} (crowded long), volume {volume_ratio:.2f}x kering, RSI5m={rsi6_5m:.1f} oversold, agg={agg:.2f} sell dominant, OFI SHORT → HFT memancing SHORT, akan pump",
+                "priority": -10008
+            }
+        return {"override": False}
+
+
 # ================= NEW DETECTOR MODULES (LECTURER'S ADDITIONS) =================
 
 class FakeKillDirection:
@@ -11078,9 +11115,30 @@ class BinanceAnalyzer:
             result["priority_level"] = fake_squeeze["priority"]
             result["_fake_squeeze_override"] = True
 
+        # Ambil dual_trap_data untuk digunakan di detector berikutnya
+        dual_trap_data = result.get("dual_liq_trap", {})
+
+        # ===== PRIORITY -10008: SHORT SQUEEZE BAIT REVERSAL =====
+        short_squeeze_bait = ShortSqueezeBaitReversal.detect(
+            dual_liq_trap=dual_trap_data.get("dual_liq_trap", False),
+            trap_score=dual_trap_data.get("trap_score", 0),
+            first_move_direction=dual_trap_data.get("first_move_direction", "UNKNOWN"),
+            funding_rate=funding_rate_val,
+            volume_ratio=volume_ratio,
+            rsi6_5m=result.get("rsi6_5m", 50.0),
+            agg=agg_val,
+            ofi_bias=result.get("ofi_bias", "NEUTRAL")
+        )
+        if short_squeeze_bait["override"]:
+            result["bias"] = short_squeeze_bait["bias"]
+            result["reason"] = f"[SHORT SQUEEZE BAIT] {short_squeeze_bait['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = short_squeeze_bait["priority"]
+            result["_short_squeeze_bait"] = True
+            # Skip DualLiqFirstMoveFollower dan detector lain
+
         # ===== PRIORITY -10000: DUAL LIQ FIRST MOVE =====
-        if not result.get("_crowded_override", False) and not result.get("_agg_override", False) and not result.get("_fake_squeeze_override", False):
-            dual_trap_data = result.get("dual_liq_trap", {})
+        if not result.get("_crowded_override", False) and not result.get("_agg_override", False) and not result.get("_fake_squeeze_override", False) and not result.get("_short_squeeze_bait", False):
             first_move = DualLiqFirstMoveFollower.detect(
                 dual_liq_trap=dual_trap_data.get("dual_liq_trap", False),
                 trap_score=dual_trap_data.get("trap_score", 0),
