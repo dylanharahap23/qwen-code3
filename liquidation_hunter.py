@@ -9381,6 +9381,54 @@ class RSIDivergenceHighMomentumTrap:
         return {"override": False}
 
 
+class OversoldLongLiqBounceHighPriority:
+    """
+    🔥 OVERSOLD + CLOSE LONG LIQUIDITY + LOW VOLUME = CAPITULATION BOUNCE (HIGH PRIORITY)
+    Priority -10009 (higher than CrowdedResolver -10001)
+    Memaksa LONG ketika long_liq dekat, harga turun meski tidak ekstrem, oversold, volume kering, ada pembeli.
+    
+    Kondisi:
+    - long_liq < 2.0% (long liquidation sangat dekat)
+    - change_5m < -1.5% (turun cukup untuk menyentuh long stop)
+    - rsi6 < 35 (oversold)
+    - volume_ratio < 0.9 (volume kering, exhaustion)
+    - down_energy < 0.1 (tidak ada tekanan jual tersisa)
+    - agg > 0.6 (ada pembeli nyata)
+    - (opsional) funding_rate > 0.0002 (crowded long, memperkuat)
+    
+    Logic: Ketika semua kondisi ini terpenuhi, HFT akan sweep long stops lalu pump
+    karena tidak ada lagi seller dan buyers sudah masuk.
+    """
+    @staticmethod
+    def detect(long_liq: float, change_5m: float, rsi6: float,
+               volume_ratio: float, down_energy: float, agg: float,
+               funding_rate: float = 0.0) -> dict:
+        if funding_rate is None:
+            funding_rate = 0.0
+        
+        if (long_liq < 2.0 and
+            change_5m < -1.5 and
+            rsi6 < 35 and
+            volume_ratio < 0.9 and
+            down_energy < 0.1 and
+            agg > 0.6):
+            # Bonus jika funding positif (crowded long)
+            funding_bonus = " (crowded long)" if funding_rate > 0.0002 else ""
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": (
+                    f"OVERSOLD LONG LIQ BOUNCE (HIGH PRIORITY): long_liq={long_liq:.2f}% dekat, "
+                    f"price dropped {change_5m:.1f}%, RSI {rsi6:.1f} oversold, "
+                    f"volume {volume_ratio:.2f}x kering, down_energy={down_energy:.2f} (no selling pressure), "
+                    f"agg={agg:.2f} buyers stepping in{funding_bonus} → "
+                    f"HFT will sweep long stops then pump"
+                ),
+                "priority": -10009
+            }
+        return {"override": False}
+
+
 class CapitulationTrapGuard:
     """
     🔥 PRIORITY -1104.95: Deteksi jebakan capitulation bottom palsu
@@ -10887,6 +10935,24 @@ class BinanceAnalyzer:
             result["priority_level"] = exhausted_sweep["priority"]
             result["_exhausted_sweep"] = True
             return result  # Hard return, tidak ada yang bisa override ini
+        
+        # ===== PRIORITY -10009: OVERSOLD LONG LIQ BOUNCE (HIGH PRIORITY) =====
+        oversold_bounce_high = OversoldLongLiqBounceHighPriority.detect(
+            long_liq=long_liq,
+            change_5m=change_5m_val,
+            rsi6=rsi6_val,
+            volume_ratio=volume_ratio,
+            down_energy=down_energy_val,
+            agg=agg_val,
+            funding_rate=funding_rate_val or 0.0
+        )
+        if oversold_bounce_high["override"]:
+            result["bias"] = oversold_bounce_high["bias"]
+            result["reason"] = f"[OVERSOLD BOUNCE HIGH] {oversold_bounce_high['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = oversold_bounce_high["priority"]
+            result["_oversold_bounce_high"] = True
+            return result  # Hard return karena priority sangat tinggi
         
         # ===== PRIORITY -10009: LOW VOLUME FAKE PUMP TRAP =====
         dual_trap_data = result.get("dual_liq_trap", {})
