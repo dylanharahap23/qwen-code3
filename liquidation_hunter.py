@@ -9375,6 +9375,46 @@ class AggSpoofingWithLiquidityContext:
         return {"override": False}
 
 
+class FakeShortSqueezeTrap:
+    """
+    🔥 FAKE SHORT SQUEEZE TRAP DETECTOR – Priority -10003
+    
+    Detects when short liq is extremely close (<0.5%) and price has pumped,
+    but volume is low, RSI is overbought, and OBV is positive extreme.
+    This is a trap: HFT pumps slightly to trigger short stops, then dumps hard.
+    
+    Conditions (all must be true):
+    - short_liq < 0.5% (target extremely close)
+    - change_5m > 1.0% (price already moved up)
+    - rsi6 > 75 (overbought)
+    - volume_ratio < 0.7 (low volume – no real buying power)
+    - obv_trend in ("POSITIVE_EXTREME", "POSITIVE") (OBV divergence)
+    - funding_rate is not strongly negative (< -0.003) – because strong negative funding would indicate real short crowding
+    
+    Priority: -10003 (HIGHEST – overrides both DualLiqFirstMoveFollower and Vega fade)
+    Bias: SHORT
+    """
+    @staticmethod
+    def detect(short_liq: float, change_5m: float, rsi6: float,
+               volume_ratio: float, obv_trend: str, funding_rate: float) -> Dict:
+        if funding_rate is not None and funding_rate < -0.003:
+            # Real short squeeze potential – do not override
+            return {"override": False}
+        
+        if (short_liq < 0.5 and
+            change_5m > 1.0 and
+            rsi6 > 75 and
+            volume_ratio < 0.7 and
+            obv_trend in ("POSITIVE_EXTREME", "POSITIVE")):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"FAKE SHORT SQUEEZE TRAP: short_liq={short_liq:.2f}% super close, price up {change_5m:.1f}%, RSI {rsi6:.1f} overbought, volume {volume_ratio:.2f}x dry, OBV {obv_trend} → HFT pump to trap longs, imminent dump",
+                "priority": -10003
+            }
+        return {"override": False}
+
+
 class DualLiqFirstMoveFollower:
     """
     Ketika dual_liq_trap aktif, sistem sudah tahu first_move_direction.
@@ -10841,8 +10881,24 @@ class BinanceAnalyzer:
                 result["priority_level"] = -10000.6
                 result["_agg_override"] = False
 
+        # ===== PRIORITY -10003: FAKE SHORT SQUEEZE TRAP =====
+        fake_squeeze = FakeShortSqueezeTrap.detect(
+            short_liq=short_liq,
+            change_5m=change_5m_val,
+            rsi6=rsi6_val,
+            volume_ratio=volume_ratio,
+            obv_trend=result.get("obv_trend", "NEUTRAL"),
+            funding_rate=funding_rate_val
+        )
+        if fake_squeeze["override"]:
+            result["bias"] = fake_squeeze["bias"]
+            result["reason"] = f"[FAKE SHORT SQUEEZE TRAP] {fake_squeeze['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = fake_squeeze["priority"]
+            result["_fake_squeeze_override"] = True
+
         # ===== PRIORITY -10000: DUAL LIQ FIRST MOVE =====
-        if not result.get("_crowded_override", False) and not result.get("_agg_override", False):
+        if not result.get("_crowded_override", False) and not result.get("_agg_override", False) and not result.get("_fake_squeeze_override", False):
             dual_trap_data = result.get("dual_liq_trap", {})
             first_move = DualLiqFirstMoveFollower.detect(
                 dual_liq_trap=dual_trap_data.get("dual_liq_trap", False),
@@ -11127,7 +11183,7 @@ class BinanceAnalyzer:
         for key in ['_crowded_override', '_agg_override', '_vega_fade_override', '_presweep_override', 
                     '_post_pump_override', '_funding_obv_override', '_liquidity_extreme_override', 
                     '_obv_veto_long', '_pump_fake_override', '_greeks_short_trap', '_funding_extreme_override', '_capitulation_trap', 
-                    '_extreme_capitulation']:
+                    '_extreme_capitulation', '_fake_squeeze_override']:
             if result.get(key):
                 override_count += 1
         
