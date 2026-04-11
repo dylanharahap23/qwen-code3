@@ -9269,6 +9269,42 @@ class GreekKillReversalAfterCapitulation:
         return {"override": False}
 
 
+class SweepPumpFundingValidationGuard:
+    """
+    🔥 GUARD untuk FundingNegativeOBVPositiveLongLiqSweepPump:
+    
+    Detector itu hanya boleh fire jika funding BENAR-BENAR negatif.
+    Jika funding hampir netral atau positif, detector HARUS diblokir.
+    
+    Tambahkan validasi ini di dalam detector aslinya:
+    """
+    @staticmethod
+    def is_valid_sweep_pump_setup(funding_rate: float,
+                                   long_liq: float,
+                                   short_liq: float,
+                                   rsi6_5m: float) -> bool:
+        if funding_rate is None:
+            return False
+        
+        # Funding HARUS benar-benar negatif untuk "crowded short" 
+        if funding_rate >= -0.0005:
+            return False
+        
+        # Long liq tidak boleh ultra dekat (itu cascade, bukan sweep)
+        if long_liq < 0.3:
+            return False
+        
+        # Short liq harus lebih jauh (ada target untuk pump setelah sweep)
+        if short_liq < long_liq * 2:
+            return False
+        
+        # RSI5m tidak boleh terlalu tinggi (kalau tinggi = masih overbought)
+        if rsi6_5m > 75:
+            return False
+        
+        return True
+
+
 class FundingNegativeOBVPositiveLongLiqSweepPump:
     """
     🔥 FUNDING NEG + OBV POS + LONG LIQ SWEEP PUMP (PRIORITY -10011):
@@ -9286,14 +9322,22 @@ class FundingNegativeOBVPositiveLongLiqSweepPump:
     long stop sebelum pump besar.
     
     Case: RAVEUSDT - funding negatif + agg 0.94 + long_liq 1.64% = LONG
+    
+    ⚠️ UPDATED: Tambah validasi ketat funding rate untuk hindari salah fire di CKBUSDT
     """
     @staticmethod
     def detect(funding_rate: float, obv_trend: str, long_liq: float,
                short_liq: float, agg: float, change_5m: float,
                rsi6: float, down_energy: float, volume_ratio: float,
-               greeks_kill_direction: str) -> dict:
+               greeks_kill_direction: str, rsi6_5m: float = 50.0) -> dict:
         
         if funding_rate is None:
+            return {"override": False}
+        
+        # ===== GUARD VALIDATION: Funding HARUS benar-benar negatif =====
+        if not SweepPumpFundingValidationGuard.is_valid_sweep_pump_setup(
+            funding_rate, long_liq, short_liq, rsi6_5m
+        ):
             return {"override": False}
         
         # Funding negatif = crowded short
@@ -9531,6 +9575,158 @@ class StochasticJMaximalBlowOff:
                     f"Reversal PASTI terjadi. Score: {score}/6"
                 ),
                 "priority": -10013.5
+            }
+        
+        return {"override": False}
+
+
+class UltraCloseLongLiqCascadeGuard:
+    """
+    🔥 CKBUSDT PATTERN (PRIORITY -10015 - TERTINGGI ABSOLUT):
+    Long liq < 0.3% = BUKAN target sweep = CASCADE DUMP TRIGGER.
+    
+    Ketika long_liq sangat dekat (<0.3%), harga hampir menyentuh
+    titik likuidasi massal. HFT tidak perlu setup apapun —
+    tinggal push kecil dan cascade terjadi sendiri.
+    
+    Bedain dengan sweep normal (long_liq 1-3%):
+    - Normal sweep: HFT perlu gerakan signifikan untuk trigger
+    - Ultra close (<0.3%): satu candle kecil sudah cukup cascade
+    
+    Ini OVERRIDE semua detector yang bilang LONG karena
+    "long_liq dekat = akan di-sweep lalu pump."
+    
+    Kondisi TAMBAHAN yang harus terpenuhi:
+    - RSI5m > 65 (5m masih elevated = trend turun belum selesai)
+    - ATAU OFI display ≠ agg (data race = tidak bisa dipercaya)
+    - ATAU short_liq >> long_liq (jauh lebih banyak long daripada short)
+    
+    Case: CKBUSDT - long_liq 0.06-0.24%, RSI5m 81.2, SHORT 7.3%
+    
+    Priority: -10015 (LEBIH TINGGI dari FakeShortLiqTrap -10014)
+    Bias: SHORT
+    """
+    @staticmethod
+    def detect(long_liq: float, short_liq: float,
+               rsi6_5m: float, rsi6: float,
+               funding_rate: float,
+               volume_ratio: float,
+               change_5m: float) -> dict:
+        
+        # Core: long liq ULTRA dekat
+        if long_liq >= 0.3:
+            return {"override": False}
+        
+        # Long liq ultra dekat = cascade imminent
+        # Konfirmasi dengan minimal 2 dari 4:
+        
+        # 1. RSI5m masih tinggi (trend 5m belum reversal)
+        rsi5m_elevated = rsi6_5m > 65
+        
+        # 2. Short liq jauh lebih besar (tidak ada short yang perlu di-squeeze)
+        liq_asymmetric = short_liq > long_liq * 5
+        
+        # 3. Volume kering (tidak ada rescue buyer)
+        volume_dry = volume_ratio < 0.6
+        
+        # 4. Funding tidak crowded short
+        not_crowded_short = funding_rate > -0.002
+        
+        score = sum([rsi5m_elevated, liq_asymmetric, volume_dry, not_crowded_short])
+        
+        if score >= 2:
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"ULTRA CLOSE LONG LIQ CASCADE: "
+                    f"long_liq={long_liq:.2f}% (<0.3% = cascade threshold), "
+                    f"short_liq={short_liq:.2f}% (ratio {short_liq/long_liq:.0f}x), "
+                    f"RSI5m={rsi6_5m:.1f}, volume={volume_ratio:.2f}x, "
+                    f"funding={funding_rate:.6f} → "
+                    f"BUKAN sweep target. Ini CASCADE DUMP trigger. "
+                    f"Satu push kecil = liquidasi massal LONG. "
+                    f"Score: {score}/4"
+                ),
+                "priority": -10015
+            }
+        
+        return {"override": False}
+
+
+class RSIDivergenceExtremeWithLiqContext:
+    """
+    🔥 CKBUSDT PATTERN (PRIORITY -10014.5):
+    RSI1m sangat oversold + RSI5m sangat overbought + long_liq dekat
+    = Trend 5m mendominasi, bounce 1m adalah jebakan.
+    
+    Sistem sudah ada RSIDivergenceHighMomentumTrap tapi kalah
+    dari detector lain. Ini versi yang lebih kuat dengan konteks likuiditas.
+    
+    Logic:
+    - RSI1m < 35: harga baru turun di 1m (orang mau beli)
+    - RSI5m > 70: trend 5m masih turun dari overbought
+    - Gap > 35 poin: divergence sangat ekstrem
+    - long_liq dekat: ada gravitasi ke bawah
+    - Volume rendah: bounce tidak ada fuel
+    
+    Case: CKBUSDT - RSI1m 32.4, RSI5m 81.2, gap 48.8 poin
+    
+    Priority: -10014.5 (di bawah UltraCascade -10015, di atas FakeShortLiq -10014)
+    Bias: SHORT
+    """
+    @staticmethod
+    def detect(rsi6: float, rsi6_5m: float,
+               long_liq: float, short_liq: float,
+               volume_ratio: float,
+               change_5m: float,
+               funding_rate: float) -> dict:
+        
+        if funding_rate is None:
+            funding_rate = 0.0
+        
+        rsi_gap = rsi6_5m - rsi6  # positif = 5m lebih tinggi dari 1m
+        
+        # Divergence ekstrem: 1m oversold tapi 5m masih tinggi
+        extreme_divergence = (
+            rsi6 < 35 and
+            rsi6_5m > 70 and
+            rsi_gap > 35
+        )
+        
+        if not extreme_divergence:
+            return {"override": False}
+        
+        # Konteks likuiditas: long_liq lebih dekat
+        long_liq_closer = long_liq < short_liq
+        
+        # Volume kering (bounce tidak ada momentum)
+        volume_dry = volume_ratio < 0.6
+        
+        # Funding tidak crowded short (tidak ada squeeze setup)
+        not_crowded_short = funding_rate > -0.001
+        
+        # Harga turun atau flat (bukan sedang pumping)
+        price_weak = change_5m < 0.5
+        
+        score = sum([long_liq_closer, volume_dry, not_crowded_short, price_weak])
+        
+        if score >= 3:
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"RSI DIVERGENCE EXTREME WITH LIQ CONTEXT: "
+                    f"RSI1m={rsi6:.1f} (oversold) vs RSI5m={rsi6_5m:.1f} "
+                    f"(gap={rsi_gap:.0f} poin), "
+                    f"long_liq={long_liq:.2f}% closer, "
+                    f"volume={volume_ratio:.2f}x, "
+                    f"funding={funding_rate:.6f} → "
+                    f"Trend 5m mendominasi. "
+                    f"Bounce 1m adalah jebakan. "
+                    f"Score: {score}/4"
+                ),
+                "priority": -10014.5
             }
         
         return {"override": False}
@@ -11404,6 +11600,47 @@ class BinanceAnalyzer:
             result["reason"] = f"[GREEK KILL REVERSAL] {greek_kill_rev['reason']} | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = greek_kill_rev["priority"]
+            return result  # Hard return
+
+        # ===== PRIORITY -10015: ULTRA CLOSE LONG LIQ CASCADE (TERTINGGI ABSOLUT) =====
+        # Harus di paling atas karena ini override semua LONG signal dari long_liq dekat
+        ultra_cascade = UltraCloseLongLiqCascadeGuard.detect(
+            long_liq=long_liq,
+            short_liq=short_liq,
+            rsi6_5m=result.get("rsi6_5m", 50.0),
+            rsi6=rsi6_val,
+            funding_rate=funding_rate_val or 0.0,
+            volume_ratio=volume_ratio,
+            change_5m=change_5m_val
+        )
+        if ultra_cascade["override"]:
+            result["bias"] = ultra_cascade["bias"]
+            result["reason"] = (
+                f"[ULTRA CASCADE] {ultra_cascade['reason']} | "
+                + result.get("reason", "")
+            )
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = ultra_cascade["priority"]
+            return result  # Hard return
+
+        # ===== PRIORITY -10014.5: RSI DIVERGENCE EXTREME WITH LIQ CONTEXT =====
+        rsi_div_liq = RSIDivergenceExtremeWithLiqContext.detect(
+            rsi6=rsi6_val,
+            rsi6_5m=result.get("rsi6_5m", 50.0),
+            long_liq=long_liq,
+            short_liq=short_liq,
+            volume_ratio=volume_ratio,
+            change_5m=change_5m_val,
+            funding_rate=funding_rate_val or 0.0
+        )
+        if rsi_div_liq["override"]:
+            result["bias"] = rsi_div_liq["bias"]
+            result["reason"] = (
+                f"[RSI DIV LIQ] {rsi_div_liq['reason']} | "
+                + result.get("reason", "")
+            )
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = rsi_div_liq["priority"]
             return result  # Hard return
 
         # ===== PRIORITY -10011: FUNDING NEG + OBV POS + LONG LIQ SWEEP PUMP =====
