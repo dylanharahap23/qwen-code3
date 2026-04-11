@@ -1718,7 +1718,10 @@ def greeks_final_screen(result: dict) -> dict:
         output["bias"] = pre_kill["bias"]
         output["confidence"] = "ABSOLUTE"
         output["greeks_override"] = True
-        output["greeks_priority"] = pre_kill["priority"]
+        # UBAH priority dari -9998 ke -10009.5
+        # agar selalu menang vs OversoldLongLiqBounceHighPriority (-10009)
+        output["greeks_priority"] = -10009.5  # bukan pre_kill["priority"]
+        output["priority_level"] = -10009.5
         output["reason"] = (
             f"[PRE-KILL SIGNAL] {pre_kill['reason']} "
             f"| Original: {result.get('reason', '')}"
@@ -10640,21 +10643,43 @@ class OversoldLongLiqBounceHighPriority:
     
     Logic: Ketika semua kondisi ini terpenuhi, HFT akan sweep long stops lalu pump
     karena tidak ada lagi seller dan buyers sudah masuk.
+    
+    🔥 GUARDS (LECTURER FIX):
+    - Guard 1: Funding positif + crowded long + kill_direction SHORT = dump setup, bukan bounce
+    - Guard 2: RSI 1m oversold tapi RSI 5m netral (>40) = bounce palsu (1 candle spike)
+    - Guard 3: ask_slope jauh lebih besar dari bid_slope = sell wall dominan
     """
     @staticmethod
     def detect(long_liq: float, change_5m: float, rsi6: float,
                volume_ratio: float, down_energy: float, agg: float,
-               funding_rate: float = 0.0) -> dict:
+               funding_rate: float = 0.0,
+               # TAMBAH parameter baru untuk guards:
+               rsi6_5m: float = 50.0,
+               greeks_kill_direction: str = "",
+               greeks_delta_crowded: str = "",
+               ask_slope: float = 0.0,
+               bid_slope: float = 1.0) -> dict:
         if funding_rate is None:
             funding_rate = 0.0
         
-        if (long_liq < 2.0 and
-            change_5m < -1.5 and
-            rsi6 < 35 and
-            volume_ratio < 0.9 and
-            down_energy < 0.1 and
-            agg > 0.6):
-            # Bonus jika funding positif (crowded long)
+        # GUARD 1: Funding positif + crowded long + kill_direction SHORT = dump setup, bukan bounce
+        if (funding_rate > 0.0002 and 
+            greeks_delta_crowded == "LONG" and
+            greeks_kill_direction == "SHORT"):
+            return {"override": False}
+        
+        # GUARD 2: RSI 1m oversold tapi RSI 5m netral = bounce palsu (1 candle spike)
+        # Bounce valid hanya jika rsi6_5m juga oversold (<40)
+        if rsi6 < 20 and rsi6_5m > 40:
+            return {"override": False}
+        
+        # GUARD 3: ask_slope jauh lebih besar dari bid_slope = sell wall dominan
+        if bid_slope > 0 and ask_slope / bid_slope > 5.0:
+            return {"override": False}
+        
+        # Logic asli tetap:
+        if (long_liq < 2.0 and change_5m < -1.5 and rsi6 < 35 and
+            volume_ratio < 0.9 and down_energy < 0.1 and agg > 0.6):
             funding_bonus = " (crowded long)" if funding_rate > 0.0002 else ""
             return {
                 "override": True,
@@ -10668,6 +10693,63 @@ class OversoldLongLiqBounceHighPriority:
                 ),
                 "priority": -10009
             }
+        return {"override": False}
+
+
+class CrowdedLongOversoldTrap:
+    """
+    🔥 VELVETUSDT PATTERN: RSI 1m oversold tapi rsi5m netral
+    + funding positif (crowded long) + kill_direction SHORT
+    = agg=1.00 adalah BAIT terakhir sebelum dump
+    
+    HFT bikin harga turun 1-2% agar RSI 1m terlihat oversold,
+    retail beli (agg=1.00), HFT dump ke long stop.
+    
+    Kondisi:
+    - rsi6 < 20 (1m oversold)
+    - rsi6_5m > 40 (5m NOT oversold = bounce tidak valid)
+    - funding_rate > 0.0001 (crowded long)
+    - greeks_kill_direction == "SHORT"
+    - long_liq < 2.0% (target dekat)
+    - agg > 0.7 (bait sudah dimakan retail)
+    - change_5m < 0 (harga turun)
+    
+    Priority: -10009.8 (lebih tinggi dari OversoldBounce -10009)
+    Bias: SHORT
+    """
+    @staticmethod
+    def detect(rsi6: float, rsi6_5m: float, funding_rate: float,
+               kill_direction: str, long_liq: float,
+               agg: float, change_5m: float,
+               delta_crowded: str = "") -> dict:
+        
+        if funding_rate is None:
+            funding_rate = 0.0
+        
+        # Core pattern
+        if (rsi6 < 20 and                    # 1m terlihat oversold
+            rsi6_5m > 40 and                 # 5m masih netral (bounce palsu)
+            funding_rate > 0.0001 and        # crowded long
+            kill_direction == "SHORT" and    # Greeks konfirmasi dump
+            long_liq < 2.0 and              # target dekat
+            agg > 0.7 and                   # retail sudah beli (bait dimakan)
+            change_5m < 0):                 # harga turun
+            
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"CROWDED LONG OVERSOLD TRAP: RSI1m={rsi6:.1f} terlihat oversold "
+                    f"tapi RSI5m={rsi6_5m:.1f} netral (bounce palsu), "
+                    f"funding={funding_rate:.5f} crowded long, "
+                    f"kill_direction={kill_direction}, "
+                    f"long_liq={long_liq:.2f}% → "
+                    f"agg={agg:.2f} adalah retail beli BAIT. "
+                    f"HFT akan dump ke long stop. Force SHORT."
+                ),
+                "priority": -10009.8
+            }
+        
         return {"override": False}
 
 
@@ -12594,6 +12676,28 @@ class BinanceAnalyzer:
             result["_exhausted_sweep"] = True
             return result  # Hard return, tidak ada yang bisa override ini
         
+        # ===== PRIORITY -10009.8: CROWDED LONG OVERSOLD TRAP (LEBIH TINGGI DARI OVERSOLD BOUNCE) =====
+        # Dipanggil SEBELUM OversoldLongLiqBounceHighPriority untuk menangkap pola velvetusdt
+        crowded_oversold_trap = CrowdedLongOversoldTrap.detect(
+            rsi6=rsi6_val,
+            rsi6_5m=rsi6_5m_val,
+            funding_rate=funding_rate_val or 0.0,
+            kill_direction=result.get("greeks_kill_direction", ""),
+            long_liq=long_liq,
+            agg=agg_val,
+            change_5m=change_5m_val,
+            delta_crowded=result.get("greeks_delta_crowded", "")
+        )
+        if crowded_oversold_trap["override"]:
+            result["bias"] = crowded_oversold_trap["bias"]
+            result["reason"] = (
+                f"[CROWDED LONG OVERSOLD TRAP] {crowded_oversold_trap['reason']} | "
+                + result.get("reason", "")
+            )
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = crowded_oversold_trap["priority"]
+            return result  # Hard return, priority -10009.8 lebih tinggi dari -10009
+        
         # ===== PRIORITY -10009: OVERSOLD LONG LIQ BOUNCE (HIGH PRIORITY) =====
         oversold_bounce_high = OversoldLongLiqBounceHighPriority.detect(
             long_liq=long_liq,
@@ -12602,7 +12706,13 @@ class BinanceAnalyzer:
             volume_ratio=volume_ratio,
             down_energy=down_energy_val,
             agg=agg_val,
-            funding_rate=funding_rate_val or 0.0
+            funding_rate=funding_rate_val or 0.0,
+            # TAMBAH parameter guards baru:
+            rsi6_5m=rsi6_5m_val,
+            greeks_kill_direction=result.get("greeks_kill_direction", ""),
+            greeks_delta_crowded=result.get("greeks_delta_crowded", ""),
+            ask_slope=result.get("ask_slope", 0.0),
+            bid_slope=result.get("bid_slope", 1.0)
         )
         if oversold_bounce_high["override"]:
             result["bias"] = oversold_bounce_high["bias"]
