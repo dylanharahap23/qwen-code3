@@ -1237,6 +1237,25 @@ def _delta_calculate(data: dict) -> dict:
 
     who_is_crowded = "LONG" if delta_long > delta_short else "SHORT"
 
+    # ===== FIX 4: Override crowding berdasarkan funding rate (LECTURER FIX) =====
+    # Funding adalah proxy paling akurat untuk crowd positioning
+    # Positif = lebih banyak LONG = crowded LONG (bukan SHORT)
+    if funding_rate > 0.0005:
+        # Strong positive funding = definitely crowded LONG
+        who_is_crowded = "LONG"
+        # Kill direction: jika crowded LONG dan short_liq dekat,
+        # tapi funding sangat positif → HFT akan dump LONG, bukan sweep short
+        if short_dies_at < long_dies_at:
+            # Short liq dekat tapi semua orang LONG
+            # HFT akan dump dulu untuk kill LONG sebelum sweep short
+            kill_direction = "SHORT"
+            who_dies_first = "LONG_TRADERS"
+    elif funding_rate < -0.0005:
+        who_is_crowded = "SHORT"
+        if long_dies_at < short_dies_at:
+            kill_direction = "LONG"
+            who_dies_first = "SHORT_TRADERS"
+
     # ===== GUARD: Dip-Then-Rip Override =====
     # Jika long_liq sangat dekat (<1%) dan short_liq jauh (>2x),
     # kill_direction seharusnya LONG (sweep long stop dulu, lalu pump)
@@ -2332,11 +2351,35 @@ class ShortLiqSqueezeContinuationGuard:
     Priority -10017 (PALING TINGGI, di atas VegaActiveShortOverride -10002)
     Memaksa LONG ketika short_liq sangat dekat (<1.5%) dan up_energy > down_energy,
     meskipun volume rendah dan RSI overbought. Ini adalah squeeze yang masih berjalan.
+    
+    🔥 GUARDS (LECTURER FIX):
+    - Guard 1: agg < 0.3 = 78%+ trades SELL = bukan squeeze nyata
+    - Guard 2: funding positif tinggi (>0.0005) + short_liq dekat = crowded LONG yang akan dieksekusi
+    - Guard 3: bid wall jauh lebih tebal dari ask tapi agg rendah = bid wall spoofing
     """
     @staticmethod
     def detect(short_liq: float, long_liq: float, change_5m: float,
                up_energy: float, down_energy: float, volume_ratio: float,
-               rsi6: float, rsi6_5m: float, agg: float, ofi_bias: str) -> dict:
+               rsi6: float, rsi6_5m: float, agg: float, ofi_bias: str,
+               # TAMBAH parameter baru untuk guards:
+               funding_rate: float = 0.0,
+               bid_slope: float = 0.0,
+               ask_slope: float = 0.0) -> dict:
+        
+        # GUARD BARU #1: agg rendah = 78%+ trades SELL = bukan squeeze nyata
+        if agg < 0.3:
+            return {"override": False}
+        
+        # GUARD BARU #2: funding positif tinggi + short_liq dekat = 
+        # crowded LONG yang akan dieksekusi, BUKAN short squeeze
+        if funding_rate is not None and funding_rate > 0.0005:
+            return {"override": False}
+        
+        # GUARD BARU #3: bid wall jauh lebih tebal dari ask tapi agg rendah
+        # = bid wall spoofing, jangan percaya up_energy
+        if (bid_slope > 0 and ask_slope > 0 and 
+            bid_slope > ask_slope * 2.0 and agg < 0.4):
+            return {"override": False}
         
         # Core conditions
         if (short_liq < 1.5 and
@@ -9939,11 +9982,16 @@ class StochasticJMaximalBlowOff:
         if not stoch_maximal:
             return {"override": False}
         
-        # 🔥 GUARD 1: Stoch J > 108 = OVERFLOW ARTIFACT
+        # 🔥 GUARD 1: Stoch J > 108 = OVERFLOW BLOW-OFF TOP (KONFIRMASI, bukan invalid)
         # Ini terjadi saat RSI6=100 dan momentum sangat kuat
-        # Bukan sinyal valid, skip
+        # J > 108 adalah matematically impossible tanpa blow-off top ekstrem
         if stoch_j > 108:
-            return {"override": False}
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"STOCH J OVERFLOW BLOW-OFF: J={stoch_j:.1f} (>108 = matematically impossible without blow-off), immediate reversal",
+                "priority": -10013.5
+            }
         
         # 🔥 GUARD 2: RSI6=100 + change besar = MOMENTUM CONTINUATION
         # Bukan blow-off top — ini squeeze yang masih berjalan
@@ -10748,6 +10796,65 @@ class CrowdedLongOversoldTrap:
                     f"HFT akan dump ke long stop. Force SHORT."
                 ),
                 "priority": -10009.8
+            }
+        
+        return {"override": False}
+
+
+class BidWallSpoofingDump:
+    """
+    🔥 SKYAIUSDT PATTERN: bid_slope >> ask_slope tapi agg < 0.3
+    
+    HFT pasang bid wall besar (bid_slope 422M) untuk ilusi support.
+    Tapi 78% trades aktual adalah SELL (agg=0.22).
+    
+    Jika bid wall nyata → semua orang beli → agg tinggi.
+    Jika bid wall palsu (spoofed) → orang jual ke bid wall → agg rendah.
+    
+    Begitu posisi short HFT terisi cukup → tarik bid wall → dump.
+    
+    Kondisi:
+    - bid_slope > ask_slope * 2.0  (bid wall dominan)
+    - agg < 0.35                   (mayoritas trades SELL)
+    - change_5m > 2.0              (harga sudah pump)
+    - rsi6 > 80                    (overbought)
+    - funding_rate > 0.0003        (crowded long = korban sudah siap)
+    
+    Priority: -10014.2
+    Bias: SHORT
+    """
+    @staticmethod
+    def detect(bid_slope: float, ask_slope: float, agg: float,
+               change_5m: float, rsi6: float, funding_rate: float,
+               short_liq: float, volume_ratio: float) -> dict:
+        
+        if bid_slope <= 0 or ask_slope <= 0:
+            return {"override": False}
+        if funding_rate is None:
+            funding_rate = 0.0
+        
+        bid_ask_ratio = bid_slope / ask_slope
+        
+        # Core: bid wall besar tapi agg rendah = spoofing
+        if (bid_ask_ratio > 2.0 and
+            agg < 0.35 and
+            change_5m > 2.0 and
+            rsi6 > 80 and
+            funding_rate > 0.0003):
+            
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"BID WALL SPOOFING DUMP: bid_slope={bid_slope:.0f} vs "
+                    f"ask_slope={ask_slope:.0f} (ratio {bid_ask_ratio:.1f}x) "
+                    f"tapi agg={agg:.2f} (78%+ trades SELL) → "
+                    f"bid wall adalah PALSU (HFT spoof support), "
+                    f"funding={funding_rate:.5f} crowded long, "
+                    f"RSI={rsi6:.1f} overbought → "
+                    f"HFT akan tarik bid wall dan dump. Force SHORT."
+                ),
+                "priority": -10014.2
             }
         
         return {"override": False}
@@ -12436,13 +12543,60 @@ class BinanceAnalyzer:
             rsi6=rsi6_val,
             rsi6_5m=rsi6_5m_val,
             agg=agg_val,
-            ofi_bias=result.get("ofi_bias", "NEUTRAL")
+            ofi_bias=result.get("ofi_bias", "NEUTRAL"),
+            # TAMBAH parameter guards baru:
+            funding_rate=funding_rate_val or 0.0,
+            bid_slope=result.get("bid_slope", 0.0),
+            ask_slope=result.get("ask_slope", 0.0)
         )
         if short_squeeze_guard["override"]:
             result["bias"] = short_squeeze_guard["bias"]
             result["reason"] = f"[SHORT SQUEEZE GUARD] {short_squeeze_guard['reason']} | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = short_squeeze_guard["priority"]
+            return result
+
+        # ===== FIX 5: UNIVERSAL AGG-FUNDING CONTRADICTION GUARD (LECTURER FIX) =====
+        # Jika agg < 0.3 (78%+ trades SELL) tapi sistem output LONG
+        # DAN funding positif (crowded long) → FLIP ke SHORT
+        current_bias = result.get("bias", "NEUTRAL")
+        
+        if (agg_val < 0.3 and 
+            funding_rate_val is not None and funding_rate_val > 0.0003 and
+            current_bias == "LONG" and
+            rsi6_val > 80):
+            result["bias"] = "SHORT"
+            result["reason"] = (
+                f"[AGG-FUNDING UNIVERSAL VETO] "
+                f"agg={agg_val:.2f} (78%+ trades SELL) + "
+                f"funding={funding_rate_val:.5f} (crowded long) + "
+                f"RSI={rsi6_val:.1f} overbought → "
+                f"sistem output LONG adalah kesalahan. Force SHORT. | "
+                + result.get("reason", "")
+            )
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = -10014.5
+            return result
+
+        # ===== PRIORITY -10014.2: BID WALL SPOOFING DUMP (SEBELUM SQUEEZE GUARDS) =====
+        bid_wall_spoof = BidWallSpoofingDump.detect(
+            bid_slope=result.get("bid_slope", 0.0),
+            ask_slope=result.get("ask_slope", 0.0),
+            agg=agg_val,
+            change_5m=change_5m_val,
+            rsi6=rsi6_val,
+            funding_rate=funding_rate_val or 0.0,
+            short_liq=short_liq,
+            volume_ratio=volume_ratio
+        )
+        if bid_wall_spoof["override"]:
+            result["bias"] = bid_wall_spoof["bias"]
+            result["reason"] = (
+                f"[BID WALL SPOOFING DUMP] {bid_wall_spoof['reason']} | "
+                + result.get("reason", "")
+            )
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = bid_wall_spoof["priority"]
             return result
 
         # ===== PRIORITY -10016: AGG-OFI FULL BULLISH CONTINUATION =====
