@@ -8,6 +8,7 @@ __pycache__/
 # Logs and temp files
 *.log
 *.tmp
+*.swp
 
 # Environment
 .env
@@ -27,10 +28,4 @@ node_modules/
 dist/
 build/
 target/
-
-# Testing
-.coverage
-htmlcov/
-.pytest_cache/
-.mypy_cache/
 ```
