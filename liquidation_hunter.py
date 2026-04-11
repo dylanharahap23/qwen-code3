@@ -2114,23 +2114,52 @@ class BinanceWebSocket:
 
 class FundingExtremeRelentlessSqueeze:
     """
-    🔥 FUNDING EXTREME RELENTLESS SQUEEZE: funding < -0.005, short_liq masih ada, down_energy=0
-    HFT akan terus pump sampai funding reset, tidak peduli seberapa jauh short_liq sudah terlewati.
-    Priority -10024 (TERTINGGI)
+    🔥 FUNDING EXTREME RELENTLESS SQUEEZE: funding < -0.005, short_liq dekat ATAU momentum pump
+    Priority -10024 (TERTINGGI ABSOLUT)
+    Hanya aktif jika short_liq < 2.5 (dekat) ATAU change_5m > 3.0 (momentum pump).
     """
     @staticmethod
-    def detect(funding_rate: float, short_liq: float, down_energy: float, agg: float) -> dict:
+    def detect(funding_rate: float, short_liq: float, down_energy: float,
+               agg: float, change_5m: float) -> dict:
         if funding_rate is None:
             return {"override": False}
-        if (funding_rate < -0.005 and
-            short_liq < 5.0 and
-            down_energy < 0.1 and
-            agg > 0.5):
+        if funding_rate >= -0.005:
+            return {"override": False}
+        # Hanya aktif jika short_liq dekat ATAU momentum pump
+        if not (short_liq < 2.5 or change_5m > 3.0):
+            return {"override": False}
+        if down_energy < 0.1 and agg > 0.5:
             return {
                 "override": True,
                 "bias": "LONG",
-                "reason": f"FUNDING EXTREME RELENTLESS SQUEEZE: funding={funding_rate:.5f} (< -0.5%), short_liq={short_liq:.2f}% masih ada, down_energy=0, agg={agg:.2f} → HFT akan terus pump tanpa peduli jarak, force LONG",
+                "reason": f"FUNDING EXTREME RELENTLESS SQUEEZE: funding={funding_rate:.5f}, short_liq={short_liq:.2f}% {'dekat' if short_liq<2.5 else f'momentum {change_5m:.1f}%'}, down_energy=0 → force LONG",
                 "priority": -10024
+            }
+        return {"override": False}
+
+
+class FundingExtremeTrapReversal:
+    """
+    🔥 FUNDING EXTREME TRAP: funding < -0.005 tapi short_liq > 3% dan change_5m < 2%
+    HFT memancing LONG, akan dump.
+    Priority -10023
+    """
+    @staticmethod
+    def detect(funding_rate: float, short_liq: float, change_5m: float,
+               down_energy: float, agg: float, obv_trend: str) -> dict:
+        if funding_rate is None:
+            return {"override": False}
+        if (funding_rate < -0.005 and
+            short_liq > 3.0 and
+            abs(change_5m) < 2.0 and
+            down_energy < 0.1 and
+            agg > 0.5 and
+            obv_trend in ("POSITIVE_EXTREME", "POSITIVE")):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"FUNDING EXTREME TRAP: funding={funding_rate:.5f}, short_liq={short_liq:.2f}% jauh, price flat {change_5m:.1f}%, OBV {obv_trend} → HFT jebak LONG, force SHORT",
+                "priority": -10023
             }
         return {"override": False}
 
@@ -11905,13 +11934,30 @@ class BinanceAnalyzer:
             funding_rate=funding_rate_val,
             short_liq=short_liq,
             down_energy=down_energy_val,
-            agg=agg_val
+            agg=agg_val,
+            change_5m=change_5m_val
         )
         if relentless["override"]:
             result["bias"] = relentless["bias"]
-            result["reason"] = f"[RELENTLESS SQUEEZE] {relentless['reason']} | " + result.get("reason", "")
+            result["reason"] = f"[RELENTLESS] {relentless['reason']} | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = relentless["priority"]
+            return result
+        
+        # ===== PRIORITY -10023: FUNDING EXTREME TRAP (SHORT LIQ JAUH, HARGA FLAT) =====
+        funding_trap = FundingExtremeTrapReversal.detect(
+            funding_rate=funding_rate_val,
+            short_liq=short_liq,
+            change_5m=change_5m_val,
+            down_energy=down_energy_val,
+            agg=agg_val,
+            obv_trend=obv_trend
+        )
+        if funding_trap["override"]:
+            result["bias"] = funding_trap["bias"]
+            result["reason"] = f"[FUNDING TRAP] {funding_trap['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = funding_trap["priority"]
             return result
         
         # ===== PRIORITY -10023: FUNDING EXTREME SWEEP COMPLETION REVERSAL (TERTINGGI) =====
