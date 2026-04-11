@@ -9702,14 +9702,27 @@ class FundingNegativeOBVPositiveLongLiqSweepPump:
     Case: RAVEUSDT - funding negatif + agg 0.94 + long_liq 1.64% = LONG
     
     ⚠️ UPDATED: Tambah validasi ketat funding rate untuk hindari salah fire di CKBUSDT
+    
+    🔥 LECTURER FIX 4: Tambah guard greeks_who_dies_first=BOTH_POSSIBLE
+    🔥 LECTURER FIX 1: Perbaiki threshold down_energy dari <1.0 jadi <0.5, tambah early exit jika >2.0
     """
     @staticmethod
     def detect(funding_rate: float, obv_trend: str, long_liq: float,
                short_liq: float, agg: float, change_5m: float,
                rsi6: float, down_energy: float, volume_ratio: float,
-               greeks_kill_direction: str, rsi6_5m: float = 50.0) -> dict:
+               greeks_kill_direction: str, rsi6_5m: float = 50.0,
+               greeks_who_dies_first: str = "") -> dict:
         
         if funding_rate is None:
+            return {"override": False}
+        
+        # 🔥 LECTURER FIX 4: Guard universal untuk semua sweep/pump detectors
+        # Jika arah belum committed (BOTH_POSSIBLE), jangan force arah apapun
+        if greeks_who_dies_first == "BOTH_POSSIBLE":
+            return {"override": False}
+        
+        # 🔥 LECTURER FIX 1: Early exit jika down_energy > 2.0 (real sellers present)
+        if down_energy > 2.0:
             return {"override": False}
         
         # 🔥 GUARD: Jika OBV NEGATIVE_EXTREME, jangan trigger (ini bukan setup pump)
@@ -9738,8 +9751,8 @@ class FundingNegativeOBVPositiveLongLiqSweepPump:
         # Ini adalah "controlled dip" bukan genuine dump
         agg_bullish = agg > 0.6
         
-        # Tidak ada seller aktif
-        no_active_seller = down_energy < 1.0
+        # 🔥 LECTURER FIX 1: Tidak ada seller aktif (threshold strict < 0.5, bukan < 1.0)
+        no_active_seller = down_energy < 0.5
         
         # Harga belum naik banyak (masih dalam fase sweep)
         not_pumped_yet = change_5m < 2.0
@@ -9769,7 +9782,7 @@ class FundingNegativeOBVPositiveLongLiqSweepPump:
                     f"long_liq={long_liq:.2f}% (sweep target), "
                     f"short_liq={short_liq:.2f}% (pump target after sweep), "
                     f"agg={agg:.2f} (majority buy = controlled dip), "
-                    f"down_energy={down_energy:.2f} (no real seller) → "
+                    f"down_energy={down_energy:.2f} (no real seller, strict <0.5) → "
                     f"HFT controlled dip to sweep long stop, "
                     f"THEN massive pump to kill all crowded shorts. "
                     f"Score: {score}/8"
@@ -10182,6 +10195,61 @@ class UltraCloseLongLiqCascadeGuard:
                     f"Score: {score}/4"
                 ),
                 "priority": -10015
+            }
+        
+        return {"override": False}
+
+
+class RealSellerCascadeGuard:
+    """
+    🔥 LECTURER FIX 2 - REAL SELLER CASCADE GUARD (PRIORITY -10015.5):
+    
+    long_liq sangat dekat (<0.5%) + down_energy tinggi (>1.0) + agg rendah (<0.5)
+    = HFT akan DRIVE THROUGH long liq (cascade), bukan bounce.
+    
+    Berbeda dari UltraCloseLongLiqCascadeGuard yang cek RSI5m.
+    Ini fokus pada energy + agg sebagai bukti seller aktif.
+    
+    Kondisi yang harus terpenuhi (minimal 3 dari 4):
+    - long_liq < 0.5% (ultra close cascade target)
+    - down_energy > 1.0 (real sellers present)
+    - agg < 0.5 (sell dominant trades)
+    - change_5m < 0 (price falling)
+    - hft_bias == "SHORT" or algo_bias == "SHORT" (HFT/Algo konfirmasi)
+    
+    Priority -10015.5 (antara UltraCascade -10015 dan FakeShortLiq -10014)
+    Bias: SHORT
+    
+    Case: RAVEUSDT - long_liq 0.33%, down_energy 5.93, agg 0.41 = CASCADE BUKAN BOUNCE
+    """
+    @staticmethod
+    def detect(long_liq: float, short_liq: float, down_energy: float,
+               agg: float, change_5m: float, hft_bias: str, algo_bias: str) -> dict:
+        
+        if long_liq >= 0.5:
+            return {"override": False}
+        
+        # Sellers aktif + harga turun + HFT/Algo konfirmasi = cascade
+        real_seller = down_energy > 1.0
+        sell_dominant = agg < 0.5
+        price_falling = change_5m < 0
+        hft_algo_short = (hft_bias == "SHORT" or algo_bias == "SHORT")
+        
+        score = sum([real_seller, sell_dominant, price_falling, hft_algo_short])
+        
+        if score >= 3:
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"REAL SELLER CASCADE: long_liq={long_liq:.2f}% ultra close, "
+                    f"down_energy={down_energy:.2f} (real sellers), "
+                    f"agg={agg:.2f} (sell dominant), "
+                    f"change={change_5m:.1f}% → "
+                    f"HFT akan DRIVE THROUGH long liq bukan bounce. "
+                    f"Score: {score}/4"
+                ),
+                "priority": -10015.5
             }
         
         return {"override": False}
@@ -12430,6 +12498,28 @@ class BinanceAnalyzer:
             result["priority_level"] = ultra_cascade["priority"]
             return result  # Hard return
 
+        # ===== PRIORITY -10015.5: REAL SELLER CASCADE GUARD (LECTURER FIX 2) =====
+        # Deteksi: long_liq <0.5% + down_energy tinggi + agg rendah = cascade BUKAN bounce
+        # Dipanggil sebelum UltraCascade karena lebih spesifik ke seller energy
+        real_seller_cascade = RealSellerCascadeGuard.detect(
+            long_liq=long_liq,
+            short_liq=short_liq,
+            down_energy=down_energy_val,
+            agg=agg_val,
+            change_5m=change_5m_val,
+            hft_bias=result.get("hft_6pct_bias", "NEUTRAL"),
+            algo_bias=result.get("algo_type_bias", "NEUTRAL")
+        )
+        if real_seller_cascade["override"]:
+            result["bias"] = real_seller_cascade["bias"]
+            result["reason"] = (
+                f"[REAL SELLER CASCADE] {real_seller_cascade['reason']} | "
+                + result.get("reason", "")
+            )
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = real_seller_cascade["priority"]
+            return result  # Hard return
+
         # ===== PRIORITY -10014.5: RSI DIVERGENCE EXTREME WITH LIQ CONTEXT =====
         rsi_div_liq = RSIDivergenceExtremeWithLiqContext.detect(
             rsi6=rsi6_val,
@@ -12451,6 +12541,7 @@ class BinanceAnalyzer:
             return result  # Hard return
 
         # ===== PRIORITY -10011: FUNDING NEG + OBV POS + LONG LIQ SWEEP PUMP =====
+        # 🔥 LECTURER FIX 4: Tambah parameter greeks_who_dies_first untuk guard BOTH_POSSIBLE
         sweep_pump = FundingNegativeOBVPositiveLongLiqSweepPump.detect(
             funding_rate=result.get("funding_rate", 0.0),
             obv_trend=result.get("obv_trend", "NEUTRAL"),
@@ -12461,7 +12552,8 @@ class BinanceAnalyzer:
             rsi6=rsi6_val,
             down_energy=down_energy_val,
             volume_ratio=volume_ratio,
-            greeks_kill_direction=result.get("greeks_kill_direction", "")
+            greeks_kill_direction=result.get("greeks_kill_direction", ""),
+            greeks_who_dies_first=result.get("greeks_who_dies_first", "")
         )
         if sweep_pump["override"]:
             result["bias"] = sweep_pump["bias"]
@@ -12895,6 +12987,7 @@ class BinanceAnalyzer:
         # ===== PRIORITY -10001.5: PRESWEEP MISINTERPRETATION GUARD =====
         presweep_triggered = False
         if not result.get("_post_pump_override", False) and not result.get("_funding_obv_override", False) and not vega_fade_triggered:
+            # 🔥 LECTURER FIX 4: Tambah parameter greeks_who_dies_first untuk guard BOTH_POSSIBLE
             presweep_guard = PresweepMisinterpretationGuard.detect(
                 long_liq=long_liq,
                 short_liq=short_liq,
@@ -12903,7 +12996,8 @@ class BinanceAnalyzer:
                 ofi_strength=result.get("ofi_strength", 0.0),
                 funding_rate=funding_rate_val,
                 rsi6=rsi6_val,
-                change_5m=change_5m_val
+                change_5m=change_5m_val,
+                greeks_who_dies_first=result.get("greeks_who_dies_first", "")
             )
             if presweep_guard["override"]:
                 result["bias"] = presweep_guard["bias"]
@@ -13405,6 +13499,26 @@ class BinanceAnalyzer:
             result["entry_allowed"] = False
             result["reason"] = f"[CONFLICT THRESHOLD] {override_count} override aktif → kemungkinan TRAP, NO TRADE | " + result.get("reason", "")
             result["priority_level"] = -1105
+        
+        # 🔥 LECTURER FIX 3: HFT + Algo double SHORT veto untuk LONG output
+        # Jika HFT dan Algo keduanya SHORT tapi output akhir LONG, dan long_liq sangat dekat, ini harus diveto
+        hft_b = result.get("hft_6pct_bias", "NEUTRAL")
+        algo_b = result.get("algo_type_bias", "NEUTRAL")
+        long_liq_v = result.get("long_liq", 99.0)
+        down_e = result.get("down_energy", 0.0)
+
+        if (hft_b == "SHORT" and algo_b == "SHORT" and 
+            result.get("bias") == "LONG" and
+            long_liq_v < 0.5 and
+            down_e > 1.0):
+            result["bias"] = "SHORT"
+            result["reason"] = (
+                f"[HFT+ALGO DOUBLE SHORT VETO] HFT={hft_b}, Algo={algo_b}, "
+                f"long_liq={long_liq_v:.2f}%, down_energy={down_e:.2f} → "
+                f"force SHORT override LONG | " + result.get("reason", "")
+            )
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = -10015.8
         
         return result
 
