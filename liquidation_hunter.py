@@ -2601,6 +2601,8 @@ class ShortLiqSqueezeContinuationGuard:
     - Guard 1: agg < 0.3 = 78%+ trades SELL = bukan squeeze nyata
     - Guard 2: funding positif tinggi (>0.0005) + short_liq dekat = crowded LONG yang akan dieksekusi
     - Guard 3: bid wall jauh lebih tebal dari ask tapi agg rendah = bid wall spoofing
+    - Guard 4 (NEW): OFI SHORT kuat + agg < 0.5 = bukan squeeze
+    - Guard 5 (NEW): RSI 5m overbought (>72) + OFI SHORT = squeeze exhausted
     """
     @staticmethod
     def detect(short_liq: float, long_liq: float, change_5m: float,
@@ -2609,7 +2611,17 @@ class ShortLiqSqueezeContinuationGuard:
                # TAMBAH parameter baru untuk guards:
                funding_rate: float = 0.0,
                bid_slope: float = 0.0,
-               ask_slope: float = 0.0) -> dict:
+               ask_slope: float = 0.0,
+               # NEW parameters untuk guards tambahan
+               ofi_strength: float = 0.0) -> dict:
+        
+        # GUARD BARU #4 (LECTURER FIX): jika OFI SHORT kuat + agg < 0.5 = bukan squeeze
+        if ofi_bias == "SHORT" and ofi_strength > 0.65 and agg < 0.5:
+            return {"override": False}
+        
+        # GUARD BARU #5 (LECTURER FIX): jika RSI 5m sudah overbought (>72) + OFI SHORT = squeeze exhausted
+        if rsi6_5m > 72 and ofi_bias == "SHORT" and agg < 0.55:
+            return {"override": False}
         
         # GUARD BARU #1: agg rendah = 78%+ trades SELL = bukan squeeze nyata
         if agg < 0.3:
@@ -2749,6 +2761,183 @@ class RSI100VolumeDryBlowOff:
                 "priority": -10021
             }
         return {"override": False}
+
+
+class OFIDominantShortSqueezeVeto:
+    """
+    🔥 TRIAUSDT FIX: OFI SHORT 1.00 + agg < 0.5 + short_liq close = BAIT, bukan squeeze
+    
+    Kondisi squeeze nyata: agg > 0.55 (mayoritas BUY) + short_liq dekat
+    Kondisi BAIT: OFI SHORT kuat + agg < 0.5 (sell dominant) + short_liq dekat sebagai umpan
+    
+    Ketika 78%+ trades SELL dan order flow juga SHORT kuat, short_liq yang "dekat"
+    adalah jebakan — HFT pasang likuiditas dekat untuk memancing LONG masuk,
+    lalu distribusi dan dump.
+    
+    Priority: -10017.5 (lebih tinggi dari ShortLiqSqueezeContinuationGuard -10017)
+    Bias: SHORT
+    """
+    @staticmethod
+    def detect(ofi_bias: str, ofi_strength: float, agg: float,
+               short_liq: float, long_liq: float,
+               volume_ratio: float, change_5m: float,
+               rsi6_5m: float, down_energy: float) -> dict:
+        
+        # OFI harus sangat kuat dan berlawanan dengan squeeze
+        if ofi_bias != "SHORT" or ofi_strength < 0.7:
+            return {"override": False}
+        
+        # agg < 0.5 = mayoritas trades SELL = tidak ada squeeze nyata
+        if agg >= 0.5:
+            return {"override": False}
+        
+        # short_liq harus dekat (ini yang bikin sistem terjebak)
+        if short_liq >= 2.0:
+            return {"override": False}
+        
+        # Konfirmasi tambahan: minimal 2 dari 4
+        confirmations = sum([
+            volume_ratio < 0.65,            # volume kering
+            abs(change_5m) < 0.5,           # price flat/minimal move
+            rsi6_5m > 70,                   # 5m sudah overbought
+            down_energy < 0.01,             # no real sellers in book (spoofed)
+        ])
+        
+        if confirmations < 2:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"OFI DOMINANT SHORT SQUEEZE VETO: "
+                f"OFI={ofi_bias} (strength={ofi_strength:.2f}) kuat TAPI "
+                f"agg={agg:.2f} (sell dominant, bukan squeeze), "
+                f"short_liq={short_liq:.2f}% adalah UMPAN bukan target. "
+                f"volume={volume_ratio:.2f}x, RSI5m={rsi6_5m:.1f}, "
+                f"confirmations={confirmations}/4 → force SHORT"
+            ),
+            "priority": -10017.5
+        }
+
+
+class FlatPriceOFIDivergenceTrap:
+    """
+    🔥 TRIAUSDT FIX: Harga flat + OFI SHORT kuat + volume kering + short_liq close
+    = Smart money distribusi diam-diam sementara sistem kira ada squeeze
+    
+    Pola ini sangat licik karena:
+    - change_5m kecil (<0.5%) membuat sistem tidak trigger dump detector
+    - short_liq dekat membuat sistem mengira squeeze akan terjadi
+    - OFI SHORT 1.00 menunjukkan institusi jual besar, bukan retail short
+    
+    Kenyataan: institusi membangun posisi SHORT sambil harga flat,
+    lalu dump setelah posisi terisi penuh.
+    
+    Priority: -10017.8 (lebih tinggi dari OFIDominantShortSqueezeVeto)
+    Bias: SHORT
+    """
+    @staticmethod
+    def detect(ofi_bias: str, ofi_strength: float, change_5m: float,
+               volume_ratio: float, short_liq: float, long_liq: float,
+               agg: float, rsi6_5m: float, up_energy: float) -> dict:
+        
+        # Harga harus flat atau sangat kecil movenya
+        if abs(change_5m) >= 0.5:
+            return {"override": False}
+        
+        # OFI harus SHORT dan kuat
+        if ofi_bias != "SHORT" or ofi_strength < 0.65:
+            return {"override": False}
+        
+        # Volume harus kering
+        if volume_ratio >= 0.7:
+            return {"override": False}
+        
+        # short_liq harus dekat (itulah yang memancing sistem)
+        if short_liq >= 2.5:
+            return {"override": False}
+        
+        # agg tidak boleh terlalu bullish (jika agg > 0.65 mungkin ada squeeze nyata)
+        if agg >= 0.65:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"FLAT PRICE OFI DIVERGENCE TRAP: "
+                f"price flat ({change_5m:.2f}%) tapi OFI={ofi_bias} {ofi_strength:.2f}, "
+                f"volume={volume_ratio:.2f}x kering, short_liq={short_liq:.2f}% dekat (umpan), "
+                f"agg={agg:.2f} tidak konfirmasi squeeze → "
+                f"institusi distribusi diam-diam, dump incoming. Force SHORT."
+            ),
+            "priority": -10017.8
+        }
+
+
+class MultiTFOverboughtShortLiqGuard:
+    """
+    🔥 TRIAUSDT FIX: RSI6_5m > 75 + short_liq close + OFI SHORT + agg < 0.5
+    = 5m sudah overbought, squeeze tidak punya momentum naik lagi
+    
+    Prinsip: Short squeeze hanya bisa terjadi jika 5m RSI belum overbought.
+    Jika RSI 5m sudah > 75 tapi RSI 1m masih rendah (divergence), ini justru
+    menunjukkan trend 5m sedang berbalik ke bawah, bukan naik.
+    
+    Case TRIAUSDT:
+    - RSI6_1m = 45.3 (oversold di 1m)
+    - RSI6_5m = 79.1 (overbought di 5m)
+    → sistem kira akan squeeze, padahal 5m momentum sudah habis
+    
+    Priority: -10017.7
+    Bias: SHORT
+    """
+    @staticmethod
+    def detect(rsi6_5m: float, rsi6_1m: float,
+               short_liq: float, long_liq: float,
+               ofi_bias: str, ofi_strength: float,
+               agg: float, volume_ratio: float,
+               change_5m: float, down_energy: float) -> dict:
+        
+        # RSI 5m harus overbought
+        if rsi6_5m <= 72:
+            return {"override": False}
+        
+        # RSI 1m harus lebih rendah dari 5m (divergence = fake momentum)
+        if rsi6_1m >= rsi6_5m - 20:
+            return {"override": False}
+        
+        # short_liq harus dekat
+        if short_liq >= 2.0:
+            return {"override": False}
+        
+        # OFI harus SHORT
+        if ofi_bias != "SHORT" or ofi_strength < 0.5:
+            return {"override": False}
+        
+        # agg tidak boleh terlalu bullish
+        if agg >= 0.55:
+            return {"override": False}
+        
+        # Volume kering (squeeze tanpa volume = fake)
+        if volume_ratio >= 0.75:
+            return {"override": False}
+        
+        rsi_gap = rsi6_5m - rsi6_1m
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"MULTI-TF OVERBOUGHT SHORT LIQ GUARD: "
+                f"RSI5m={rsi6_5m:.1f} (overbought) vs RSI1m={rsi6_1m:.1f} "
+                f"(gap={rsi_gap:.0f} poin = momentum 5m sudah habis), "
+                f"short_liq={short_liq:.2f}% dekat tapi OFI={ofi_bias} {ofi_strength:.2f}, "
+                f"agg={agg:.2f} → squeeze tidak punya fuel, force SHORT"
+            ),
+            "priority": -10017.7
+        }
 
 
 # ========== LECTURER'S SARAN: EXTREME SHORT LIQ SQUEEZE DETECTORS (-1112 to -1110) ==========
@@ -13175,6 +13364,64 @@ class BinanceAnalyzer:
             return result
         
         
+        # ===== PRIORITY -10017.8: FLAT PRICE OFI DIVERGENCE TRAP (TERTINGGI BARU) =====
+        flat_ofi_trap = FlatPriceOFIDivergenceTrap.detect(
+            ofi_bias=result.get("ofi_bias", "NEUTRAL"),
+            ofi_strength=result.get("ofi_strength", 0.0),
+            change_5m=change_5m_val,
+            volume_ratio=volume_ratio,
+            short_liq=short_liq,
+            long_liq=long_liq,
+            agg=agg_val,
+            rsi6_5m=rsi6_5m_val,
+            up_energy=up_energy_val
+        )
+        if flat_ofi_trap["override"]:
+            result["bias"] = flat_ofi_trap["bias"]
+            result["reason"] = f"[FLAT OFI TRAP] {flat_ofi_trap['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = flat_ofi_trap["priority"]
+            return result
+        
+        # ===== PRIORITY -10017.7: MULTI-TF OVERBOUGHT SHORT LIQ GUARD =====
+        multitf_guard = MultiTFOverboughtShortLiqGuard.detect(
+            rsi6_5m=rsi6_5m_val,
+            rsi6_1m=rsi6_val,
+            short_liq=short_liq,
+            long_liq=long_liq,
+            ofi_bias=result.get("ofi_bias", "NEUTRAL"),
+            ofi_strength=result.get("ofi_strength", 0.0),
+            agg=agg_val,
+            volume_ratio=volume_ratio,
+            change_5m=change_5m_val,
+            down_energy=down_energy_val
+        )
+        if multitf_guard["override"]:
+            result["bias"] = multitf_guard["bias"]
+            result["reason"] = f"[MULTITF OVERBOUGHT GUARD] {multitf_guard['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = multitf_guard["priority"]
+            return result
+        
+        # ===== PRIORITY -10017.5: OFI DOMINANT SHORT SQUEEZE VETO =====
+        ofi_squeeze_veto = OFIDominantShortSqueezeVeto.detect(
+            ofi_bias=result.get("ofi_bias", "NEUTRAL"),
+            ofi_strength=result.get("ofi_strength", 0.0),
+            agg=agg_val,
+            short_liq=short_liq,
+            long_liq=long_liq,
+            volume_ratio=volume_ratio,
+            change_5m=change_5m_val,
+            rsi6_5m=rsi6_5m_val,
+            down_energy=down_energy_val
+        )
+        if ofi_squeeze_veto["override"]:
+            result["bias"] = ofi_squeeze_veto["bias"]
+            result["reason"] = f"[OFI SQUEEZE VETO] {ofi_squeeze_veto['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = ofi_squeeze_veto["priority"]
+            return result
+        
         # ===== PRIORITY -10017: SHORT LIQ SQUEEZE CONTINUATION GUARD =====
         short_squeeze_guard = ShortLiqSqueezeContinuationGuard.detect(
             short_liq=short_liq,
@@ -13190,7 +13437,8 @@ class BinanceAnalyzer:
             # TAMBAH parameter guards baru:
             funding_rate=funding_rate_val or 0.0,
             bid_slope=result.get("bid_slope", 0.0),
-            ask_slope=result.get("ask_slope", 0.0)
+            ask_slope=result.get("ask_slope", 0.0),
+            ofi_strength=result.get("ofi_strength", 0.0)
         )
         if short_squeeze_guard["override"]:
             result["bias"] = short_squeeze_guard["bias"]
