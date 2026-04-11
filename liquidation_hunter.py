@@ -9135,6 +9135,225 @@ class FundingExtremeDualTrapOverride:
 # 🔥 LECTURER'S SARAN LOGIC - EXHAUSTED SQUEEZE & FAKE PUMP DETECTORS
 # ================================================================
 
+class OBVPositiveRSIOversoldFundingNegativeReversal:
+    """
+    🔥 TRIPLE CONFLUENCE REVERSAL (PRIORITY -10013 - PALING TINGGI ABSOLUT):
+    OBV POSITIVE_EXTREME + RSI sangat oversold + Funding negatif
+    
+    Ini adalah kombinasi paling kuat untuk reversal ke atas:
+    1. OBV POSITIVE_EXTREME = smart money sudah akumulasi banyak
+    2. RSI < 15 = retail sudah kapitulasi (tidak ada yang jual lagi)  
+    3. Funding negatif = crowded short (banyak target untuk di-squeeze)
+    
+    Ketiga faktor ini = HFT PASTI akan pump.
+    Tidak peduli apa kata Greeks atau sinyal lain.
+    
+    Case: ARIAUSDT - RSI 13.5 + OBV POSITIVE_EXTREME + funding negatif = LONG
+    """
+    @staticmethod
+    def detect(obv_trend: str, obv_value: float, rsi6: float,
+               funding_rate: float, short_liq: float, long_liq: float,
+               change_5m: float, volume_ratio: float) -> dict:
+        
+        if funding_rate is None:
+            return {"override": False}
+        
+        # Triple confluence
+        obv_extreme = (obv_trend == "POSITIVE_EXTREME" and obv_value > 0)
+        rsi_capitulation = rsi6 < 15
+        funding_crowded_short = funding_rate < -0.0003
+        
+        if obv_extreme and rsi_capitulation and funding_crowded_short:
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": (
+                    f"TRIPLE CONFLUENCE REVERSAL: "
+                    f"OBV={obv_trend} ({obv_value:,.0f}) [institutional accumulation], "
+                    f"RSI={rsi6:.1f} [retail capitulation], "
+                    f"funding={funding_rate:.5f} [crowded short = squeeze target] → "
+                    f"STRONGEST possible reversal signal. "
+                    f"HFT WILL pump. Override ALL other signals."
+                ),
+                "priority": -10013
+            }
+        
+        # Versi moderat: 2 dari 3 + kondisi support
+        moderate_score = sum([obv_extreme, rsi_capitulation, funding_crowded_short])
+        if moderate_score >= 2:
+            # Tambahan konfirmasi: long_liq dekat
+            if long_liq < 2.0 and change_5m < -1.0:
+                return {
+                    "override": True,
+                    "bias": "LONG",
+                    "reason": (
+                        f"DUAL CONFLUENCE + LONG LIQ REVERSAL: "
+                        f"OBV={obv_trend}, RSI={rsi6:.1f}, "
+                        f"funding={funding_rate:.5f}, "
+                        f"long_liq={long_liq:.2f}% close → "
+                        f"Score {moderate_score}/3 + long_liq support → LONG"
+                    ),
+                    "priority": -10011
+                }
+        
+        return {"override": False}
+
+
+class GreekKillReversalAfterCapitulation:
+    """
+    🔥 GREEK KILL REVERSAL AFTER CAPITULATION (PRIORITY -10012):
+    ARIAUSDT EXACT PATTERN: Greeks bilang LONG_TRADERS_DIE (kill SHORT) tapi semua kondisi 
+    menunjukkan oversold kapitulasi dan akumulasi institusional.
+    
+    HFT logic:
+    1. Harga sudah drop keras (-3%+)
+    2. RSI oversold ekstrem (<20)
+    3. OBV POSITIVE_EXTREME (smart money akumulasi)
+    4. Funding negatif (crowded short = target untuk di-squeeze)
+    5. Long liq dekat = sweep victim sebelum pump
+    
+    Greeks salah karena mereka masih hitung berdasarkan 
+    siapa yang masuk posisi SEBELUM drop — padahal fresh 
+    short yang baru masuk setelah drop adalah target sebenarnya.
+    
+    Case: ARIAUSDT - Greeks bilang SHORT tapi RSI 13.5 + OBV POSITIVE_EXTREME + funding negatif
+    """
+    @staticmethod
+    def detect(change_5m: float, rsi6: float, obv_trend: str,
+               funding_rate: float, long_liq: float, short_liq: float,
+               greeks_kill_direction: str, volume_ratio: float,
+               down_energy: float, agg: float) -> dict:
+        
+        if funding_rate is None:
+            return {"override": False}
+        
+        # Core: sudah drop keras + oversold + OBV akumulasi
+        deep_drop = change_5m < -2.0
+        rsi_oversold = rsi6 < 20
+        obv_accumulating = obv_trend in ("POSITIVE_EXTREME", "POSITIVE")
+        funding_crowded_short = funding_rate < -0.0005
+        long_liq_close = long_liq < 2.5
+        
+        # Greeks salah arah (bilang SHORT padahal semua sinyal LONG)
+        greeks_wrong = greeks_kill_direction == "SHORT"
+        
+        # Tidak ada seller aktif (down_energy rendah meski harga turun)
+        no_seller = down_energy < 0.5
+        
+        score = sum([
+            deep_drop,
+            rsi_oversold,
+            obv_accumulating,
+            funding_crowded_short,
+            long_liq_close,
+            no_seller
+        ])
+        
+        if score >= 4 and greeks_wrong:
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": (
+                    f"GREEK KILL REVERSAL AFTER CAPITULATION: "
+                    f"drop {change_5m:.1f}%, RSI {rsi6:.1f} oversold, "
+                    f"OBV {obv_trend} (institutional accumulation), "
+                    f"funding={funding_rate:.5f} (crowded short), "
+                    f"long_liq={long_liq:.2f}% close → "
+                    f"Greeks wrong: fresh shorts = target, NOT long traders. "
+                    f"HFT sweep long stop THEN pump to kill all shorts. "
+                    f"Score: {score}/6"
+                ),
+                "priority": -10012
+            }
+        
+        return {"override": False}
+
+
+class FundingNegativeOBVPositiveLongLiqSweepPump:
+    """
+    🔥 FUNDING NEG + OBV POS + LONG LIQ SWEEP PUMP (PRIORITY -10011):
+    RAVEUSDT PATTERN: 
+    Funding negatif + OBV positif/netral + long_liq sangat dekat
+    = HFT akan sweep long liq (turun sedikit) LALU pump keras.
+    
+    Bedain dengan genuine dump:
+    - Genuine dump: OBV negatif + agg rendah + seller aktif
+    - Sweep & pump: OBV netral/positif + agg tinggi + no seller
+    
+    Kunci: agg tinggi (0.94) menunjukkan 94% trades adalah BUY.
+    Bahkan saat harga "turun" (-0.4%), mayoritas orang masih beli.
+    Ini adalah tanda HFT sedang buat "controlled dip" untuk sweep
+    long stop sebelum pump besar.
+    
+    Case: RAVEUSDT - funding negatif + agg 0.94 + long_liq 1.64% = LONG
+    """
+    @staticmethod
+    def detect(funding_rate: float, obv_trend: str, long_liq: float,
+               short_liq: float, agg: float, change_5m: float,
+               rsi6: float, down_energy: float, volume_ratio: float,
+               greeks_kill_direction: str) -> dict:
+        
+        if funding_rate is None:
+            return {"override": False}
+        
+        # Funding negatif = crowded short
+        crowded_short = funding_rate < -0.001
+        
+        # OBV tidak bearish (akumulasi atau netral)
+        obv_not_bearish = obv_trend not in ("NEGATIVE_EXTREME", "NEGATIVE")
+        
+        # Long liq sangat dekat (target sweep)
+        long_liq_target = long_liq < 2.0
+        
+        # Short liq LEBIH JAUH (setelah sweep long, short yang jadi target)
+        short_liq_further = short_liq > long_liq * 1.5
+        
+        # Agg tinggi (mayoritas trades BUY meski harga turun/flat)
+        # Ini adalah "controlled dip" bukan genuine dump
+        agg_bullish = agg > 0.6
+        
+        # Tidak ada seller aktif
+        no_active_seller = down_energy < 1.0
+        
+        # Harga belum naik banyak (masih dalam fase sweep)
+        not_pumped_yet = change_5m < 2.0
+        
+        # RSI tidak overbought (masih ada ruang naik)
+        rsi_ok = rsi6 < 75
+        
+        score = sum([
+            crowded_short,
+            obv_not_bearish,
+            long_liq_target,
+            short_liq_further,
+            agg_bullish,
+            no_active_seller,
+            not_pumped_yet,
+            rsi_ok
+        ])
+        
+        if score >= 6:
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": (
+                    f"FUNDING NEG + OBV POS + LONG LIQ SWEEP PUMP: "
+                    f"funding={funding_rate:.5f} (crowded short={crowded_short}), "
+                    f"OBV={obv_trend} (not bearish), "
+                    f"long_liq={long_liq:.2f}% (sweep target), "
+                    f"short_liq={short_liq:.2f}% (pump target after sweep), "
+                    f"agg={agg:.2f} (majority buy = controlled dip), "
+                    f"down_energy={down_energy:.2f} (no real seller) → "
+                    f"HFT controlled dip to sweep long stop, "
+                    f"THEN massive pump to kill all crowded shorts. "
+                    f"Score: {score}/8"
+                ),
+                "priority": -10011
+            }
+        
+        return {"override": False}
+
+
 class ExhaustedSqueezePostSweep:
     """
     🔥 RAVEUSDT EXACT PATTERN: Short liq sudah tersapu tapi sistem masih LONG
@@ -10916,6 +11135,64 @@ class BinanceAnalyzer:
             result["reason"] = f"[OBV-VOLUME VETO] OBV {obv_trend}, volume {volume_ratio:.2f}x → SHORT override ditolak, paksa LONG | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = -1104.6
+        
+        # ===== PRIORITY -10013: TRIPLE CONFLUENCE REVERSAL (PALING TINGGI) =====
+        triple_confluence = OBVPositiveRSIOversoldFundingNegativeReversal.detect(
+            obv_trend=result.get("obv_trend", "NEUTRAL"),
+            obv_value=result.get("obv_value", 0.0),
+            rsi6=result.get("rsi6", 50.0),
+            funding_rate=result.get("funding_rate", 0.0),
+            short_liq=short_liq,
+            long_liq=long_liq,
+            change_5m=change_5m_val,
+            volume_ratio=volume_ratio
+        )
+        if triple_confluence["override"]:
+            result["bias"] = triple_confluence["bias"]
+            result["reason"] = f"[TRIPLE CONFLUENCE] {triple_confluence['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = triple_confluence["priority"]
+            return result  # Hard return
+
+        # ===== PRIORITY -10012: GREEK KILL REVERSAL AFTER CAPITULATION =====
+        greek_kill_rev = GreekKillReversalAfterCapitulation.detect(
+            change_5m=change_5m_val,
+            rsi6=rsi6_val,
+            obv_trend=result.get("obv_trend", "NEUTRAL"),
+            funding_rate=result.get("funding_rate", 0.0),
+            long_liq=long_liq,
+            short_liq=short_liq,
+            greeks_kill_direction=result.get("greeks_kill_direction", ""),
+            volume_ratio=volume_ratio,
+            down_energy=down_energy_val,
+            agg=agg_val
+        )
+        if greek_kill_rev["override"]:
+            result["bias"] = greek_kill_rev["bias"]
+            result["reason"] = f"[GREEK KILL REVERSAL] {greek_kill_rev['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = greek_kill_rev["priority"]
+            return result  # Hard return
+
+        # ===== PRIORITY -10011: FUNDING NEG + OBV POS + LONG LIQ SWEEP PUMP =====
+        sweep_pump = FundingNegativeOBVPositiveLongLiqSweepPump.detect(
+            funding_rate=result.get("funding_rate", 0.0),
+            obv_trend=result.get("obv_trend", "NEUTRAL"),
+            long_liq=long_liq,
+            short_liq=short_liq,
+            agg=agg_val,
+            change_5m=change_5m_val,
+            rsi6=rsi6_val,
+            down_energy=down_energy_val,
+            volume_ratio=volume_ratio,
+            greeks_kill_direction=result.get("greeks_kill_direction", "")
+        )
+        if sweep_pump["override"]:
+            result["bias"] = sweep_pump["bias"]
+            result["reason"] = f"[SWEEP PUMP] {sweep_pump['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = sweep_pump["priority"]
+            return result  # Hard return
         
         # ===== PRIORITY -10010: EXHAUSTED SQUEEZE POST-SWEEP (TERTINGGI ABSOLUT) =====
         exhausted_sweep = ExhaustedSqueezePostSweep.detect(
