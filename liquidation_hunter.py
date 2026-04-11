@@ -9413,11 +9413,18 @@ class PresweepMisinterpretationGuard:
     Kondisi: long_liq < 0.3% + agg > 0.75 + ofi_bias == "LONG" 
     → BLOCK semua SHORT signal, paksa ke LONG
     Priority: -10001.5 (antara CrowdedResolver dan DualLiqFirstMove)
+
+    🔥 LECTURER FIX 4: Tambah parameter greeks_who_dies_first untuk guard BOTH_POSSIBLE
     """
     @staticmethod
     def detect(long_liq: float, short_liq: float, agg: float,
                ofi_bias: str, ofi_strength: float,
-               funding_rate: float, rsi6: float, change_5m: float) -> dict:
+               funding_rate: float, rsi6: float, change_5m: float,
+               greeks_who_dies_first: str = "") -> dict:
+
+        # Jika arah belum committed (BOTH_POSSIBLE), jangan force arah apapun
+        if greeks_who_dies_first == "BOTH_POSSIBLE":
+            return {"override": False}
 
         # Guard 1: long_liq sangat tipis tapi order flow bullish
         # Ini bukan setup dump, tapi "micro-dip sweep lalu pump"
