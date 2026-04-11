@@ -2751,6 +2751,95 @@ class RSI100VolumeDryBlowOff:
         return {"override": False}
 
 
+# ========== LECTURER'S SARAN: EXTREME SHORT LIQ SQUEEZE DETECTORS (-1112 to -1110) ==========
+
+class ExtremeShortLiqSqueezeContinuation:
+    """
+    🔥 PRIORITY -1112: SHORT LIQ SUPER DEKAT + FUNDING POSITIF + OBV POSITIF = SQUEEZE CONTINUATION
+    Overrides blow-off top detector dan fake short liq trap.
+    Memaksa LONG ketika short liq super dekat, funding positif, OBV positif, volume kering, meskipun RSI overbought.
+    """
+    @staticmethod
+    def detect(short_liq: float, funding_rate: float, obv_trend: str,
+               volume_ratio: float, rsi6: float, change_5m: float,
+               agg: float, up_energy: float) -> Dict:
+        if funding_rate is None:
+            return {"override": False}
+        
+        # Core: short liq sangat dekat (<1.5%) + funding positif (crowded long)
+        if (short_liq < 1.5 and funding_rate > 0.0005):
+            # OBV positif (akumulasi) + volume rendah (no resistance)
+            if (obv_trend in ("POSITIVE_EXTREME", "POSITIVE") and 
+                volume_ratio < 0.7 and
+                up_energy > 0.1):
+                return {
+                    "override": True,
+                    "bias": "LONG",
+                    "reason": (
+                        f"EXTREME SHORT LIQ SQUEEZE CONTINUATION: short_liq={short_liq:.2f}% super dekat, "
+                        f"funding={funding_rate:.6f} (crowded long), OBV={obv_trend} (accumulation), "
+                        f"volume={volume_ratio:.2f}x kering, up_energy={up_energy:.2f} → "
+                        f"BUKAN blow-off top, HFT akan lanjut pump untuk sweep short stops. Force LONG."
+                    ),
+                    "priority": -1112
+                }
+        
+        return {"override": False}
+
+
+class PostSweepContinuationGuard:
+    """
+    🔥 PRIORITY -1111: SHORT LIQ SUDAH TERLEWATI TAPI OBV MASIH POSITIF = LANJUT PUMP
+    Mencegah SHORT setelah short liq tersapu jika OBV masih positif dan funding positif.
+    """
+    @staticmethod
+    def detect(short_liq: float, change_5m: float, obv_trend: str,
+               funding_rate: float, volume_ratio: float) -> Dict:
+        if funding_rate is None:
+            return {"override": False}
+        
+        # Short liq sudah terlewati (harga naik > short_liq)
+        if (short_liq > 0 and change_5m > short_liq * 1.2):
+            if (obv_trend in ("POSITIVE_EXTREME", "POSITIVE") and 
+                funding_rate > 0.0003 and
+                volume_ratio < 0.8):
+                return {
+                    "override": True,
+                    "bias": "LONG",
+                    "reason": (
+                        f"POST-SWEEP CONTINUATION: price already up {change_5m:.1f}% > short_liq {short_liq:.2f}%, "
+                        f"tapi OBV={obv_trend} masih positif, funding={funding_rate:.6f} crowded long → "
+                        f"HFT belum selesai, pump akan lanjut. Force LONG, jangan SHORT."
+                    ),
+                    "priority": -1111
+                }
+        return {"override": False}
+
+
+class BlowOffTopFalseGuard:
+    """
+    🔥 PRIORITY -1110: JANGAN TRIGGER BLOW-OFF TOP JIKA SHORT LIQ MASIH DEKAT
+    Guard untuk RSI100VolumeDryBlowOff - jangan trigger jika short liq masih dekat.
+    """
+    @staticmethod
+    def detect(rsi6: float, volume_ratio: float, short_liq: float,
+               obv_trend: str, funding_rate: float) -> Dict:
+        if rsi6 > 95 and volume_ratio < 0.6:
+            # Jika short liq dekat dan OBV positif, ini squeeze, BUKAN blow-off
+            if short_liq < 2.0 and obv_trend in ("POSITIVE_EXTREME", "POSITIVE"):
+                return {
+                    "override": True,
+                    "bias": "LONG",
+                    "reason": (
+                        f"BLOW-OFF TOP FALSE GUARD: RSI={rsi6:.1f} extreme, volume={volume_ratio:.2f}x, "
+                        f"tapi short_liq={short_liq:.2f}% masih dekat dan OBV={obv_trend} → "
+                        f"Ini SHORT SQUEEZE, bukan blow-off top. Force LONG."
+                    ),
+                    "priority": -1110
+                }
+        return {"override": False}
+
+
 # ========== LIQUIDITY EXTREME OVERRIDE DETECTORS (PRIORITY -2001 to -1998) ==========
 
 class LiquidityExtremeOverride:
@@ -12824,6 +12913,46 @@ class BinanceAnalyzer:
             result["reason"] = f"[FUNDING SQUEEZE CONTINUATION] {funding_squeeze_cont['reason']} | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = funding_squeeze_cont["priority"]
+            return result
+        
+        # ========== LECTURER'S SARAN: EXTREME SHORT LIQ SQUEEZE DETECTORS (-1112 to -1110) ==========
+        # Detector-detector ini harus dijalankan SEBELUM RSI100VolumeDryBlowOff dan FakeShortLiqTrapFundingPositive
+        
+        # ===== PRIORITY -1110: BLOW-OFF TOP FALSE GUARD (PALING AWAL) =====
+        blowoff_false = BlowOffTopFalseGuard.detect(
+            rsi6=rsi6_val, volume_ratio=volume_ratio, short_liq=short_liq,
+            obv_trend=obv_trend, funding_rate=funding_rate_val
+        )
+        if blowoff_false["override"]:
+            result["bias"] = blowoff_false["bias"]
+            result["reason"] = f"[BLOWOFF FALSE GUARD] {blowoff_false['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = blowoff_false["priority"]
+            return result
+        
+        # ===== PRIORITY -1112: EXTREME SHORT LIQ SQUEEZE CONTINUATION =====
+        extreme_squeeze = ExtremeShortLiqSqueezeContinuation.detect(
+            short_liq=short_liq, funding_rate=funding_rate_val, obv_trend=obv_trend,
+            volume_ratio=volume_ratio, rsi6=rsi6_val, change_5m=change_5m_val,
+            agg=agg_val, up_energy=up_energy_val
+        )
+        if extreme_squeeze["override"]:
+            result["bias"] = extreme_squeeze["bias"]
+            result["reason"] = f"[EXTREME SQUEEZE CONT] {extreme_squeeze['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = extreme_squeeze["priority"]
+            return result
+        
+        # ===== PRIORITY -1111: POST-SWEEP CONTINUATION GUARD =====
+        post_sweep = PostSweepContinuationGuard.detect(
+            short_liq=short_liq, change_5m=change_5m_val, obv_trend=obv_trend,
+            funding_rate=funding_rate_val, volume_ratio=volume_ratio
+        )
+        if post_sweep["override"]:
+            result["bias"] = post_sweep["bias"]
+            result["reason"] = f"[POST SWEEP CONT] {post_sweep['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = post_sweep["priority"]
             return result
         
         # ===== PRIORITY -10021: RSI100 VOLUME DRY BLOW-OFF =====
