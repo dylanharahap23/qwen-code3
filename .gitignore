@@ -10,17 +10,16 @@ __pycache__/
 venv/
 .env
 .env.local
-.env.*
+*.env.*
 
-# Logs
+# Logs and temporary files
 *.log
+*.tmp
+*.swp
 
 # Editors
 .vscode/
 .idea/
-
-# Dependencies
-node_modules/
 
 # Build artifacts
 dist/

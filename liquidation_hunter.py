@@ -2112,6 +2112,72 @@ class BinanceWebSocket:
 
 # ================= NEW DETECTOR MODULES =================
 
+class FakeMicroSqueezeTrap:
+    """
+    🔥 FAKE MICRO SQUEEZE: short_liq super dekat tapi up_energy kecil + volume kering
+    Priority -10020 (PALING TINGGI)
+    Memaksa SHORT ketika agg=1.00 tapi up_energy sangat kecil, volume kering.
+    HFT melakukan micro-buy untuk memancing LONG, lalu dump.
+    """
+    @staticmethod
+    def detect(short_liq: float, change_5m: float, agg: float,
+               up_energy: float, volume_ratio: float, down_energy: float) -> dict:
+        
+        if (short_liq < 1.0 and
+            change_5m > 0 and
+            agg > 0.85 and
+            up_energy < 0.5 and
+            volume_ratio < 0.7 and
+            down_energy < 0.1):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"FAKE MICRO SQUEEZE TRAP: short_liq={short_liq:.2f}% super dekat, "
+                    f"agg={agg:.2f} (100% buy microtrades) TAPI "
+                    f"up_energy={up_energy:.2f} sangat kecil, volume={volume_ratio:.2f}x kering → "
+                    f"HFT micro-buy untuk memancing LONG, lalu dump. Force SHORT."
+                ),
+                "priority": -10020
+            }
+        return {"override": False}
+
+
+class OversoldNoAccumulationDump:
+    """
+    🔥 OVERSOLD + LONG LIQ DEKAT + TIDAK ADA AKUMULASI = DUMP LANJUT
+    Priority -10019 (sangat tinggi)
+    Memaksa SHORT ketika oversold tapi OBV tidak positif, agg rendah, OFI SHORT.
+    Ini adalah falling knife, bukan capitulation bounce.
+    """
+    @staticmethod
+    def detect(long_liq: float, change_5m: float, rsi6: float,
+               obv_trend: str, agg: float, ofi_bias: str,
+               up_energy: float, down_energy: float) -> dict:
+        
+        if (long_liq < 2.0 and
+            change_5m < -2.0 and
+            rsi6 < 30 and
+            obv_trend != "POSITIVE_EXTREME" and
+            agg < 0.4 and
+            ofi_bias == "SHORT" and
+            down_energy < up_energy * 2):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"OVERSOLD NO ACCUMULATION DUMP: "
+                    f"long_liq={long_liq:.2f}% dekat, price dropped {change_5m:.1f}%, "
+                    f"RSI={rsi6:.1f} oversold, OBV={obv_trend} (no accumulation), "
+                    f"agg={agg:.2f} (sell dominant), OFI={ofi_bias} → "
+                    f"Smart money masih distribusi, dump lanjut untuk sweep long stop. "
+                    f"Force SHORT."
+                ),
+                "priority": -10019
+            }
+        return {"override": False}
+
+
 class ShortLiqSqueezeContinuationGuard:
     """
     🔥 SHORT LIQ SANGAT DEKAT + BUY PRESSURE = SQUEEZE CONTINUATION
@@ -11783,6 +11849,41 @@ class BinanceAnalyzer:
         
         # Terapkan bias akhir
         result["bias"] = new_bias
+
+
+        # ===== PRIORITY -10020: FAKE MICRO SQUEEZE TRAP (PALING TINGGI) =====
+        fake_micro = FakeMicroSqueezeTrap.detect(
+            short_liq=short_liq,
+            change_5m=change_5m_val,
+            agg=agg_val,
+            up_energy=up_energy_val,
+            volume_ratio=volume_ratio,
+            down_energy=down_energy_val
+        )
+        if fake_micro["override"]:
+            result["bias"] = fake_micro["bias"]
+            result["reason"] = f"[FAKE MICRO SQUEEZE] {fake_micro['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = fake_micro["priority"]
+            return result
+
+        # ===== PRIORITY -10019: OVERSOLD NO ACCUMULATION DUMP =====
+        oversold_dump = OversoldNoAccumulationDump.detect(
+            long_liq=long_liq,
+            change_5m=change_5m_val,
+            rsi6=rsi6_val,
+            obv_trend=result.get("obv_trend", "NEUTRAL"),
+            agg=agg_val,
+            ofi_bias=ofi_bias,
+            up_energy=up_energy_val,
+            down_energy=down_energy_val
+        )
+        if oversold_dump["override"]:
+            result["bias"] = oversold_dump["bias"]
+            result["reason"] = f"[OVERSOLD DUMP] {oversold_dump['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = oversold_dump["priority"]
+            return result
 
 
         # ===== PRIORITY -10018: OVERSOLD OBV NEGATIVE CONTINUATION (PALING TINGGI) =====
