@@ -2397,6 +2397,199 @@ class OversoldNoAccumulationDump:
         return {"override": False}
 
 
+# ================= LECTURER'S SARAN: HFT TRAP DETECTORS =================
+
+class MicroTradeSpoofDetector:
+    """
+    🔥 MICRO-TRADE SPOOFING DETECTOR (Priority -1106)
+    HFT sering menggunakan ribuan trade kecil (micro-trades) untuk memanipulasi agg menjadi ekstrem 
+    (0.99 atau 0.01) tanpa pergerakan harga yang berarti.
+    
+    Deteksi:
+    • agg > 0.9 atau agg < 0.1
+    • volume_ratio < 0.6 (volume total rendah)
+    • abs(change_5m) < 0.5% (harga flat)
+    • Rata-rata ukuran trade dalam 1 menit < 10% dari rata-rata ukuran trade normal
+    
+    Kesimpulan: HFT sedang "catut" harga → bias NEUTRAL, blok entry.
+    """
+    @staticmethod
+    def detect(agg: float, volume_ratio: float, change_5m: float,
+               avg_trade_size: float, normal_avg_trade_size: float) -> Dict:
+        if ((agg > 0.9 or agg < 0.1) and volume_ratio < 0.6 
+            and abs(change_5m) < 0.5 and avg_trade_size < normal_avg_trade_size * 0.1):
+            return {
+                "override": True,
+                "bias": "NEUTRAL",
+                "reason": f"Micro-trade spoofing: agg={agg:.2f} ekstrem tapi volume kering & harga flat → HFT catut",
+                "priority": -1106
+            }
+        return {"override": False}
+
+
+class IcebergAccumulationDetector:
+    """
+    🧊 ICEBERG ORDER + HIDDEN ACCUMULATION (Priority -1107)
+    HFT memasang iceberg sell wall besar (ask_slope >> bid_slope) tapi secara diam-diam akumulasi di bid. 
+    Harga tidak turun meskipun ask wall tebal.
+    
+    Deteksi:
+    • ask_slope / bid_slope > 5.0
+    • change_5m > -0.5% (harga tidak turun)
+    • obv_trend == "POSITIVE_EXTREME" (akumulasi terjadi)
+    • agg > 0.7 (mayoritas trade BUY)
+    • volume_ratio < 0.8
+    
+    Kesimpulan: HFT sedang akumulasi di bawah → bias LONG.
+    """
+    @staticmethod
+    def detect(ask_slope: float, bid_slope: float, change_5m: float,
+               obv_trend: str, agg: float, volume_ratio: float) -> Dict:
+        if bid_slope > 0 and ask_slope / bid_slope > 5.0 and change_5m > -0.5:
+            if obv_trend in ("POSITIVE_EXTREME", "POSITIVE") and agg > 0.7 and volume_ratio < 0.8:
+                return {
+                    "override": True,
+                    "bias": "LONG",
+                    "reason": f"Iceberg accumulation: ask wall {ask_slope/bid_slope:.1f}x tebal tapi OBV positif & harga tidak turun → HFT akumulasi",
+                    "priority": -1107
+                }
+        return {"override": False}
+
+
+class TimeWeightedPatienceTrap:
+    """
+    ⏱️ TIME-WEIGHTED PATIENCE TRAP (Priority -1108)
+    HFT membuat market sideways berkepanjangan (10-30 menit) dengan volume sangat rendah, 
+    lalu tiba-tiba gerak cepat ke satu arah. Trader yang sudah jenuh akan ketinggalan.
+    
+    Deteksi:
+    • abs(change_5m) < 0.3% selama 10 candle terakhir
+    • volume_ratio < 0.5 selama periode yang sama
+    • Tiba-tiba change_5m > 1.5% dalam 1 menit
+    • short_liq atau long_liq masih dekat (< 3%)
+    
+    Kesimpulan: Ikuti arah breakout pertama (setelah fase sepi) → LONG jika pump, SHORT jika dump.
+    """
+    def __init__(self):
+        self.sideways_start = None
+        self.sideways_count = 0
+
+    def detect(self, change_5m: float, volume_ratio: float,
+               short_liq: float, long_liq: float) -> Dict:
+        now = time.time()
+        if abs(change_5m) < 0.3 and volume_ratio < 0.5:
+            if self.sideways_start is None:
+                self.sideways_start = now
+            self.sideways_count += 1
+        else:
+            if self.sideways_count >= 10 and abs(change_5m) > 1.5:
+                bias = "LONG" if change_5m > 0 else "SHORT"
+                target_liq = short_liq if bias == "LONG" else long_liq
+                if target_liq < 3.0:
+                    self.reset()
+                    return {
+                        "override": True,
+                        "bias": bias,
+                        "reason": f"Time-weighted patience trap: sideways {self.sideways_count} menit, lalu breakout {change_5m:.1f}% dengan liq target {target_liq:.2f}% → ikut {bias}",
+                        "priority": -1108
+                    }
+            self.reset()
+        return {"override": False}
+
+    def reset(self):
+        self.sideways_start = None
+        self.sideways_count = 0
+
+
+class VWAPDeviationTrap:
+    """
+    📉 VWAP DEVIATION TRAP (Priority -1109)
+    HFT mendorong harga jauh dari VWAP dengan volume kecil, menciptakan ilusi trend, lalu balik arah.
+    
+    Deteksi:
+    • abs(price - vwap) / vwap > 1.5% (deviasi besar)
+    • volume_ratio < 0.6 (volume rendah)
+    • rsi6 < 30 atau rsi6 > 70 (oversold/overbought)
+    • obv_trend tidak searah dengan harga
+    
+    Kesimpulan: HFT akan menarik harga kembali ke VWAP → REVERSAL.
+    """
+    @staticmethod
+    def detect(price: float, vwap: float, volume_ratio: float,
+               rsi6: float, obv_trend: str, change_5m: float) -> Dict:
+        if vwap == 0:
+            return {"override": False}
+        deviation = abs(price - vwap) / vwap * 100
+        if deviation > 1.5 and volume_ratio < 0.6:
+            if rsi6 > 70 and change_5m > 0 and obv_trend not in ("POSITIVE_EXTREME", "POSITIVE"):
+                return {
+                    "override": True,
+                    "bias": "SHORT",
+                    "reason": f"VWAP deviation trap: price {deviation:.1f}% di atas VWAP, volume kering, RSI overbought → pullback ke VWAP",
+                    "priority": -1109
+                }
+            if rsi6 < 30 and change_5m < 0 and obv_trend not in ("NEGATIVE_EXTREME", "NEGATIVE"):
+                return {
+                    "override": True,
+                    "bias": "LONG",
+                    "reason": f"VWAP deviation trap: price {deviation:.1f}% di bawah VWAP, volume kering, RSI oversold → bounce ke VWAP",
+                    "priority": -1109
+                }
+        return {"override": False}
+
+
+class OrderBookDeltaMomentum:
+    """
+    🧩 ORDER BOOK DELTA MOMENTUM (Priority -1110)
+    HFT sering memasang bid wall tipis lalu menariknya saat harga mendekat, menciptakan false breakout.
+    
+    Deteksi:
+    • Hitung perubahan bid_slope dan ask_slope dalam 3 detik terakhir.
+    • Jika bid_slope turun drastis (>50%) saat harga naik → wall ditarik.
+    • Jika ask_slope turun drastis saat harga turun → support ditarik.
+    
+    Kesimpulan: Ikuti arah setelah wall ditarik (karena HFT sudah selesai induce).
+    """
+    def __init__(self, history_sec=3):
+        self.bid_history = []
+        self.ask_history = []
+        self.history_sec = history_sec
+
+    def detect(self, bid_slope: float, ask_slope: float,
+               price: float, change_5m: float) -> Dict:
+        now = time.time()
+        self.bid_history.append((now, bid_slope))
+        self.ask_history.append((now, ask_slope))
+        # keep only last history_sec
+        self.bid_history = [(t, v) for t, v in self.bid_history if now - t <= self.history_sec]
+        self.ask_history = [(t, v) for t, v in self.ask_history if now - t <= self.history_sec]
+
+        if len(self.bid_history) >= 2:
+            bid_delta = (self.bid_history[-1][1] - self.bid_history[0][1]) / self.bid_history[0][1] if self.bid_history[0][1] != 0 else 0
+            if bid_delta < -0.5 and change_5m > 0:  # bid wall ditarik saat harga naik
+                return {
+                    "override": True,
+                    "bias": "SHORT",
+                    "reason": f"Bid wall withdrawal: bid_slope turun {abs(bid_delta)*100:.0f}% saat harga naik → HFT tarik support, akan dump",
+                    "priority": -1110
+                }
+        if len(self.ask_history) >= 2:
+            ask_delta = (self.ask_history[-1][1] - self.ask_history[0][1]) / self.ask_history[0][1] if self.ask_history[0][1] != 0 else 0
+            if ask_delta < -0.5 and change_5m < 0:
+                return {
+                    "override": True,
+                    "bias": "LONG",
+                    "reason": f"Ask wall withdrawal: ask_slope turun {abs(ask_delta)*100:.0f}% saat harga turun → HFT tarik resistance, akan pump",
+                    "priority": -1110
+                }
+        return {"override": False}
+
+
+# Global instances for stateful detectors
+_time_weighted_trap = TimeWeightedPatienceTrap()
+_order_book_delta = OrderBookDeltaMomentum()
+
+
 class ShortLiqSqueezeContinuationGuard:
     """
     🔥 SHORT LIQ SANGAT DEKAT + BUY PRESSURE = SQUEEZE CONTINUATION
@@ -12332,6 +12525,66 @@ class BinanceAnalyzer:
             result["priority_level"] = -20000
             result["reason"] = f"[PREP HARD BLOCK] Market dalam fase PREP (akumulasi) → NO TRADE | " + result.get("reason", "")
             # Tidak perlu proses filter lain
+            return result
+        
+        # ================= LECTURER'S SARAN: HFT TRAP DETECTORS (HIGHEST PRIORITY) =================
+        # Detector-detector ini harus dijalankan PALING AWAL dengan priority tertinggi (-1110 ke atas)
+        
+        # ===== PRIORITY -1110: ORDER BOOK DELTA MOMENTUM (HFT WALL WITHDRAWAL) =====
+        bid_slope = result.get("bid_slope", 0.0)
+        ask_slope = result.get("ask_slope", 0.0)
+        price = result.get("price", 0.0)
+        ob_delta = _order_book_delta.detect(bid_slope=bid_slope, ask_slope=ask_slope, price=price, change_5m=change_5m_val)
+        if ob_delta["override"]:
+            result["bias"] = ob_delta["bias"]
+            result["reason"] = f"[OB DELTA MOMENTUM] {ob_delta['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = ob_delta["priority"]
+            return result
+        
+        # ===== PRIORITY -1109: VWAP DEVIATION TRAP =====
+        vwap = result.get("vwap", 0.0)
+        vwap_trap = VWAPDeviationTrap.detect(price=price, vwap=vwap, volume_ratio=volume_ratio,
+                                              rsi6=rsi6_val, obv_trend=obv_trend, change_5m=change_5m_val)
+        if vwap_trap["override"]:
+            result["bias"] = vwap_trap["bias"]
+            result["reason"] = f"[VWAP TRAP] {vwap_trap['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = vwap_trap["priority"]
+            return result
+        
+        # ===== PRIORITY -1108: TIME-WEIGHTED PATIENCE TRAP =====
+        patience_trap = _time_weighted_trap.detect(change_5m=change_5m_val, volume_ratio=volume_ratio,
+                                                    short_liq=short_liq, long_liq=long_liq)
+        if patience_trap["override"]:
+            result["bias"] = patience_trap["bias"]
+            result["reason"] = f"[TIME PATIENCE TRAP] {patience_trap['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = patience_trap["priority"]
+            return result
+        
+        # ===== PRIORITY -1107: ICEBERG ACCUMULATION =====
+        iceberg = IcebergAccumulationDetector.detect(ask_slope=ask_slope, bid_slope=bid_slope,
+                                                      change_5m=change_5m_val, obv_trend=obv_trend,
+                                                      agg=agg_val, volume_ratio=volume_ratio)
+        if iceberg["override"]:
+            result["bias"] = iceberg["bias"]
+            result["reason"] = f"[ICEBERG ACCUMULATION] {iceberg['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = iceberg["priority"]
+            return result
+        
+        # ===== PRIORITY -1106: MICRO-TRADE SPOOFING =====
+        avg_trade_size = result.get("avg_trade_size", 0.0)
+        normal_avg_trade_size = result.get("normal_avg_trade_size", 1.0)
+        micro_spoof = MicroTradeSpoofDetector.detect(agg=agg_val, volume_ratio=volume_ratio,
+                                                      change_5m=change_5m_val, avg_trade_size=avg_trade_size,
+                                                      normal_avg_trade_size=normal_avg_trade_size)
+        if micro_spoof["override"]:
+            result["bias"] = micro_spoof["bias"]
+            result["reason"] = f"[MICRO SPOOF] {micro_spoof['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = micro_spoof["priority"]
             return result
         
         # ===== PRIORITY -10025: FUNDING EXTREME LONG LIQ TRAP (TERTINGGI ABSOLUT) =====
