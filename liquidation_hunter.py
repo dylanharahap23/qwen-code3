@@ -9562,22 +9562,12 @@ class OBVPositiveRSIOversoldFundingNegativeReversal:
 
 class GreekKillReversalAfterCapitulation:
     """
-    🔥 GREEK KILL REVERSAL AFTER CAPITULATION (PRIORITY -10012):
-    ARIAUSDT EXACT PATTERN: Greeks bilang LONG_TRADERS_DIE (kill SHORT) tapi semua kondisi 
-    menunjukkan oversold kapitulasi dan akumulasi institusional.
-    
-    HFT logic:
-    1. Harga sudah drop keras (-3%+)
-    2. RSI oversold ekstrem (<20)
-    3. OBV POSITIVE_EXTREME (smart money akumulasi)
-    4. Funding negatif (crowded short = target untuk di-squeeze)
-    5. Long liq dekat = sweep victim sebelum pump
-    
-    Greeks salah karena mereka masih hitung berdasarkan 
-    siapa yang masuk posisi SEBELUM drop — padahal fresh 
-    short yang baru masuk setelah drop adalah target sebenarnya.
-    
-    Case: ARIAUSDT - Greeks bilang SHORT tapi RSI 13.5 + OBV POSITIVE_EXTREME + funding negatif
+    🔥 GREEK KILL REVERSAL AFTER CAPITULATION (DIPERBAIKI)
+    Hanya trigger jika:
+    - change_5m < -3.0% (drop signifikan) ATAU
+    - rsi6 < 20 (oversold ekstrem) ATAU
+    - long_liq < 0.5% (super dekat) DAN change_5m < -1.5%
+    Jangan trigger jika funding extreme negatif dan long_liq masih > 1% tapi harga flat.
     """
     @staticmethod
     def detect(change_5m: float, rsi6: float, obv_trend: str,
@@ -9588,45 +9578,72 @@ class GreekKillReversalAfterCapitulation:
         if funding_rate is None:
             return {"override": False}
         
-        # Core: sudah drop keras + oversold + OBV akumulasi
+        # 🔥 GUARD: Jika funding extreme negatif (< -0.01) dan long_liq masih > 1% dan change_5m > -2%,
+        # ini bukan capitulation, ini masih dalam fase distribusi. JANGAN REVERSAL.
+        if funding_rate < -0.01 and long_liq > 1.0 and change_5m > -2.0:
+            return {"override": False}
+        
+        # 🔥 GUARD: Jika rsi6 tidak oversold (<30) dan change_5m tidak cukup turun (< -2%), jangan trigger
+        if rsi6 >= 30 and change_5m > -2.0:
+            return {"override": False}
+        
+        # Kondisi capitulation yang valid
         deep_drop = change_5m < -2.0
         rsi_oversold = rsi6 < 20
+        ultra_close_liq = long_liq < 0.5 and change_5m < -1.5
+        
+        if not (deep_drop or rsi_oversold or ultra_close_liq):
+            return {"override": False}
+        
+        # Konfirmasi OBV akumulasi
         obv_accumulating = obv_trend in ("POSITIVE_EXTREME", "POSITIVE")
         funding_crowded_short = funding_rate < -0.0005
         long_liq_close = long_liq < 2.5
-        
-        # Greeks salah arah (bilang SHORT padahal semua sinyal LONG)
-        greeks_wrong = greeks_kill_direction == "SHORT"
-        
-        # Tidak ada seller aktif (down_energy rendah meski harga turun)
         no_seller = down_energy < 0.5
         
-        score = sum([
-            deep_drop,
-            rsi_oversold,
-            obv_accumulating,
-            funding_crowded_short,
-            long_liq_close,
-            no_seller
-        ])
+        score = sum([deep_drop, rsi_oversold, obv_accumulating, 
+                     funding_crowded_short, long_liq_close, no_seller])
         
-        if score >= 4 and greeks_wrong:
+        if score >= 4:
             return {
                 "override": True,
                 "bias": "LONG",
                 "reason": (
-                    f"GREEK KILL REVERSAL AFTER CAPITULATION: "
-                    f"drop {change_5m:.1f}%, RSI {rsi6:.1f} oversold, "
-                    f"OBV {obv_trend} (institutional accumulation), "
-                    f"funding={funding_rate:.5f} (crowded short), "
-                    f"long_liq={long_liq:.2f}% close → "
-                    f"Greeks wrong: fresh shorts = target, NOT long traders. "
-                    f"HFT sweep long stop THEN pump to kill all shorts. "
-                    f"Score: {score}/6"
+                    f"GREEK KILL REVERSAL AFTER CAPITULATION (VALID): "
+                    f"drop {change_5m:.1f}%, RSI {rsi6:.1f} oversold={rsi_oversold}, "
+                    f"OBV {obv_trend}, funding={funding_rate:.5f}, long_liq={long_liq:.2f}% → "
+                    f"Score: {score}/6 → LONG"
                 ),
                 "priority": -10012
             }
         
+        return {"override": False}
+
+
+class FundingExtremeLongLiqTrapReversal:
+    """
+    🔥 FUNDING EXTREME + LONG LIQ DEKAT + HARGA FLAT = TRAP
+    funding < -0.01, long_liq < 2.0%, change_5m > -2.0% (tidak turun cukup)
+    HFT memancing LONG dengan ilusi "sweep lalu pump", tapi sebenarnya dump.
+    Priority -10025 (LEBIH TINGGI dari relentless squeeze)
+    """
+    @staticmethod
+    def detect(funding_rate: float, long_liq: float, change_5m: float,
+               down_energy: float, agg: float, obv_trend: str) -> dict:
+        if funding_rate is None:
+            return {"override": False}
+        if (funding_rate < -0.01 and
+            long_liq < 2.0 and
+            change_5m > -2.0 and
+            down_energy < 0.1 and
+            agg < 0.8 and
+            obv_trend in ("POSITIVE_EXTREME", "POSITIVE")):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"FUNDING EXTREME LONG LIQ TRAP: funding={funding_rate:.5f}, long_liq={long_liq:.2f}% dekat, price flat {change_5m:.1f}%, OBV {obv_trend} → HFT jebak LONG, force SHORT",
+                "priority": -10025
+            }
         return {"override": False}
 
 
@@ -11927,6 +11944,22 @@ class BinanceAnalyzer:
             result["priority_level"] = -20000
             result["reason"] = f"[PREP HARD BLOCK] Market dalam fase PREP (akumulasi) → NO TRADE | " + result.get("reason", "")
             # Tidak perlu proses filter lain
+            return result
+        
+        # ===== PRIORITY -10025: FUNDING EXTREME LONG LIQ TRAP (TERTINGGI ABSOLUT) =====
+        funding_long_trap = FundingExtremeLongLiqTrapReversal.detect(
+            funding_rate=funding_rate_val,
+            long_liq=long_liq,
+            change_5m=change_5m_val,
+            down_energy=down_energy_val,
+            agg=agg_val,
+            obv_trend=obv_trend
+        )
+        if funding_long_trap["override"]:
+            result["bias"] = funding_long_trap["bias"]
+            result["reason"] = f"[FUNDING LONG TRAP] {funding_long_trap['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = funding_long_trap["priority"]
             return result
         
         # ===== PRIORITY -10024: FUNDING EXTREME RELENTLESS SQUEEZE (TERTINGGI ABSOLUT) =====
