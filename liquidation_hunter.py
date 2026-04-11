@@ -2112,6 +2112,29 @@ class BinanceWebSocket:
 
 # ================= NEW DETECTOR MODULES =================
 
+class FundingExtremeRelentlessSqueeze:
+    """
+    🔥 FUNDING EXTREME RELENTLESS SQUEEZE: funding < -0.005, short_liq masih ada, down_energy=0
+    HFT akan terus pump sampai funding reset, tidak peduli seberapa jauh short_liq sudah terlewati.
+    Priority -10024 (TERTINGGI)
+    """
+    @staticmethod
+    def detect(funding_rate: float, short_liq: float, down_energy: float, agg: float) -> dict:
+        if funding_rate is None:
+            return {"override": False}
+        if (funding_rate < -0.005 and
+            short_liq < 5.0 and
+            down_energy < 0.1 and
+            agg > 0.5):
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": f"FUNDING EXTREME RELENTLESS SQUEEZE: funding={funding_rate:.5f} (< -0.5%), short_liq={short_liq:.2f}% masih ada, down_energy=0, agg={agg:.2f} → HFT akan terus pump tanpa peduli jarak, force LONG",
+                "priority": -10024
+            }
+        return {"override": False}
+
+
 class FundingExtremeSweepCompletionReversal:
     """
     🔥 FUNDING EXTREME + SWEEP COMPLETION = DUMP IMMINENT
@@ -2121,9 +2144,15 @@ class FundingExtremeSweepCompletionReversal:
     """
     @staticmethod
     def detect(funding_rate: float, change_5m: float, short_liq: float,
-               rsi6: float, volume_ratio: float) -> dict:
+               rsi6: float, volume_ratio: float,
+               obv_trend: str = "NEUTRAL", agg: float = 0.5) -> dict:
         if funding_rate is None:
             return {"override": False}
+        
+        # 🔥 GUARD: Jika OBV NEGATIVE_EXTREME dan agg > 0.85, jangan trigger (OBV lagging)
+        if obv_trend == "NEGATIVE_EXTREME" and agg > 0.85:
+            return {"override": False}
+        
         if (funding_rate < -0.005 and
             change_5m > short_liq * 2.5 and
             rsi6 > 95 and
@@ -10217,6 +10246,14 @@ class ExhaustedSqueezePostSweep:
                down_energy: float = 0.0,
                up_energy: float = 0.0) -> dict:
         
+        # 🔥 GUARD: Jika funding sangat negatif (< -0.005), jangan trigger exhausted sweep
+        if funding_rate is not None and funding_rate < -0.005:
+            return {"override": False}
+        
+        # 🔥 GUARD: Jika OBV NEGATIVE_EXTREME tapi agg > 0.85 (real-time buy dominant), OBV lagging
+        if obv_trend == "NEGATIVE_EXTREME" and agg > 0.85:
+            return {"override": False}
+        
         sweep_completed = change_5m >= short_liq * 0.7
         if not sweep_completed:
             return {"override": False}
@@ -11863,13 +11900,29 @@ class BinanceAnalyzer:
             # Tidak perlu proses filter lain
             return result
         
+        # ===== PRIORITY -10024: FUNDING EXTREME RELENTLESS SQUEEZE (TERTINGGI ABSOLUT) =====
+        relentless = FundingExtremeRelentlessSqueeze.detect(
+            funding_rate=funding_rate_val,
+            short_liq=short_liq,
+            down_energy=down_energy_val,
+            agg=agg_val
+        )
+        if relentless["override"]:
+            result["bias"] = relentless["bias"]
+            result["reason"] = f"[RELENTLESS SQUEEZE] {relentless['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = relentless["priority"]
+            return result
+        
         # ===== PRIORITY -10023: FUNDING EXTREME SWEEP COMPLETION REVERSAL (TERTINGGI) =====
         funding_sweep = FundingExtremeSweepCompletionReversal.detect(
             funding_rate=funding_rate_val,
             change_5m=change_5m_val,
             short_liq=short_liq,
             rsi6=rsi6_val,
-            volume_ratio=volume_ratio
+            volume_ratio=volume_ratio,
+            obv_trend=obv_trend,
+            agg=agg_val
         )
         if funding_sweep["override"]:
             result["bias"] = funding_sweep["bias"]
