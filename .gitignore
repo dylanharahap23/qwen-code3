@@ -5,34 +5,13 @@ __pycache__/
 *.pyo
 *.pyd
 
+# Logs and temp files
+*.log
+*.tmp
+*.swp
+
 # Environment
-.venv/
-venv/
 .env
 .env.local
 *.env.*
-
-# Logs
-*.log
-
-# Temporary files
-*.tmp
-*.swp
-*~
-
-# Coverage
-.coverage
-coverage/
-htmlcov/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# Build and distribution
-build/
-dist/
-*.egg-info/
 ```
