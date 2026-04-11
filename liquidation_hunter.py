@@ -9354,6 +9354,188 @@ class FundingNegativeOBVPositiveLongLiqSweepPump:
         return {"override": False}
 
 
+class FakeShortLiqTrapFundingPositive:
+    """
+    🔥 BULLAUSDT EXACT PATTERN (PRIORITY -10014 - LEBIH TINGGI dari semua squeeze detector):
+    Short liq dekat (<1.5%) tapi FUNDING POSITIF = umpan untuk jebak LONG.
+    
+    Logic:
+    - Short liq dekat BUKAN karena banyak short terbuka
+    - Tapi karena tidak ada yang berani short (semua orang sudah LONG)
+    - Funding positif membuktikan ini: semua orang crowded LONG
+    - HFT tidak butuh sweep short liq kecil itu
+    - Target sebenarnya: LONG yang crowded → dump untuk liquidasi
+    
+    Konfirmasi tambahan:
+    - RSI5m > 82 (overbought, tidak ada ruang naik)
+    - Stoch J > 90 (maximal, reversal imminent)
+    - Volume sangat rendah (tidak ada momentum nyata)
+    - OBV "positif" tapi volume kering = OBV stale/palsu
+    - Long liq jauh lebih besar (banyak LONG yang bisa di-liquidasi)
+    
+    Case: BULLAUSDT - short_liq 0.6%, funding +0.000093, RSI5m 89.1, Stoch J 99.2, volume 0.32x
+    Hasil: Sistem LONG, HFT dump 8%
+    
+    Priority: -10014 (LEBIH TINGGI dari Triple Confluence -10013)
+    Bias: SHORT
+    """
+    @staticmethod
+    def detect(short_liq: float, long_liq: float,
+               funding_rate: float,
+               rsi6_5m: float, stoch_j: float,
+               volume_ratio: float,
+               obv_trend: str,
+               change_5m: float,
+               agg: float) -> dict:
+        
+        if funding_rate is None:
+            return {"override": False}
+        
+        # Core: short liq dekat TAPI funding positif (crowded LONG)
+        short_liq_close = short_liq < 1.5
+        funding_crowded_long = funding_rate > 0.00005  # threshold rendah
+        
+        if not (short_liq_close and funding_crowded_long):
+            return {"override": False}
+        
+        # Long liq jauh lebih besar = banyak LONG yang bisa di-liquidasi
+        long_liq_far = long_liq > short_liq * 5
+        
+        # RSI overbought di 5m
+        rsi_overbought = rsi6_5m > 82
+        
+        # Stochastic maximal
+        stoch_maximal = stoch_j > 90
+        
+        # Volume kering (tidak ada momentum nyata)
+        volume_dry = volume_ratio < 0.5
+        
+        # OBV "positif" tapi volume kering = OBV stale/palsu
+        obv_fake = (obv_trend in ("POSITIVE_EXTREME", "POSITIVE") 
+                    and volume_ratio < 0.5)
+        
+        # Harga sudah naik (tapi kecil — classic fake pump)
+        fake_pump = 0 < change_5m < 3.0
+        
+        score = sum([
+            long_liq_far,
+            rsi_overbought,
+            stoch_maximal,
+            volume_dry,
+            obv_fake,
+            fake_pump
+        ])
+        
+        if score >= 4:
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"FAKE SHORT LIQ TRAP (FUNDING POSITIVE): "
+                    f"short_liq={short_liq:.2f}% dekat TAPI "
+                    f"funding={funding_rate:.6f} (crowded LONG, bukan SHORT), "
+                    f"long_liq={long_liq:.2f}% (ratio {long_liq/short_liq:.1f}x = "
+                    f"banyak LONG yang jadi target dump), "
+                    f"RSI5m={rsi6_5m:.1f} overbought, "
+                    f"Stoch J={stoch_j:.1f} maximal, "
+                    f"volume={volume_ratio:.2f}x kering → "
+                    f"SHORT LIQ ADALAH UMPAN. "
+                    f"HFT akan DUMP untuk liquidasi LONG crowded. "
+                    f"Score: {score}/6"
+                ),
+                "priority": -10014
+            }
+        
+        return {"override": False}
+
+
+class StochasticJMaximalBlowOff:
+    """
+    🔥 Stochastic J mendekati/menyentuh 100 = blow-off top absolut.
+    
+    Stoch J = 3K - 2D. Ketika J > 95:
+    - Momentum sudah maximal secara matematis
+    - Tidak ada ruang untuk naik lebih
+    - Reversal PASTI akan terjadi
+    
+    Ini bahkan lebih akurat dari RSI untuk deteksi blow-off karena
+    Stoch J mempertimbangkan price range bukan hanya momentum.
+    
+    Kondisi untuk SHORT:
+    - stoch_j > 95 (maximal)
+    - rsi6_5m > 80 (overbought di 5m)
+    - volume_ratio < 0.55 (tidak ada fuel)
+    - funding_rate > 0 (crowded LONG)
+    - short_liq > long_liq * 3 ATAU funding > 0
+      (konfirmasi tidak ada short yang perlu di-sweep)
+    
+    Priority: -10013.5 (antara FakeShortLiqTrap -10014 dan TripleConfluence -10013)
+    Bias: SHORT
+    """
+    @staticmethod
+    def detect(stoch_j: float, stoch_k: float, stoch_d: float,
+               rsi6_5m: float, rsi14: float,
+               volume_ratio: float,
+               funding_rate: float,
+               short_liq: float, long_liq: float,
+               change_5m: float) -> dict:
+        
+        if funding_rate is None:
+            funding_rate = 0.0
+        
+        # Stoch J maximal
+        stoch_maximal = stoch_j > 95
+        
+        if not stoch_maximal:
+            return {"override": False}
+        
+        # Konfirmasi overbought multi-TF
+        rsi_5m_overbought = rsi6_5m > 80
+        rsi14_overbought = rsi14 > 70
+        
+        # Volume kering (blow-off tanpa fuel)
+        volume_dry = volume_ratio < 0.55
+        
+        # Funding tidak sangat negatif
+        # (jika funding sangat negatif, mungkin genuine short squeeze)
+        not_genuine_squeeze = funding_rate > -0.003
+        
+        # Long liq lebih "reachable" (banyak LONG yang bisa dilikuidasi)
+        # Bahkan jika short_liq lebih dekat secara jarak,
+        # jika jumlah LONG lebih besar (estimasi dari funding positif)
+        # maka dump lebih profitable
+        crowded_long = funding_rate > 0
+        
+        score = sum([
+            rsi_5m_overbought,
+            rsi14_overbought,
+            volume_dry,
+            not_genuine_squeeze,
+            crowded_long,
+            change_5m > 0  # sedang dalam uptrend = blow-off
+        ])
+        
+        if score >= 4:
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"STOCHASTIC J MAXIMAL BLOW-OFF: "
+                    f"Stoch J={stoch_j:.1f} (maximal >95), "
+                    f"K={stoch_k:.1f} D={stoch_d:.1f}, "
+                    f"RSI5m={rsi6_5m:.1f} RSI14={rsi14:.1f} overbought, "
+                    f"volume={volume_ratio:.2f}x kering, "
+                    f"funding={funding_rate:.6f} ({'crowded LONG' if funding_rate > 0 else 'netral'}), "
+                    f"change={change_5m:.1f}% → "
+                    f"Blow-off top matematis. "
+                    f"Reversal PASTI terjadi. Score: {score}/6"
+                ),
+                "priority": -10013.5
+            }
+        
+        return {"override": False}
+
+
 class ExhaustedSqueezePostSweep:
     """
     🔥 RAVEUSDT EXACT PATTERN: Short liq sudah tersapu tapi sistem masih LONG
@@ -10965,12 +11147,17 @@ class BinanceAnalyzer:
         ofi_strength = result.get("ofi_strength", 0.0)
         volume_ratio = result.get("volume_ratio", 1.0)
         rsi6_val = result.get("rsi6", 50.0)
+        rsi6_5m_val = result.get("rsi6_5m", 50.0)
+        rsi14_val = result.get("rsi14", 50.0)
         change_5m_val = result.get("change_5m", 0.0)
         down_energy_val = result.get("down_energy", 0.0)
         up_energy_val = result.get("up_energy", 0.0)
         funding_rate_val = result.get("funding_rate", 0.0)
         obv_trend = result.get("obv_trend", "NEUTRAL")
         obv_value = result.get("obv_value", 0.0)
+        stoch_k_val = result.get("stoch_k", 50.0)
+        stoch_d_val = result.get("stoch_d", 50.0)
+        stoch_j_val = result.get("stoch_j", 50.0)
         kill_direction = result.get("greeks_kill_direction", "")
         who_dies_first = result.get("greeks_who_dies_first", "")
         delta_crowded = result.get("greeks_delta_crowded", "NEUTRAL")
@@ -11135,6 +11322,51 @@ class BinanceAnalyzer:
             result["reason"] = f"[OBV-VOLUME VETO] OBV {obv_trend}, volume {volume_ratio:.2f}x → SHORT override ditolak, paksa LONG | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = -1104.6
+        
+        # ===== PRIORITY -10014: FAKE SHORT LIQ TRAP FUNDING POSITIVE (PALING TINGGI ABSOLUT) =====
+        fake_short_liq = FakeShortLiqTrapFundingPositive.detect(
+            short_liq=short_liq,
+            long_liq=long_liq,
+            funding_rate=result.get("funding_rate", 0.0),
+            rsi6_5m=rsi6_5m_val,
+            stoch_j=stoch_j_val,
+            volume_ratio=volume_ratio,
+            obv_trend=obv_trend,
+            change_5m=change_5m_val,
+            agg=agg_val
+        )
+        if fake_short_liq["override"]:
+            result["bias"] = fake_short_liq["bias"]
+            result["reason"] = (
+                f"[FAKE SHORT LIQ TRAP] {fake_short_liq['reason']} | "
+                + result.get("reason", "")
+            )
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = fake_short_liq["priority"]
+            return result  # Hard return
+
+        # ===== PRIORITY -10013.5: STOCHASTIC J MAXIMAL BLOW-OFF =====
+        stoch_blowoff = StochasticJMaximalBlowOff.detect(
+            stoch_j=stoch_j_val,
+            stoch_k=stoch_k_val,
+            stoch_d=stoch_d_val,
+            rsi6_5m=rsi6_5m_val,
+            rsi14=rsi14_val,
+            volume_ratio=volume_ratio,
+            funding_rate=result.get("funding_rate", 0.0),
+            short_liq=short_liq,
+            long_liq=long_liq,
+            change_5m=change_5m_val
+        )
+        if stoch_blowoff["override"]:
+            result["bias"] = stoch_blowoff["bias"]
+            result["reason"] = (
+                f"[STOCH J BLOWOFF] {stoch_blowoff['reason']} | "
+                + result.get("reason", "")
+            )
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = stoch_blowoff["priority"]
+            return result  # Hard return
         
         # ===== PRIORITY -10013: TRIPLE CONFLUENCE REVERSAL (PALING TINGGI) =====
         triple_confluence = OBVPositiveRSIOversoldFundingNegativeReversal.detect(
