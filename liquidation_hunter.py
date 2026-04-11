@@ -2112,6 +2112,37 @@ class BinanceWebSocket:
 
 # ================= NEW DETECTOR MODULES =================
 
+class ExtremeDropMomentumOverride:
+    """
+    🔥 EXTREME DROP MOMENTUM OVERRIDE: Harga turun >12% dalam 5m, volume kering, RSI <15
+    Memaksa SHORT, meng-override semua sinyal reversal (termasuk Triple Confluence).
+    Momentum bearish masih terlalu kuat untuk reversal.
+    Priority -10021 (PALING TINGGI)
+    """
+    @staticmethod
+    def detect(change_5m: float, volume_ratio: float, rsi6: float,
+               long_liq: float, down_energy: float = 0.0) -> dict:
+        
+        if (change_5m < -12.0 and
+            volume_ratio < 0.7 and
+            rsi6 < 15 and
+            long_liq < 2.0 and
+            down_energy < 0.5):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"EXTREME DROP MOMENTUM OVERRIDE: "
+                    f"price crashed {change_5m:.1f}% in 5m, volume {volume_ratio:.2f}x kering, "
+                    f"RSI={rsi6:.1f} capitulation, long_liq={long_liq:.2f}% (target reached). "
+                    f"Momentum still strongly bearish, no reversal yet. "
+                    f"Force SHORT, override all reversal signals."
+                ),
+                "priority": -10021
+            }
+        return {"override": False}
+
+
 class FakeMicroSqueezeTrap:
     """
     🔥 FAKE MICRO SQUEEZE: short_liq super dekat tapi up_energy kecil + volume kering
@@ -9317,6 +9348,10 @@ class OBVPositiveRSIOversoldFundingNegativeReversal:
                funding_rate: float, short_liq: float, long_liq: float,
                change_5m: float, volume_ratio: float) -> dict:
         
+        # 🔥 GUARD: Jika harga sudah turun >12%, jangan trigger reversal (biarkan momentum dulu)
+        if change_5m < -12.0:
+            return {"override": False}
+        
         if funding_rate is None:
             return {"override": False}
         
@@ -11720,6 +11755,21 @@ class BinanceAnalyzer:
             result["priority_level"] = -20000
             result["reason"] = f"[PREP HARD BLOCK] Market dalam fase PREP (akumulasi) → NO TRADE | " + result.get("reason", "")
             # Tidak perlu proses filter lain
+            return result
+        
+        # ===== PRIORITY -10021: EXTREME DROP MOMENTUM OVERRIDE (PALING TINGGI) =====
+        extreme_drop = ExtremeDropMomentumOverride.detect(
+            change_5m=change_5m_val,
+            volume_ratio=volume_ratio,
+            rsi6=rsi6_val,
+            long_liq=long_liq,
+            down_energy=down_energy_val
+        )
+        if extreme_drop["override"]:
+            result["bias"] = extreme_drop["bias"]
+            result["reason"] = f"[EXTREME DROP] {extreme_drop['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = extreme_drop["priority"]
             return result
         
         # ===== BAIT PHASE SOFT BLOCK (tidak langsung block, tapi turunkan confidence) =====
