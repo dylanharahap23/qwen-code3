@@ -5,18 +5,19 @@ __pycache__/
 *.pyo
 *.pyd
 
+# Logs and temp files
+*.log
+*.tmp
+*.swp
+
 # Environment
 .env
 .env.local
 *.env.*
 
-# Logs
-*.log
-
-# Temporary files
-*.tmp
-*.swp
-*.swo
+# Editors
+.vscode/
+.idea/
 
 # Dependencies
 .venv/
@@ -27,21 +28,4 @@ node_modules/
 dist/
 build/
 target/
-
-# Editors
-.vscode/
-.idea/
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Coverage
-.coverage
-coverage/
-htmlcov/
-
-# Cache
-.mypy_cache/
-.pytest_cache/
 ```

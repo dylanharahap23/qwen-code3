@@ -1268,6 +1268,29 @@ def _delta_calculate(data: dict) -> dict:
         who_dies_first = "SHORT_TRADERS"  # setelah sweep long stop, short yang mati
         liq_7pct_touch = "SHORT_TRADERS_DIE"
 
+    # ===== FIX 2: Override who_is_crowded berdasarkan agg jika ekstrem =====
+    # agg adalah ground truth transaksi nyata, tidak bisa dispoof
+    agg_val = data.get("agg", 0.5)
+    obv_value = data.get("obv_value", 0)
+
+    if agg_val > 0.85 and obv_value > 200_000_000:
+        # 85%+ trades BUY + OBV sangat besar positif
+        # = SHORT yang crowded (mereka yang short akan dieksekusi)
+        who_is_crowded = "SHORT"
+        # Jika short_liq lebih dekat dari long_liq → kill LONG (sweep short)
+        if short_dies_at < long_dies_at:
+            kill_direction = "LONG"
+            who_dies_first = "SHORT_TRADERS"
+            liq_7pct_touch = "SHORT_TRADERS_DIE"
+
+    elif agg_val < 0.15 and obv_value < -200_000_000:
+        # 85%+ trades SELL + OBV sangat besar negatif = LONG crowded
+        who_is_crowded = "LONG"
+        if long_dies_at < short_dies_at:
+            kill_direction = "SHORT"
+            who_dies_first = "LONG_TRADERS"
+            liq_7pct_touch = "LONG_TRADERS_DIE"
+
     liq_pressure_short = max(0.0, 10.0 - short_dies_at) / 10.0
     liq_pressure_long  = max(0.0, 10.0 - long_dies_at)  / 10.0
     delta_exposure = max(liq_pressure_short, liq_pressure_long)
@@ -1548,7 +1571,36 @@ def _greeks_absolute_score(
         
         # Cek konflik dengan kill direction
         if kill_direction != "NEUTRAL" and fade_direction != kill_direction:
-            # Abaikan Vega, ikuti kill direction
+            
+            # GUARD BARU: Jika OBV magnitude sangat besar dan agg sangat tinggi,
+            # kill_direction mungkin salah — percaya Vega fade (arah aslinya)
+            obv_value_abs = abs(data.get("obv_value", 0))
+            agg_val = data.get("agg", 0.5)
+            
+            obv_magnitude_extreme = obv_value_abs > 500_000_000  # 500 juta
+            agg_confirms_fade = (
+                (fade_direction == "LONG" and agg_val > 0.80) or
+                (fade_direction == "SHORT" and agg_val < 0.20)
+            )
+            
+            if obv_magnitude_extreme and agg_confirms_fade:
+                # OBV besar + agg konfirmasi = Vega fade yang benar,
+                # kill_direction yang salah
+                return {
+                    "final_bias": fade_direction,  # ikuti Vega, bukan kill
+                    "override": True,
+                    "confidence": "ABSOLUTE",
+                    "priority": -9991.4,
+                    "score_reason": (
+                        f"VEGA-KILL CONFLICT OVERRIDDEN BY OBV+AGG: "
+                        f"OBV={obv_value_abs:,.0f} (extreme institutional), "
+                        f"agg={agg_val:.2f} (confirms {fade_direction}), "
+                        f"kill_direction={kill_direction} kemungkinan salah → "
+                        f"percaya Vega fade ke {fade_direction}"
+                    )
+                }
+            
+            # Default: ikuti kill direction (existing logic)
             return {
                 "final_bias": kill_direction,
                 "override": True,
@@ -10391,6 +10443,72 @@ class RSIDivergenceExtremeWithLiqContext:
         return {"override": False}
 
 
+class MassiveOBVDipBuySignal:
+    """
+    🔥 AKEUSDT PATTERN: OBV > 500 juta POSITIF + dip kecil + agg tinggi
+    
+    Ketika OBV akumulatif sangat besar (institutional buying jangka panjang)
+    dan harga turun -1% sampai -4% dengan:
+    - agg masih tinggi (>0.80) = retail beli dip
+    - down_energy = 0 = tidak ada seller nyata
+    - RSI14 masih bullish (>50) = trend jangka menengah naik
+    
+    Ini adalah "engineered dip" — HFT sengaja turunkan harga
+    untuk mancing short masuk, lalu pump untuk bunuh mereka.
+    
+    Bukan genuine dump karena:
+    - OBV tidak turun (akumulasi masih jalan)
+    - down_energy = 0 (tidak ada yang mau jual)
+    - agg tinggi (orang masih beli)
+    
+    Priority: -10010.5 (lebih tinggi dari OversoldBounce -10009)
+    Bias: LONG
+    """
+    @staticmethod
+    def detect(obv_value: float, obv_trend: str,
+               change_5m: float, agg: float,
+               down_energy: float, rsi14: float,
+               rsi6: float, short_liq: float,
+               volume_ratio: float) -> dict:
+        
+        # OBV harus sangat besar dan positif
+        if obv_value < 500_000_000:
+            return {"override": False}
+        
+        if obv_trend not in ("POSITIVE_EXTREME", "POSITIVE"):
+            return {"override": False}
+        
+        # Dip kecil (bukan crash)
+        if not (-5.0 < change_5m < -0.5):
+            return {"override": False}
+        
+        # Konfirmasi: buyer masih dominan
+        agg_bullish = agg > 0.75
+        no_seller = down_energy < 0.1
+        trend_bullish = rsi14 > 50  # trend 14-bar masih naik
+        rsi6_not_extreme_low = rsi6 > 15  # bukan crash brutal
+        
+        score = sum([agg_bullish, no_seller, trend_bullish, rsi6_not_extreme_low])
+        
+        if score >= 3:
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": (
+                    f"MASSIVE OBV DIP BUY: OBV={obv_value:,.0f} "
+                    f"({obv_trend}) = institutional akumulasi besar, "
+                    f"dip {change_5m:.1f}% dengan agg={agg:.2f} (buyer dominan), "
+                    f"down_energy={down_energy:.2f} (no sellers), "
+                    f"RSI14={rsi14:.1f} (trend masih bullish) → "
+                    f"HFT engineered dip untuk mancing short. "
+                    f"Pump akan menyusul. Score: {score}/4"
+                ),
+                "priority": -10010.5
+            }
+        
+        return {"override": False}
+
+
 class ExhaustedSqueezePostSweep:
     """
     🔥 RAVEUSDT EXACT PATTERN: Short liq sudah tersapu tapi sistem masih LONG
@@ -11606,8 +11724,14 @@ class HFT6PercentDirection:
                 primary = "LONG"
                 reason = "Energi up sangat murah → HFT akan pump terlebih dahulu"
             elif down_energy < up_energy * 0.5 and primary == "LONG":
-                primary = "SHORT"
-                reason = "Energi down sangat murah → HFT akan dump terlebih dahulu"
+                if down_energy < 0.01:
+                    # down_energy = 0 bukan "murah untuk dump"
+                    # artinya TIDAK ADA seller = tidak mungkin dump
+                    # Pertahankan LONG
+                    reason += " (down_energy=0 = no sellers, maintaining LONG)"
+                else:
+                    primary = "SHORT"
+                    reason = "Energi down sangat murah → HFT akan dump terlebih dahulu"
 
         if oi_delta > 2.0:
             reason += ", OI naik → posisi terperangkap memperkuat arah"
@@ -12805,6 +12929,29 @@ class BinanceAnalyzer:
             result["priority_level"] = sweep_pump["priority"]
             return result  # Hard return
         
+        # ===== PRIORITY -10010.5: MASSIVE OBV DIP BUY SIGNAL (FIX 3) =====
+        # Dipanggil SEBELUM exhausted_sweep untuk menangkap pola AKEUSDT
+        obv_dip_buy = MassiveOBVDipBuySignal.detect(
+            obv_value=result.get("obv_value", 0),
+            obv_trend=result.get("obv_trend", "NEUTRAL"),
+            change_5m=change_5m_val,
+            agg=agg_val,
+            down_energy=down_energy_val,
+            rsi14=rsi14_val,
+            rsi6=rsi6_val,
+            short_liq=short_liq,
+            volume_ratio=volume_ratio
+        )
+        if obv_dip_buy["override"]:
+            result["bias"] = obv_dip_buy["bias"]
+            result["reason"] = (
+                f"[MASSIVE OBV DIP BUY] {obv_dip_buy['reason']} | "
+                + result.get("reason", "")
+            )
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = obv_dip_buy["priority"]
+            return result
+        
         # ===== PRIORITY -10010: EXHAUSTED SQUEEZE POST-SWEEP (TERTINGGI ABSOLUT) =====
         exhausted_sweep = ExhaustedSqueezePostSweep.detect(
             change_5m=change_5m_val,
@@ -13193,25 +13340,58 @@ class BinanceAnalyzer:
                 result["_funding_obv_override"] = True
 
         # ===== PRIORITY -10002: VEGA FADE OVERRIDE (BAIT + DUAL TRAP) =====
-        # FIX 3: Jika Vega aktif dan (BAIT phase atau dual trap) dengan volume rendah,
-        # paksa bias mengikuti greeks_bias (yang biasanya fade direction) dan skip crowded resolver
+        # FIX 5: Guard agg > 0.80 di VEGA-KILL CONFLICT block
+        # Jika agg sangat tinggi dan OBV besar, Vega fade tidak reliable — agg adalah ground truth
         vega_fade_triggered = False
         vega_active = result.get("greeks_vega_active", False)
         dual_trap_active = result.get("dual_liq_trap", {}).get("dual_liq_trap", False)
         market_phase = phase_result.phase if phase_result else "UNKNOWN"
         
         if vega_active and (market_phase == "BAIT" or dual_trap_active) and volume_ratio < 0.7:
-            greeks_bias = result.get("greeks_bias", "NEUTRAL")
-            if greeks_bias in ("LONG", "SHORT"):
-                result["bias"] = greeks_bias
-                result["reason"] = f"[VEGA FADE OVERRIDE] BAIT phase + dual trap aktif, mengikuti Greeks fade ke {greeks_bias} | " + result.get("reason", "")
-                result["confidence"] = "ABSOLUTE"
-                result["priority_level"] = -10002
-                result["_vega_fade_override"] = True
-                # Skip crowded resolver nanti
+            
+            # GUARD: agg ekstrem + OBV besar mengalahkan Vega fade
+            agg_v = result.get("agg", 0.5)
+            obv_v = result.get("obv_value", 0)
+            
+            if agg_v > 0.80 and obv_v > 300_000_000:
+                # 80%+ trades BUY + OBV besar = bukan fake move
+                # Vega sedang salah baca situasi
+                result["bias"] = "LONG"
+                result["reason"] = (
+                    f"[VEGA FADE BLOCKED BY AGG+OBV] "
+                    f"agg={agg_v:.2f} (80%+ real buy trades) + "
+                    f"OBV={obv_v:,.0f} (institutional) → "
+                    f"Vega fade tidak valid, move adalah nyata. Force LONG | "
+                    + result.get("reason", "")
+                )
+                result["priority_level"] = -10002.5
+                vega_fade_triggered = True  # mark as handled
+            
+            elif agg_v < 0.20 and obv_v < -300_000_000:
+                # Mirror: 80%+ SELL + OBV besar negatif → SHORT nyata
+                result["bias"] = "SHORT"
+                result["reason"] = (
+                    f"[VEGA FADE BLOCKED BY AGG+OBV] "
+                    f"agg={agg_v:.2f} (80%+ real sell trades) + "
+                    f"OBV={obv_v:,.0f} (distribution) → Force SHORT | "
+                    + result.get("reason", "")
+                )
+                result["priority_level"] = -10002.5
                 vega_fade_triggered = True
+            
             else:
-                vega_fade_triggered = False
+                # Kondisi normal: ikuti Vega fade
+                greeks_bias = result.get("greeks_bias", "NEUTRAL")
+                if greeks_bias in ("LONG", "SHORT"):
+                    result["bias"] = greeks_bias
+                    result["reason"] = f"[VEGA FADE OVERRIDE] BAIT phase + dual trap aktif, mengikuti Greeks fade ke {greeks_bias} | " + result.get("reason", "")
+                    result["confidence"] = "ABSOLUTE"
+                    result["priority_level"] = -10002
+                    result["_vega_fade_override"] = True
+                    # Skip crowded resolver nanti
+                    vega_fade_triggered = True
+                else:
+                    vega_fade_triggered = False
         else:
             vega_fade_triggered = False
         
