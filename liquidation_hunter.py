@@ -9522,15 +9522,39 @@ class StochasticJMaximalBlowOff:
                volume_ratio: float,
                funding_rate: float,
                short_liq: float, long_liq: float,
-               change_5m: float) -> dict:
+               change_5m: float,
+               # ===== TAMBAHAN PARAMETER (PATCH) =====
+               rsi6: float = 50.0,
+               agg: float = 0.5) -> dict:
         
         if funding_rate is None:
             funding_rate = 0.0
         
-        # Stoch J maximal
         stoch_maximal = stoch_j > 95
-        
         if not stoch_maximal:
+            return {"override": False}
+        
+        # 🔥 GUARD 1: Stoch J > 108 = OVERFLOW ARTIFACT
+        # Ini terjadi saat RSI6=100 dan momentum sangat kuat
+        # Bukan sinyal valid, skip
+        if stoch_j > 108:
+            return {"override": False}
+        
+        # 🔥 GUARD 2: RSI6=100 + change besar = MOMENTUM CONTINUATION
+        # Bukan blow-off top — ini squeeze yang masih berjalan
+        if rsi6 >= 98 and change_5m > 5.0:
+            return {"override": False}
+        
+        # 🔥 GUARD 3: Tidak ada target likuiditas dekat
+        # Jika short_liq > 5% dan long_liq > 10%, tidak ada yang perlu di-dump
+        no_liq_target = (short_liq > 5.0 and long_liq > 10.0)
+        if no_liq_target:
+            return {"override": False}
+        
+        # 🔥 GUARD 4: agg rendah tapi change besar
+        # Jika agg < 0.4 saat pump besar = distribusi nyata
+        # Tapi jika agg > 0.6 saat pump = momentum nyata, jangan SHORT
+        if agg > 0.65 and change_5m > 5.0:
             return {"override": False}
         
         # Konfirmasi overbought multi-TF
@@ -9541,13 +9565,9 @@ class StochasticJMaximalBlowOff:
         volume_dry = volume_ratio < 0.55
         
         # Funding tidak sangat negatif
-        # (jika funding sangat negatif, mungkin genuine short squeeze)
         not_genuine_squeeze = funding_rate > -0.003
         
-        # Long liq lebih "reachable" (banyak LONG yang bisa dilikuidasi)
-        # Bahkan jika short_liq lebih dekat secara jarak,
-        # jika jumlah LONG lebih besar (estimasi dari funding positif)
-        # maka dump lebih profitable
+        # Long liq lebih "reachable"
         crowded_long = funding_rate > 0
         
         score = sum([
@@ -9556,7 +9576,7 @@ class StochasticJMaximalBlowOff:
             volume_dry,
             not_genuine_squeeze,
             crowded_long,
-            change_5m > 0  # sedang dalam uptrend = blow-off
+            change_5m > 0
         ])
         
         if score >= 4:
@@ -9575,6 +9595,137 @@ class StochasticJMaximalBlowOff:
                     f"Reversal PASTI terjadi. Score: {score}/6"
                 ),
                 "priority": -10013.5
+            }
+        
+        return {"override": False}
+
+
+class AggOFIFullBullishContinuation:
+    """
+    🔥 PATTERN: agg=1.00 + OFI LONG 1.00 + down_energy=0 + pump aktif
+    = Squeeze masih berjalan, JANGAN SHORT apapun alasannya.
+    
+    Ini adalah kondisi paling bullish yang bisa ada:
+    - 100% trades adalah BUY
+    - Order flow 100% bullish
+    - Tidak ada seller sama sekali
+    - Harga sedang naik
+    
+    Dalam kondisi ini, SEMUA reversal detector harus diblokir.
+    Satu-satunya yang boleh override adalah:
+    - RSI6 = 100 DAN short_liq sudah terlewati jauh (>2x)
+    - Stoch J > 108 (overflow = tidak valid)
+    
+    Priority: -10016 (PALING TINGGI ABSOLUT)
+    Bias: LONG (protection dari false SHORT)
+    """
+    @staticmethod
+    def detect(agg: float, ofi_bias: str, ofi_strength: float,
+               down_energy: float, change_5m: float,
+               short_liq: float, rsi6: float,
+               rsi6_5m: float, volume_ratio: float) -> dict:
+        
+        # Core: triple full bullish
+        full_bullish = (
+            agg > 0.90 and
+            ofi_bias == "LONG" and
+            ofi_strength > 0.85 and
+            down_energy < 0.01 and
+            change_5m > 0
+        )
+        
+        if not full_bullish:
+            return {"override": False}
+        
+        # Konfirmasi squeeze masih aktif
+        squeeze_active = (
+            short_liq > 0.5 and      # masih ada short liq yang belum tersapu
+            change_5m < short_liq * 3  # harga belum jauh melewati target
+        )
+        
+        # Tidak overbought absolut
+        not_absolute_top = not (rsi6 >= 100 and change_5m > short_liq * 2)
+        
+        if squeeze_active and not_absolute_top:
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": (
+                    f"AGG-OFI FULL BULLISH CONTINUATION: "
+                    f"agg={agg:.2f} (100% buy), OFI={ofi_bias} {ofi_strength:.2f}, "
+                    f"down_energy={down_energy:.3f} (zero sellers), "
+                    f"change={change_5m:.1f}%, short_liq={short_liq:.2f}% → "
+                    f"Squeeze MASIH BERJALAN. "
+                    f"BLOCK semua reversal signal."
+                ),
+                "priority": -10016
+            }
+        
+        return {"override": False}
+
+
+class OBVLaggingAggContradictionResolver:
+    """
+    🔥 OBV NEGATIVE_EXTREME tapi agg=1.00 = OBV LAGGING/STALE
+    
+    OBV dihitung dari volume historis. Ketika:
+    - OBV = NEGATIVE_EXTREME (dari periode sebelumnya)
+    - Tapi agg = 1.00 RIGHT NOW (100% trades buy saat ini)
+    
+    Ini berarti OBV mencerminkan kondisi SEBELUM pump dimulai.
+    Real-time signal (agg) lebih akurat dari OBV yang lagging.
+    
+    Rule: Jika agg > 0.85 dan OBV berlawanan → ABAIKAN OBV,
+    percaya agg sebagai ground truth real-time.
+    
+    Output: Jika ada detector yang pakai OBV untuk SHORT
+    saat agg=1.00, BLOCK detector tersebut.
+    
+    Priority: -10015.5
+    """
+    @staticmethod
+    def should_trust_agg_over_obv(agg: float, ofi_strength: float,
+                                   obv_trend: str, down_energy: float,
+                                   change_5m: float) -> bool:
+        """Returns True jika agg lebih reliable dari OBV"""
+        
+        # agg sangat tinggi + OFI konfirmasi = real-time bullish nyata
+        agg_reliable = (agg > 0.85 and ofi_strength > 0.7)
+        
+        # OBV berlawanan dengan agg
+        obv_bearish = obv_trend in ("NEGATIVE_EXTREME", "NEGATIVE")
+        
+        # Tidak ada seller (konfirmasi agg bukan spoof)
+        no_seller = down_energy < 0.01
+        
+        # Harga naik (konsisten dengan agg bullish)
+        price_up = change_5m > 0
+        
+        return (agg_reliable and obv_bearish and no_seller and price_up)
+    
+    @staticmethod
+    def detect(agg: float, ofi_bias: str, ofi_strength: float,
+               obv_trend: str, down_energy: float,
+               change_5m: float, short_liq: float) -> dict:
+        
+        should_trust_agg = OBVLaggingAggContradictionResolver.should_trust_agg_over_obv(
+            agg, ofi_strength, obv_trend, down_energy, change_5m
+        )
+        
+        if should_trust_agg and short_liq > 0.3:
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": (
+                    f"OBV LAGGING AGG CONTRADICTION: "
+                    f"OBV={obv_trend} (stale/lagging) TAPI "
+                    f"agg={agg:.2f} + OFI={ofi_bias} {ofi_strength:.2f} + "
+                    f"down_energy={down_energy:.3f} → "
+                    f"Real-time signal (agg) lebih akurat. "
+                    f"OBV mencerminkan kondisi sebelum pump. "
+                    f"Trust agg: LONG"
+                ),
+                "priority": -10015.5
             }
         
         return {"override": False}
@@ -9751,12 +9902,41 @@ class ExhaustedSqueezePostSweep:
     def detect(change_5m: float, short_liq: float, rsi6: float,
                obv_trend: str, volume_ratio: float,
                rsi6_5m: float, long_liq: float,
-               funding_rate: float = 0.0) -> dict:
+               funding_rate: float = 0.0,
+               # ===== TAMBAHAN PARAMETER (PATCH) =====
+               agg: float = 0.5,
+               ofi_bias: str = "NEUTRAL",
+               ofi_strength: float = 0.0,
+               down_energy: float = 0.0,
+               up_energy: float = 0.0) -> dict:
         
-        # Core: harga sudah melewati short liq target
-        sweep_completed = change_5m >= short_liq * 0.7  # 70% dari jarak = sudah dekat/lewat
-        
+        sweep_completed = change_5m >= short_liq * 0.7
         if not sweep_completed:
+            return {"override": False}
+        
+        # 🔥 GUARD 1: Jika agg=1.00 + OFI LONG kuat + no seller
+        # = squeeze MASIH BERJALAN, belum selesai
+        squeeze_still_active = (
+            agg > 0.85 and
+            ofi_bias == "LONG" and
+            ofi_strength > 0.7 and
+            down_energy < 0.01
+        )
+        if squeeze_still_active:
+            return {"override": False}
+        
+        # 🔥 GUARD 2: Jika change_5m sangat besar (>5%) + agg tinggi
+        # = momentum masih kuat, bukan exhausted
+        strong_momentum = (change_5m > 5.0 and agg > 0.6 and up_energy > 0.3)
+        if strong_momentum:
+            return {"override": False}
+        
+        # 🔥 GUARD 3: Jika short_liq masih ada dan tidak terlalu kecil
+        # change >= short_liq * 0.7 bisa trigger saat short_liq masih 1.6%
+        # dan harga baru naik 3.9% — ini bukan "sweep completed"
+        # Sweep benar-benar selesai hanya jika change >= short_liq * 1.2
+        real_sweep = change_5m >= short_liq * 1.2
+        if not real_sweep and agg > 0.6:
             return {"override": False}
         
         # Konfirmasi RSI overbought ekstrem (short sudah mati)
@@ -11519,6 +11699,42 @@ class BinanceAnalyzer:
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = -1104.6
         
+        
+        # ===== PRIORITY -10016: AGG-OFI FULL BULLISH CONTINUATION =====
+        agg_ofi_bullish = AggOFIFullBullishContinuation.detect(
+            agg=result.get("agg", 0.5),
+            ofi_bias=result.get("ofi_bias", "NEUTRAL"),
+            ofi_strength=result.get("ofi_strength", 0.0),
+            down_energy=result.get("down_energy", 0.0),
+            change_5m=result.get("change_5m", 0.0),
+            short_liq=result.get("short_liq", 99.0),
+            rsi6=result.get("rsi6", 50.0),
+            rsi6_5m=result.get("rsi6_5m", 50.0),
+            volume_ratio=result.get("volume_ratio", 1.0)
+        )
+        if agg_ofi_bullish["override"]:
+            result["bias"] = agg_ofi_bullish["bias"]
+            result["reason"] = f"[AGG OFI BULLISH] {agg_ofi_bullish['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = agg_ofi_bullish["priority"]
+            return result
+
+        # ===== PRIORITY -10015.5: OBV LAGGING AGG CONTRADICTION =====
+        obv_lag = OBVLaggingAggContradictionResolver.detect(
+            agg=result.get("agg", 0.5),
+            ofi_bias=result.get("ofi_bias", "NEUTRAL"),
+            ofi_strength=result.get("ofi_strength", 0.0),
+            obv_trend=result.get("obv_trend", "NEUTRAL"),
+            down_energy=result.get("down_energy", 0.0),
+            change_5m=result.get("change_5m", 0.0),
+            short_liq=result.get("short_liq", 99.0)
+        )
+        if obv_lag["override"]:
+            result["bias"] = obv_lag["bias"]
+            result["reason"] = f"[OBV LAGGING] {obv_lag['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = obv_lag["priority"]
+            return result
         # ===== PRIORITY -10014: FAKE SHORT LIQ TRAP FUNDING POSITIVE (PALING TINGGI ABSOLUT) =====
         fake_short_liq = FakeShortLiqTrapFundingPositive.detect(
             short_liq=short_liq,
@@ -11552,7 +11768,10 @@ class BinanceAnalyzer:
             funding_rate=result.get("funding_rate", 0.0),
             short_liq=short_liq,
             long_liq=long_liq,
-            change_5m=change_5m_val
+            change_5m=change_5m_val,
+            # TAMBAH:
+            rsi6=rsi6_val,
+            agg=agg_val
         )
         if stoch_blowoff["override"]:
             result["bias"] = stoch_blowoff["bias"]
@@ -11672,7 +11891,13 @@ class BinanceAnalyzer:
             volume_ratio=volume_ratio,
             rsi6_5m=result.get("rsi6_5m", 50.0),
             long_liq=long_liq,
-            funding_rate=funding_rate_val or 0.0
+            funding_rate=funding_rate_val or 0.0,
+            # TAMBAH:
+            agg=agg_val,
+            ofi_bias=ofi_bias,
+            ofi_strength=ofi_strength,
+            down_energy=down_energy_val,
+            up_energy=up_energy_val
         )
         if exhausted_sweep["override"]:
             result["bias"] = exhausted_sweep["bias"]
