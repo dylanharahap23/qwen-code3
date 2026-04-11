@@ -2840,6 +2840,83 @@ class BlowOffTopFalseGuard:
         return {"override": False}
 
 
+# ========== LECTURER'S SARAN: BLOW-OFF REVERSAL DETECTORS (-1116 to -1113) ==========
+
+class StochJOverflowReversal:
+    """
+    🔥 PRIORITY -1114: STOCH J > 105 ADALAH MATHEMATICAL IMPOSSIBILITY → PASTI REVERSAL
+    Stochastic J yang overflow menunjukkan kondisi overbought ekstrem tidak wajar.
+    """
+    @staticmethod
+    def detect(stoch_j: float, volume_ratio: float, change_5m: float) -> Dict:
+        if stoch_j > 105 and volume_ratio < 0.7 and change_5m > 1.0:
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"STOCH J OVERFLOW: J={stoch_j:.1f}>105, vol={volume_ratio:.2f}x, pump {change_5m:.1f}% → blow-off, force SHORT",
+                "priority": -1114
+            }
+        return {"override": False}
+
+
+class AskWallBlowOffOverride:
+    """
+    🔥 PRIORITY -1113: ASK WALL > 3X BID WALL + VOLUME KERING + RSI5M > 85 + SHORT_LIQ DEKAT = FAKE SQUEEZE
+    Deteksi manipulasi order book dengan ask wall dominan.
+    """
+    @staticmethod
+    def detect(ask_slope: float, bid_slope: float, volume_ratio: float,
+               rsi6_5m: float, change_5m: float, short_liq: float) -> Dict:
+        if bid_slope <= 0:
+            return {"override": False}
+        ratio = ask_slope / bid_slope
+        if ratio > 3.0 and volume_ratio < 0.6 and rsi6_5m > 85 and change_5m > 1.0 and short_liq < 2.0:
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"ASK WALL BLOW-OFF: ask/bid={ratio:.1f}x, vol={volume_ratio:.2f}x, RSI5m={rsi6_5m:.1f} overbought → pump palsu, dump",
+                "priority": -1113
+            }
+        return {"override": False}
+
+
+class GammaExtremeAskWallBlock:
+    """
+    🔥 PRIORITY -1115: GAMMA EXTREME TAPI ASK WALL > 4X → FAKE GAMMA
+    Block sinyal LONG ketika gamma EXTREME tapi ada ask wall raksasa.
+    """
+    @staticmethod
+    def detect(gamma_intensity: str, ask_slope: float, bid_slope: float,
+               volume_ratio: float, rsi6_5m: float) -> Dict:
+        if gamma_intensity == "EXTREME" and bid_slope > 0:
+            ratio = ask_slope / bid_slope
+            if ratio > 4.0 and volume_ratio < 0.6 and rsi6_5m > 80:
+                return {
+                    "override": True,
+                    "bias": "SHORT",
+                    "reason": f"GAMMA FAKE: gamma EXTREME tapi ask/bid={ratio:.1f}x, vol kering, RSI5m={rsi6_5m:.1f} → dump",
+                    "priority": -1115
+                }
+        return {"override": False}
+
+
+class LowVolumeOverboughtReversal:
+    """
+    🔥 PRIORITY -1116: VOLUME < 0.5X, RSI5M > 85, CHANGE > 2% → EXHAUSTED PUMP
+    Deteksi pump yang kehabisan tenaga karena volume tidak mendukung.
+    """
+    @staticmethod
+    def detect(volume_ratio: float, rsi6_5m: float, change_5m: float) -> Dict:
+        if volume_ratio < 0.5 and rsi6_5m > 85 and change_5m > 2.0:
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"LOW VOL OVERBOUGHT: vol={volume_ratio:.2f}x, RSI5m={rsi6_5m:.1f}, pump {change_5m:.1f}% → reversal",
+                "priority": -1116
+            }
+        return {"override": False}
+
+
 # ========== LIQUIDITY EXTREME OVERRIDE DETECTORS (PRIORITY -2001 to -1998) ==========
 
 class LiquidityExtremeOverride:
@@ -13036,6 +13113,66 @@ class BinanceAnalyzer:
             result["reason"] = f"[OBV-VOLUME VETO] OBV {obv_trend}, volume {volume_ratio:.2f}x → SHORT override ditolak, paksa LONG | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = -1104.6
+        
+        # ========== LECTURER'S SARAN: BLOW-OFF REVERSAL DETECTORS (-1116 to -1113) ==========
+        # Detector-detector ini harus dijalankan SETELAH OBV-VOLUME VETO dan SEBELUM short squeeze guards
+        
+        # ===== PRIORITY -1114: STOCH J OVERFLOW REVERSAL (PALING AWAL) =====
+        stoch_j_overflow = StochJOverflowReversal.detect(
+            stoch_j=stoch_j_val,
+            volume_ratio=volume_ratio,
+            change_5m=change_5m_val
+        )
+        if stoch_j_overflow["override"]:
+            result["bias"] = stoch_j_overflow["bias"]
+            result["reason"] = f"[STOCH J OVERFLOW] {stoch_j_overflow['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = stoch_j_overflow["priority"]
+            return result
+        
+        # ===== PRIORITY -1115: GAMMA EXTREME ASK WALL BLOCK =====
+        gamma_ask_wall = GammaExtremeAskWallBlock.detect(
+            gamma_intensity=gamma_intensity,
+            ask_slope=result.get("ask_slope", 0.0),
+            bid_slope=result.get("bid_slope", 0.0),
+            volume_ratio=volume_ratio,
+            rsi6_5m=rsi6_5m_val
+        )
+        if gamma_ask_wall["override"]:
+            result["bias"] = gamma_ask_wall["bias"]
+            result["reason"] = f"[GAMMA ASK WALL BLOCK] {gamma_ask_wall['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = gamma_ask_wall["priority"]
+            return result
+        
+        # ===== PRIORITY -1113: ASK WALL BLOW-OFF OVERRIDE =====
+        ask_wall_blowoff = AskWallBlowOffOverride.detect(
+            ask_slope=result.get("ask_slope", 0.0),
+            bid_slope=result.get("bid_slope", 0.0),
+            volume_ratio=volume_ratio,
+            rsi6_5m=rsi6_5m_val,
+            change_5m=change_5m_val,
+            short_liq=short_liq
+        )
+        if ask_wall_blowoff["override"]:
+            result["bias"] = ask_wall_blowoff["bias"]
+            result["reason"] = f"[ASK WALL BLOW-OFF] {ask_wall_blowoff['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = ask_wall_blowoff["priority"]
+            return result
+        
+        # ===== PRIORITY -1116: LOW VOLUME OVERBOUGHT REVERSAL =====
+        low_vol_overbought = LowVolumeOverboughtReversal.detect(
+            volume_ratio=volume_ratio,
+            rsi6_5m=rsi6_5m_val,
+            change_5m=change_5m_val
+        )
+        if low_vol_overbought["override"]:
+            result["bias"] = low_vol_overbought["bias"]
+            result["reason"] = f"[LOW VOL OVERBOUGHT] {low_vol_overbought['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = low_vol_overbought["priority"]
+            return result
         
         
         # ===== PRIORITY -10017: SHORT LIQ SQUEEZE CONTINUATION GUARD =====
