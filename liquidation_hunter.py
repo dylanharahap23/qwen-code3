@@ -2112,6 +2112,31 @@ class BinanceWebSocket:
 
 # ================= NEW DETECTOR MODULES =================
 
+class FundingExtremeSweepCompletionReversal:
+    """
+    🔥 FUNDING EXTREME + SWEEP COMPLETION = DUMP IMMINENT
+    Priority -10023 (TERTINGGI)
+    Ketika funding sangat negatif tapi short_liq sudah terlewati >2.5x,
+    maka squeeze selesai, HFT akan dump untuk ambil profit.
+    """
+    @staticmethod
+    def detect(funding_rate: float, change_5m: float, short_liq: float,
+               rsi6: float, volume_ratio: float) -> dict:
+        if funding_rate is None:
+            return {"override": False}
+        if (funding_rate < -0.005 and
+            change_5m > short_liq * 2.5 and
+            rsi6 > 95 and
+            volume_ratio < 0.7):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"FUNDING EXTREME SWEEP COMPLETION: funding={funding_rate:.5f} (crowded short), short_liq={short_liq:.2f}% sudah terlewati {change_5m:.1f}% (>2.5x), RSI={rsi6:.1f} overbought, volume kering → squeeze selesai, dump imminent",
+                "priority": -10023
+            }
+        return {"override": False}
+
+
 class BlowOffPumpReversal:
     """
     🔥 BLOW-OFF PUMP REVERSAL: Pump besar dengan volume kering, energi kecil, RSI divergence
@@ -2323,6 +2348,56 @@ class OversoldOBVNegativeContinuation:
                     f"Force SHORT."
                 ),
                 "priority": -10018
+            }
+        return {"override": False}
+
+
+class FundingExtremeSqueezeContinuation:
+    """
+    🔥 FUNDING EXTREME + SQUEEZE MASIH AKTIF = LONG
+    Priority -10022
+    Ketika funding sangat negatif tapi short_liq belum terlewati,
+    maka squeeze masih aktif, HFT akan continue pump untuk cover short.
+    """
+    @staticmethod
+    def detect(funding_rate: float, change_5m: float, short_liq: float,
+               long_liq: float, down_energy: float) -> dict:
+        if funding_rate is None:
+            return {"override": False}
+        if (funding_rate < -0.005 and
+            change_5m < short_liq * 2.0 and
+            short_liq < long_liq and
+            down_energy < 0.1):
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": f"FUNDING EXTREME SQUEEZE CONTINUATION: funding={funding_rate:.5f}, short_liq={short_liq:.2f}% belum terlewati, down_energy={down_energy:.2f} → squeeze masih jalan, force LONG",
+                "priority": -10022
+            }
+        return {"override": False}
+
+
+class RSI100VolumeDryBlowOff:
+    """
+    🔥 RSI=100 + VOLUME KERING + FUNDING TIDAK EKSTREM = BLOW-OFF
+    Priority -10021
+    Ketika RSI sangat overbought tapi volume kering dan funding tidak ekstrem negatif,
+    maka ini adalah blow-off top sebelum dump.
+    """
+    @staticmethod
+    def detect(rsi6: float, volume_ratio: float, funding_rate: float,
+               change_5m: float) -> dict:
+        if funding_rate is None:
+            funding_rate = 0.0
+        if (rsi6 > 98 and
+            volume_ratio < 0.6 and
+            funding_rate > -0.003 and
+            change_5m > 3.0):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"RSI100 VOLUME DRY BLOW-OFF: RSI={rsi6:.1f}, volume={volume_ratio:.2f}x kering, funding={funding_rate:.5f} tidak ekstrem → blow-off top, force SHORT",
+                "priority": -10021
             }
         return {"override": False}
 
@@ -11788,6 +11863,21 @@ class BinanceAnalyzer:
             # Tidak perlu proses filter lain
             return result
         
+        # ===== PRIORITY -10023: FUNDING EXTREME SWEEP COMPLETION REVERSAL (TERTINGGI) =====
+        funding_sweep = FundingExtremeSweepCompletionReversal.detect(
+            funding_rate=funding_rate_val,
+            change_5m=change_5m_val,
+            short_liq=short_liq,
+            rsi6=rsi6_val,
+            volume_ratio=volume_ratio
+        )
+        if funding_sweep["override"]:
+            result["bias"] = funding_sweep["bias"]
+            result["reason"] = f"[FUNDING SWEEP COMPLETION] {funding_sweep['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = funding_sweep["priority"]
+            return result
+        
         # ===== PRIORITY -10022: BLOW-OFF PUMP REVERSAL (PALING TINGGI) =====
         blowoff_pump = BlowOffPumpReversal.detect(
             change_5m=change_5m_val,
@@ -11947,6 +12037,35 @@ class BinanceAnalyzer:
         # Terapkan bias akhir
         result["bias"] = new_bias
 
+
+        # ===== PRIORITY -10022: FUNDING EXTREME SQUEEZE CONTINUATION =====
+        funding_squeeze_cont = FundingExtremeSqueezeContinuation.detect(
+            funding_rate=funding_rate_val,
+            change_5m=change_5m_val,
+            short_liq=short_liq,
+            long_liq=long_liq,
+            down_energy=down_energy_val
+        )
+        if funding_squeeze_cont["override"]:
+            result["bias"] = funding_squeeze_cont["bias"]
+            result["reason"] = f"[FUNDING SQUEEZE CONTINUATION] {funding_squeeze_cont['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = funding_squeeze_cont["priority"]
+            return result
+        
+        # ===== PRIORITY -10021: RSI100 VOLUME DRY BLOW-OFF =====
+        rsi_blowoff = RSI100VolumeDryBlowOff.detect(
+            rsi6=rsi6_val,
+            volume_ratio=volume_ratio,
+            funding_rate=funding_rate_val,
+            change_5m=change_5m_val
+        )
+        if rsi_blowoff["override"]:
+            result["bias"] = rsi_blowoff["bias"]
+            result["reason"] = f"[RSI100 BLOW-OFF] {rsi_blowoff['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = rsi_blowoff["priority"]
+            return result
 
         # ===== PRIORITY -10020: FAKE MICRO SQUEEZE TRAP (PALING TINGGI) =====
         fake_micro = FakeMicroSqueezeTrap.detect(
