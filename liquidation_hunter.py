@@ -2112,6 +2112,37 @@ class BinanceWebSocket:
 
 # ================= NEW DETECTOR MODULES =================
 
+class BlowOffPumpReversal:
+    """
+    🔥 BLOW-OFF PUMP REVERSAL: Pump besar dengan volume kering, energi kecil, RSI divergence
+    Memaksa SHORT meskipun funding negatif (crowded short).
+    Priority -10022 (PALING TINGGI)
+    """
+    @staticmethod
+    def detect(change_5m: float, volume_ratio: float, up_energy: float,
+               rsi6: float, rsi6_5m: float, short_liq: float) -> dict:
+        
+        if (change_5m > 5.0 and
+            volume_ratio < 0.6 and
+            up_energy < 0.5 and
+            rsi6 > 85 and
+            rsi6_5m < 50 and
+            short_liq < 5.0):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"BLOW-OFF PUMP REVERSAL: pump {change_5m:.1f}% dengan "
+                    f"volume {volume_ratio:.2f}x kering, up_energy={up_energy:.2f} kecil, "
+                    f"RSI1m={rsi6:.1f} overbought vs RSI5m={rsi6_5m:.1f} (divergence). "
+                    f"Short_liq={short_liq:.2f}% sebagai umpan. "
+                    f"HFT pump palsu, dump imminent. Force SHORT."
+                ),
+                "priority": -10022
+            }
+        return {"override": False}
+
+
 class ExtremeDropMomentumOverride:
     """
     🔥 EXTREME DROP MOMENTUM OVERRIDE: Harga turun >12% dalam 5m, volume kering, RSI <15
@@ -11755,6 +11786,22 @@ class BinanceAnalyzer:
             result["priority_level"] = -20000
             result["reason"] = f"[PREP HARD BLOCK] Market dalam fase PREP (akumulasi) → NO TRADE | " + result.get("reason", "")
             # Tidak perlu proses filter lain
+            return result
+        
+        # ===== PRIORITY -10022: BLOW-OFF PUMP REVERSAL (PALING TINGGI) =====
+        blowoff_pump = BlowOffPumpReversal.detect(
+            change_5m=change_5m_val,
+            volume_ratio=volume_ratio,
+            up_energy=up_energy_val,
+            rsi6=rsi6_val,
+            rsi6_5m=result.get("rsi6_5m", 50.0),
+            short_liq=short_liq
+        )
+        if blowoff_pump["override"]:
+            result["bias"] = blowoff_pump["bias"]
+            result["reason"] = f"[BLOWOFF PUMP] {blowoff_pump['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = blowoff_pump["priority"]
             return result
         
         # ===== PRIORITY -10021: EXTREME DROP MOMENTUM OVERRIDE (PALING TINGGI) =====
