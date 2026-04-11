@@ -2162,6 +2162,43 @@ class ShortLiqSqueezeContinuationGuard:
         return {"override": False}
 
 
+class OversoldOBVNegativeContinuation:
+    """
+    🔥 OVERSOLD + OBV NEGATIVE EXTREME + LONG LIQ DEKAT = DUMP CONTINUATION
+    Priority -10018 (PALING TINGGI)
+    Memaksa SHORT ketika OBV negatif ekstrem, long liq sangat dekat, volume kering,
+    dan harga turun meski oversold. Ini adalah falling knife, bukan bounce.
+    """
+    @staticmethod
+    def detect(obv_trend: str, long_liq: float, change_5m: float,
+               volume_ratio: float, down_energy: float, rsi6: float,
+               agg: float) -> dict:
+        
+        if (obv_trend == "NEGATIVE_EXTREME" and
+            long_liq < 2.0 and
+            change_5m < -1.0 and
+            volume_ratio < 0.8 and
+            down_energy < 0.1 and
+            rsi6 < 35 and
+            agg < 0.85):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"OVERSOLD OBV NEGATIVE CONTINUATION: "
+                    f"OBV={obv_trend} (distribusi aktif), "
+                    f"long_liq={long_liq:.2f}% dekat, "
+                    f"price down {change_5m:.1f}%, volume {volume_ratio:.2f}x kering, "
+                    f"down_energy={down_energy:.2f} (no real buyers), "
+                    f"RSI={rsi6:.1f} oversold, agg={agg:.2f} → "
+                    f"Smart money masih distribusi, HFT akan terus dump untuk sweep long stop. "
+                    f"Force SHORT."
+                ),
+                "priority": -10018
+            }
+        return {"override": False}
+
+
 # ========== LIQUIDITY EXTREME OVERRIDE DETECTORS (PRIORITY -2001 to -1998) ==========
 
 class LiquidityExtremeOverride:
@@ -9393,6 +9430,10 @@ class FundingNegativeOBVPositiveLongLiqSweepPump:
         if funding_rate is None:
             return {"override": False}
         
+        # 🔥 GUARD: Jika OBV NEGATIVE_EXTREME, jangan trigger (ini bukan setup pump)
+        if obv_trend in ("NEGATIVE_EXTREME", "NEGATIVE"):
+            return {"override": False}
+        
         # ===== GUARD VALIDATION: Funding HARUS benar-benar negatif =====
         if not SweepPumpFundingValidationGuard.is_valid_sweep_pump_setup(
             funding_rate, long_liq, short_liq, rsi6_5m
@@ -11742,7 +11783,26 @@ class BinanceAnalyzer:
         
         # Terapkan bias akhir
         result["bias"] = new_bias
-        
+
+
+        # ===== PRIORITY -10018: OVERSOLD OBV NEGATIVE CONTINUATION (PALING TINGGI) =====
+        obv_negative_cont = OversoldOBVNegativeContinuation.detect(
+            obv_trend=result.get("obv_trend", "NEUTRAL"),
+            long_liq=long_liq,
+            change_5m=change_5m_val,
+            volume_ratio=volume_ratio,
+            down_energy=down_energy_val,
+            rsi6=rsi6_val,
+            agg=agg_val
+        )
+        if obv_negative_cont["override"]:
+            result["bias"] = obv_negative_cont["bias"]
+            result["reason"] = f"[OBV NEG CONTINUATION] {obv_negative_cont['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = obv_negative_cont["priority"]
+            return result
+
+
         # ========== OBV-VOLUME VETO (LECTURER FIX 3) ==========
         # Jika OBV NEGATIVE_EXTREME + volume_ratio < 0.4 dan bias = LONG → paksa SHORT
         if obv_trend == "NEGATIVE_EXTREME" and volume_ratio < 0.4 and result.get("bias") == "LONG":
