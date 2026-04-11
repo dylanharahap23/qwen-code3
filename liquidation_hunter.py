@@ -2112,6 +2112,56 @@ class BinanceWebSocket:
 
 # ================= NEW DETECTOR MODULES =================
 
+class ShortLiqSqueezeContinuationGuard:
+    """
+    🔥 SHORT LIQ SANGAT DEKAT + BUY PRESSURE = SQUEEZE CONTINUATION
+    Priority -10017 (PALING TINGGI, di atas VegaActiveShortOverride -10002)
+    Memaksa LONG ketika short_liq sangat dekat (<1.5%) dan up_energy > down_energy,
+    meskipun volume rendah dan RSI overbought. Ini adalah squeeze yang masih berjalan.
+    """
+    @staticmethod
+    def detect(short_liq: float, long_liq: float, change_5m: float,
+               up_energy: float, down_energy: float, volume_ratio: float,
+               rsi6: float, rsi6_5m: float, agg: float, ofi_bias: str) -> dict:
+        
+        # Core conditions
+        if (short_liq < 1.5 and
+            change_5m > 0 and
+            up_energy > down_energy and
+            down_energy < 3.0 and
+            short_liq < long_liq):
+            
+            # Optional confirmations (not required, but strengthen)
+            confirmations = []
+            if volume_ratio < 0.8:
+                confirmations.append(f"volume={volume_ratio:.2f}x")
+            if rsi6 > 75:
+                confirmations.append(f"RSI={rsi6:.1f} overbought")
+            if rsi6_5m < 70:
+                confirmations.append(f"RSI5m={rsi6_5m:.1f} not extreme")
+            if agg > 0.4:
+                confirmations.append(f"agg={agg:.2f} not strongly bearish")
+            if ofi_bias == "SHORT":
+                confirmations.append("OFI SHORT (being absorbed)")
+            
+            conf_str = f" ({', '.join(confirmations)})" if confirmations else ""
+            
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": (
+                    f"SHORT LIQ SQUEEZE CONTINUATION: short_liq={short_liq:.2f}% sangat dekat, "
+                    f"price up {change_5m:.1f}%, up_energy={up_energy:.2f} > down_energy={down_energy:.2f}, "
+                    f"short_liq < long_liq{conf_str} → "
+                    f"Short squeeze masih berjalan, HFT akan sweep short stops. "
+                    f"Override semua sinyal SHORT."
+                ),
+                "priority": -10017
+            }
+        
+        return {"override": False}
+
+
 # ========== LIQUIDITY EXTREME OVERRIDE DETECTORS (PRIORITY -2001 to -1998) ==========
 
 class LiquidityExtremeOverride:
@@ -8899,10 +8949,19 @@ class VegaActiveShortOverride:
     🔥 PRIORITY -10002: Ketika Vega aktif (BAIT phase), volume rendah,
     harga sudah pump >2%, short liq dekat sebagai umpan → paksa SHORT
     (karena HFT akan fade the move)
+    
+    GUARD: Jika short_liq sangat dekat (<1.5%) dan ada buy pressure (up_energy > down_energy),
+    jangan override ke SHORT karena ini adalah squeeze continuation.
     """
     @staticmethod
     def detect(vega_active: bool, volume_ratio: float, change_5m: float,
-               short_liq: float, obv_trend: str, agg: float) -> Dict:
+               short_liq: float, obv_trend: str, agg: float,
+               # TAMBAH parameter untuk guard
+               up_energy: float = 0.0, down_energy: float = 0.0) -> Dict:
+        # 🔥 GUARD: Jika short_liq sangat dekat dan ada buy pressure, jangan override ke SHORT
+        if short_liq < 1.5 and up_energy > down_energy:
+            return {"override": False}
+        
         if (vega_active and
             volume_ratio < 0.7 and
             change_5m > 2.0 and
@@ -11700,6 +11759,26 @@ class BinanceAnalyzer:
             result["priority_level"] = -1104.6
         
         
+        # ===== PRIORITY -10017: SHORT LIQ SQUEEZE CONTINUATION GUARD =====
+        short_squeeze_guard = ShortLiqSqueezeContinuationGuard.detect(
+            short_liq=short_liq,
+            long_liq=long_liq,
+            change_5m=change_5m_val,
+            up_energy=up_energy_val,
+            down_energy=down_energy_val,
+            volume_ratio=volume_ratio,
+            rsi6=rsi6_val,
+            rsi6_5m=rsi6_5m_val,
+            agg=agg_val,
+            ofi_bias=result.get("ofi_bias", "NEUTRAL")
+        )
+        if short_squeeze_guard["override"]:
+            result["bias"] = short_squeeze_guard["bias"]
+            result["reason"] = f"[SHORT SQUEEZE GUARD] {short_squeeze_guard['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = short_squeeze_guard["priority"]
+            return result
+
         # ===== PRIORITY -10016: AGG-OFI FULL BULLISH CONTINUATION =====
         agg_ofi_bullish = AggOFIFullBullishContinuation.detect(
             agg=result.get("agg", 0.5),
@@ -12273,7 +12352,9 @@ class BinanceAnalyzer:
                 change_5m=change_5m_val,
                 short_liq=short_liq,
                 obv_trend=result.get("obv_trend", "NEUTRAL"),
-                agg=agg_val
+                agg=agg_val,
+                up_energy=up_energy_val,
+                down_energy=down_energy_val
             )
             if vega_short_override["override"]:
                 result["bias"] = vega_short_override["bias"]
