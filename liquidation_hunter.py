@@ -468,25 +468,61 @@ class NoSellerNoBuyerOverride:
     🔥 PRIORITY -20000: Jika down_energy == 0 → TIDAK ADA SELLER → LONG.
        Jika up_energy == 0 → TIDAK ADA BUYER → SHORT.
        Ini mengalahkan SEMUA sinyal lain karena market structure.
+       
+    🛡️ BAIT VACUUM TRAP DETECTION: Membedakan genuine vacuum vs HFT bait.
+       - Jika BAIT phase + volume rendah + gerakan kecil + liq lebih dekat di sisi lawan → itu jebakan
+       - Jika KILL phase atau gamma executing → genuine vacuum
     """
     @staticmethod
     def detect(down_energy: float, up_energy: float,
-               agg: float, change_5m: float) -> dict:
+               agg: float, change_5m: float,
+               market_phase: str, volume_ratio: float,
+               short_liq: float, long_liq: float,
+               gamma_executing: bool) -> dict:
+        
+        # KASUS down_energy == 0 (tidak ada seller)
         if down_energy < 0.01:
-            # Tidak ada seller, harga bisa naik bebas
+            # 🔥 BAIT VACUUM TRAP: Jika masih BAIT phase, volume sangat rendah, gerakan kecil
+            # dan short_liq lebih dekat (umpan) → sebenarnya SHORT
+            if (market_phase == "BAIT" and 
+                volume_ratio < 0.4 and 
+                abs(change_5m) < 1.5 and 
+                short_liq < long_liq):
+                return {
+                    "override": True,
+                    "bias": "SHORT",
+                    "reason": f"BAIT VACUUM TRAP: down_energy=0 tapi BAIT phase, vol={volume_ratio:.2f}x, move={change_5m:.1f}%, short_liq={short_liq:.2f}% < long_liq={long_liq:.2f}% → HFT bait, forced SHORT",
+                    "priority": -20000
+                }
+            
+            # 🔥 KILL VACUUM (genuine): Jika sudah KILL phase, gamma executing, atau gerakan besar
+            # Maka LONG adalah benar
             return {
                 "override": True,
                 "bias": "LONG",
                 "reason": f"NO SELLER (down_energy={down_energy:.3f}) → forced LONG",
                 "priority": -20000
             }
+        
+        # KASUS up_energy == 0 (tidak ada buyer)
         if up_energy < 0.01:
+            if (market_phase == "BAIT" and 
+                volume_ratio < 0.4 and 
+                abs(change_5m) < 1.5 and 
+                long_liq < short_liq):
+                return {
+                    "override": True,
+                    "bias": "LONG",
+                    "reason": f"BAIT VACUUM TRAP: up_energy=0 tapi BAIT phase, vol={volume_ratio:.2f}x, move={change_5m:.1f}%, long_liq={long_liq:.2f}% < short_liq={short_liq:.2f}% → HFT bait, forced LONG",
+                    "priority": -20000
+                }
             return {
                 "override": True,
                 "bias": "SHORT",
                 "reason": f"NO BUYER (up_energy={up_energy:.3f}) → forced SHORT",
                 "priority": -20000
             }
+        
         return {"override": False}
 
 
@@ -14431,7 +14467,12 @@ class BinanceAnalyzer:
             down_energy=down_energy_val,
             up_energy=up_energy_val,
             agg=agg_val,
-            change_5m=change_5m_val
+            change_5m=change_5m_val,
+            market_phase=market_phase,      # ← dari phase_result.phase
+            volume_ratio=volume_ratio,       # ← sudah ada
+            short_liq=short_liq,             # ← dari result
+            long_liq=long_liq,               # ← dari result
+            gamma_executing=gamma_executing  # ← dari result
         )
         if no_seller_buyer["override"]:
             result["bias"] = no_seller_buyer["bias"]
