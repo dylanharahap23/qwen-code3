@@ -1008,6 +1008,17 @@ class FundingHighGreeksShortAggBaitVeto:
         if funding_rate is None:
             return {"override": False}
         
+        # 🔥 GUARD CAPITULATION: Jangan veto jika capitulation setup
+        # Ini adalah kasus AKEUSDT - biarkan CapitulationLongLiqSweepOverride yang handle
+        capitulation_setup = (
+            long_liq < 3.0 and
+            rsi6_5m < 15 and
+            change_5m < -5.0 and
+            obv_trend in ("POSITIVE_EXTREME", "POSITIVE")
+        )
+        if capitulation_setup:
+            return {"override": False}
+        
         # Funding harus tinggi positif (crowded LONG)
         if funding_rate < 0.0007:
             return {"override": False}
@@ -1081,18 +1092,37 @@ class DisplayJsonConsistencyVeto:
                                       json_agg: float,
                                       json_ofi_bias: str,
                                       funding_rate: float,
-                                      greeks_kill: str) -> bool:
+                                      greeks_kill: str,
+                                      # TAMBAH PARAMETER CAPITULATION GUARD
+                                      long_liq: float = 99.0,
+                                      rsi6: float = 50.0,
+                                      change_5m: float = 0.0,
+                                      obv_trend: str = "NEUTRAL") -> bool:
         gap = abs(display_agg - json_agg)
+        
+        # 🔥 GUARD CAPITULATION: Jangan veto jika kondisi ekstrem
+        # Ini adalah kasus AKEUSDT
+        capitulation_bounce_setup = (
+            long_liq < 3.0 and          # long liq sangat dekat
+            rsi6 < 15 and               # oversold ekstrem
+            change_5m < -5.0 and        # sudah turun drastis
+            obv_trend in ("POSITIVE_EXTREME", "POSITIVE")  # ada akumulasi
+        )
+        
+        if capitulation_bounce_setup:
+            return False  # JANGAN BLOCK, biarkan AggOFIFullBullish jalan
         
         # Data race terdeteksi
         if gap > 0.20:
-            # Percaya JSON, bukan display
             if json_agg < 0.75:
-                return True  # block AggOFIFullBullish
+                return True
         
-        # Bahkan jika konsisten, funding tinggi + Greeks SHORT = block
+        # Funding tinggi + Greeks SHORT = block (tapi dengan exception capitulation)
         if (funding_rate is not None and funding_rate > 0.0007 and
             greeks_kill == "SHORT"):
+            # 🔥 GUARD: Jika capitulation bounce setup, jangan block
+            if capitulation_bounce_setup:
+                return False
             return True
         
         return False
@@ -1101,11 +1131,28 @@ class DisplayJsonConsistencyVeto:
     def detect(display_agg: float, json_agg: float,
                ofi_bias: str, ofi_strength: float,
                funding_rate: float, greeks_kill: str,
-               greeks_who_dies: str) -> dict:
+               greeks_who_dies: str,
+               # TAMBAH PARAMETER CAPITULATION GUARD
+               long_liq: float = 99.0,
+               rsi6: float = 50.0,
+               change_5m: float = 0.0,
+               obv_trend: str = "NEUTRAL") -> dict:
         """
         Version detect() yang return dict lengkap untuk integrasi.
         """
         gap = abs(display_agg - json_agg)
+        
+        # 🔥 GUARD CAPITULATION: Jangan veto jika kondisi ekstrem
+        # Ini adalah kasus AKEUSDT
+        capitulation_bounce_setup = (
+            long_liq < 3.0 and          # long liq sangat dekat
+            rsi6 < 15 and               # oversold ekstrem
+            change_5m < -5.0 and        # sudah turun drastis
+            obv_trend in ("POSITIVE_EXTREME", "POSITIVE")  # ada akumulasi
+        )
+        
+        if capitulation_bounce_setup:
+            return {"override": False}  # JANGAN BLOCK, biarkan AggOFIFullBullish jalan
         
         # Data race terdeteksi
         if gap > 0.20 and json_agg < 0.75:
@@ -1137,6 +1184,63 @@ class DisplayJsonConsistencyVeto:
             }
         
         return {"override": False}
+
+
+class CapitulationLongLiqSweepOverride:
+    """
+    🔥 AKEUSDT PATTERN: Capitulation + long_liq ultra close + OBV positif
+    = HFT sweep long stop lalu pump ke short liq
+    
+    Kondisi:
+    - change_5m < -5.0% (sudah turun drastis)
+    - rsi6 < 15 (oversold ekstrem)
+    - long_liq < 3.0% (target likuidasi sangat dekat)
+    - short_liq > long_liq * 3 (short liq jauh lebih besar = target pump)
+    - obv_trend in ("POSITIVE_EXTREME", "POSITIVE") (akumulasi saat drop)
+    - volume_ratio < 0.8 (exhaustion, tidak ada panic volume)
+    - down_energy < 0.1 (tidak ada seller aktif)
+    - funding_rate TIDAK masalah (bisa positif/negatif)
+    
+    Priority: -10018 (LEBIH TINGGI dari DisplayJsonConsistencyVeto -10017)
+    Bias: LONG
+    """
+    @staticmethod
+    def detect(change_5m: float, rsi6: float,
+               long_liq: float, short_liq: float,
+               obv_trend: str, volume_ratio: float,
+               down_energy: float, agg: float,
+               funding_rate: float = 0.0) -> dict:
+        
+        # Core conditions
+        capitulation_drop = change_5m < -5.0
+        extreme_oversold = rsi6 < 15
+        long_liq_close = long_liq < 3.0
+        short_liq_much_further = short_liq > long_liq * 3.0
+        obv_accumulating = obv_trend in ("POSITIVE_EXTREME", "POSITIVE")
+        volume_dry = volume_ratio < 0.8
+        no_sellers = down_energy < 0.1
+        agg_bullish = agg > 0.6  # real-time buying
+        
+        if not all([capitulation_drop, extreme_oversold, long_liq_close,
+                    short_liq_much_further, obv_accumulating, volume_dry,
+                    no_sellers, agg_bullish]):
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "LONG",
+            "reason": (
+                f"CAPITULATION LONG LIQ SWEEP: price dropped {change_5m:.1f}%, "
+                f"RSI6={rsi6:.1f} capitulation, long_liq={long_liq:.2f}% (ultra close), "
+                f"short_liq={short_liq:.2f}% (target pump {short_liq/long_liq:.1f}x further), "
+                f"OBV={obv_trend} (institutional accumulation during drop), "
+                f"volume={volume_ratio:.2f}x dry, down_energy={down_energy:.2f} (no sellers), "
+                f"agg={agg:.2f} (real-time buying). "
+                f"HFT strategy: sweep long liq {long_liq:.1f}% → THEN pump to short liq {short_liq:.1f}%. "
+                f"Force LONG, override funding-greeks veto."
+            ),
+            "priority": -10018  # Lebih tinggi dari DisplayJsonConsistencyVeto (-10017)
+        }
 
 
 class VolumeDryUpReversal:
@@ -15142,6 +15246,29 @@ class BinanceAnalyzer:
             result["priority_level"] = bid_wall_spoof["priority"]
             return result
 
+        # ===== PRIORITY -10018: CAPITULATION LONG LIQ SWEEP (AKEUSDT PATTERN) =====
+        # Harus SEBELUM DisplayJsonConsistencyVeto (-10017) karena priority lebih tinggi
+        capitulation_sweep = CapitulationLongLiqSweepOverride.detect(
+            change_5m=change_5m_val,
+            rsi6=rsi6_val,
+            long_liq=long_liq,
+            short_liq=short_liq,
+            obv_trend=obv_trend,
+            volume_ratio=volume_ratio,
+            down_energy=down_energy_val,
+            agg=agg_val,
+            funding_rate=funding_rate_val
+        )
+        if capitulation_sweep["override"]:
+            result["bias"] = capitulation_sweep["bias"]
+            result["reason"] = (
+                f"[CAPITULATION SWEEP] {capitulation_sweep['reason']} | "
+                + result.get("reason", "")
+            )
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = capitulation_sweep["priority"]
+            return result  # Hard return, skip DisplayJsonConsistencyVeto
+        
         # ===== PRIORITY -10017: DISPLAY-JSON CONSISTENCY VETO (SEBELUM AGG-OFI) =====
         # Cek data race antara display agg dan JSON ground truth
         display_agg = result.get("agg_display", agg_val)  # agg dari display snapshot
@@ -15153,7 +15280,12 @@ class BinanceAnalyzer:
             ofi_strength=ofi_strength,
             funding_rate=funding_rate_val,
             greeks_kill=result.get("greeks_kill_direction", ""),
-            greeks_who_dies=result.get("greeks_who_dies_first", "")
+            greeks_who_dies=result.get("greeks_who_dies_first", ""),
+            # TAMBAH PARAMETER CAPITULATION GUARD
+            long_liq=long_liq,
+            rsi6=rsi6_val,
+            change_5m=change_5m_val,
+            obv_trend=obv_trend
         )
         if display_json_veto["override"]:
             result["bias"] = display_json_veto["bias"]
