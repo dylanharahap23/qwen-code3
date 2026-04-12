@@ -874,6 +874,271 @@ class DipThenRipSweep:
         return {"override": False}
 
 
+class AggSpoofingActiveDumpGuard:
+    """
+    AINUSDT PATTERN: agg=0.98 (98% buy trades) TAPI price turun -2.9%
+    + OBV NEGATIVE_EXTREME + funding positif tinggi + Greeks gamma executing SHORT
+    
+    Ini adalah HFT "Agg Spoofing Dump" yang paling licik:
+    1. HFT inject ribuan micro-buy trades → agg = 0.98
+    2. Sistem mengira ada buyer kuat → output LONG (reversal)
+    3. Tapi price tetap turun karena sell pressure lebih besar
+    4. Setelah LONG retail masuk → HFT dump besar
+    
+    Kunci pembeda:
+    - Genuine bounce: agg tinggi + price NAIK (atau minimal flat)
+    - Agg spoof: agg tinggi + price TURUN = mustahil jika agg genuine
+    
+    Jika 98% trades adalah BUY genuine, harga PASTI naik.
+    Jika harga turun meski agg=0.98, berarti sell orders jauh lebih besar
+    dalam dollar value (HFT sell satu order besar vs ribuan micro-buy retail).
+    
+    Konfirmasi wajib:
+    - Greeks gamma_executing = True (kill sudah dimulai)
+    - funding positif (crowded LONG = korban tersedia)
+    - OBV negatif (distribusi sudah panjang)
+    - long_liq lebih dekat dari short_liq
+    
+    Priority: -10018.95 (lebih tinggi dari semua reversal detector)
+    Bias: SHORT
+    """
+    @staticmethod
+    def detect(agg: float, change_5m: float, funding_rate: float,
+               obv_trend: str, obv_value: float,
+               greeks_gamma_executing: bool, greeks_gamma_exec_score: int,
+               greeks_kill_direction: str, greeks_who_dies_first: str,
+               long_liq: float, short_liq: float,
+               volume_ratio: float, up_energy: float,
+               rsi6_5m: float) -> dict:
+        
+        if funding_rate is None:
+            return {"override": False}
+        
+        # Core contradiction: agg sangat tinggi tapi harga turun
+        agg_price_contradiction = agg > 0.85 and change_5m < -1.5
+        
+        if not agg_price_contradiction:
+            return {"override": False}
+        
+        # Konfirmasi 1: OBV harus negatif (distribusi nyata)
+        obv_bearish = obv_trend in ("NEGATIVE_EXTREME", "NEGATIVE")
+        
+        if not obv_bearish:
+            return {"override": False}
+        
+        # Konfirmasi 2: funding positif = crowded LONG = korban ada
+        funding_crowded_long = funding_rate > 0.0003
+        
+        if not funding_crowded_long:
+            return {"override": False}
+        
+        # Konfirmasi 3: Greeks sudah committed SHORT
+        greeks_short = (
+            greeks_kill_direction == "SHORT" and
+            greeks_who_dies_first == "LONG_TRADERS"
+        )
+        
+        # Konfirmasi 4: long_liq lebih dekat dari short_liq (target jelas)
+        liq_target_valid = long_liq < short_liq * 3
+        
+        # Hitung score
+        score = sum([
+            obv_bearish,
+            funding_crowded_long,
+            greeks_short,
+            liq_target_valid,
+            greeks_gamma_executing,
+            greeks_gamma_exec_score >= 3,
+            volume_ratio < 0.6,
+        ])
+        
+        if score < 4:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"AGG SPOOFING ACTIVE DUMP: agg={agg:.2f} ({agg*100:.0f}% buy trades) "
+                f"TAPI price turun {change_5m:.1f}% → IMPOSSIBLE jika agg genuine. "
+                f"Ini HFT inject micro-buy untuk jebak reversal signal. "
+                f"OBV={obv_trend} ({obv_value:,.0f}) distribusi panjang, "
+                f"funding={funding_rate:.6f} (crowded LONG = korban siap), "
+                f"Greeks kill=SHORT gamma_executing={greeks_gamma_executing} "
+                f"(exec_score={greeks_gamma_exec_score}), "
+                f"long_liq={long_liq:.2f}% target. "
+                f"Score {score}/7. Force SHORT, blokir semua reversal."
+            ),
+            "priority": -10018.95
+        }
+
+
+class FundingHighGreeksShortAggBaitVeto:
+    """
+    AINUSDT PATTERN: agg=1.00 + OFI=LONG 1.00 TAPI
+    funding positif tinggi + greeks_kill=SHORT + greeks_who_dies=LONG
+    + OBV negatif + RSI5m overbought
+    
+    Ini adalah kondisi paling berbahaya:
+    HFT inject 100% micro-buy trades untuk membuat AggOFIFullBullish trigger,
+    tapi semua sinyal fundamental menunjuk SHORT.
+    
+    Kaidah: ketika funding > 0.0008 DAN greeks_who_dies = LONG_TRADERS,
+    agg=1.00 adalah 100% manipulasi. Greeks sudah committed bahwa LONG
+    yang akan mati. Tidak ada alasan untuk LONG.
+    
+    Pembeda dengan genuine squeeze:
+    - Genuine: funding NEGATIF (crowded SHORT yang squeeze)
+    - Bait: funding POSITIF (crowded LONG yang akan dump)
+    
+    Priority: -10016.5 (lebih tinggi dari AggOFIFullBullish -10016)
+    Bias: SHORT
+    """
+    @staticmethod
+    def detect(agg: float, ofi_bias: str, ofi_strength: float,
+               funding_rate: float,
+               greeks_kill_direction: str,
+               greeks_who_dies_first: str,
+               greeks_vega_active: bool,
+               obv_trend: str, obv_value: float,
+               rsi6_5m: float, stoch_j: float,
+               volume_ratio: float, short_liq: float,
+               long_liq: float, change_5m: float) -> dict:
+        
+        if funding_rate is None:
+            return {"override": False}
+        
+        # Funding harus tinggi positif (crowded LONG)
+        if funding_rate < 0.0007:
+            return {"override": False}
+        
+        # Greeks harus committed SHORT dengan LONG yang mati
+        greeks_committed_short = (
+            greeks_kill_direction == "SHORT" and
+            greeks_who_dies_first == "LONG_TRADERS"
+        )
+        if not greeks_committed_short:
+            return {"override": False}
+        
+        # agg atau OFI harus terlihat sangat bullish (ini yang membuat
+        # AggOFIFullBullish atau detector lain terjebak)
+        looks_bullish = agg > 0.60 or (ofi_bias == "LONG" and ofi_strength > 0.5)
+        if not looks_bullish:
+            return {"override": False}
+        
+        # Konfirmasi bahwa ini adalah bait (minimal 3 dari 5)
+        confirmations = {
+            "vega_bait": greeks_vega_active,
+            "obv_not_positive": obv_trend not in ("POSITIVE_EXTREME", "POSITIVE"),
+            "rsi5m_overbought": rsi6_5m > 70,
+            "stoch_maximal": stoch_j > 90,
+            "volume_ultra_dry": volume_ratio < 0.4,
+        }
+        
+        conf_count = sum(confirmations.values())
+        if conf_count < 3:
+            return {"override": False}
+        
+        # long_liq harus lebih jauh (target dump ada di sana)
+        # short_liq dekat hanya sebagai umpan
+        liq_trap = long_liq > short_liq * 2
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"FUNDING HIGH GREEKS SHORT AGG BAIT VETO: "
+                f"funding={funding_rate:.6f} (crowded LONG {funding_rate*100:.4f}%/8h), "
+                f"greeks_kill={greeks_kill_direction}, "
+                f"who_dies={greeks_who_dies_first} → LONG akan mati. "
+                f"agg={agg:.2f} + OFI={ofi_bias} {ofi_strength:.2f} adalah BAIT "
+                f"(Vega={greeks_vega_active} konfirmasi fake move). "
+                f"OBV={obv_trend} ({obv_value:,.0f}), "
+                f"RSI5m={rsi6_5m:.1f} overbought, "
+                f"Stoch J={stoch_j:.1f} maximal, "
+                f"volume={volume_ratio:.2f}x kering. "
+                f"short_liq={short_liq:.2f}% adalah UMPAN, "
+                f"target sebenarnya long_liq={long_liq:.2f}%. "
+                f"Confirmations={conf_count}/5. "
+                f"Veto AggOFIFullBullish. Force SHORT."
+            ),
+            "priority": -10016.5
+        }
+
+
+class DisplayJsonConsistencyVeto:
+    """
+    Ketika AggOFIFullBullish akan fire berdasarkan agg display,
+    cek apakah result["agg"] (JSON ground truth) konsisten.
+    
+    Jika gap > 0.25 antara display agg dan JSON agg,
+    dan JSON agg < 0.75, jangan fire AggOFIFullBullish.
+    
+    Priority: -10017 (lebih tinggi dari AggOFIFullBullish -10016)
+    """
+    @staticmethod
+    def should_block_agg_ofi_bullish(display_agg: float,
+                                      json_agg: float,
+                                      json_ofi_bias: str,
+                                      funding_rate: float,
+                                      greeks_kill: str) -> bool:
+        gap = abs(display_agg - json_agg)
+        
+        # Data race terdeteksi
+        if gap > 0.20:
+            # Percaya JSON, bukan display
+            if json_agg < 0.75:
+                return True  # block AggOFIFullBullish
+        
+        # Bahkan jika konsisten, funding tinggi + Greeks SHORT = block
+        if (funding_rate is not None and funding_rate > 0.0007 and
+            greeks_kill == "SHORT"):
+            return True
+        
+        return False
+    
+    @staticmethod
+    def detect(display_agg: float, json_agg: float,
+               ofi_bias: str, ofi_strength: float,
+               funding_rate: float, greeks_kill: str,
+               greeks_who_dies: str) -> dict:
+        """
+        Version detect() yang return dict lengkap untuk integrasi.
+        """
+        gap = abs(display_agg - json_agg)
+        
+        # Data race terdeteksi
+        if gap > 0.20 and json_agg < 0.75:
+            return {
+                "override": True,
+                "bias": "NEUTRAL",
+                "reason": (
+                    f"DISPLAY-JSON DATA RACE DETECTED: "
+                    f"display_agg={display_agg:.2f} vs json_agg={json_agg:.2f} "
+                    f"(gap={gap:.2f}). Percaya JSON ground truth. "
+                    f"BLOCK AggOFIFullBullish Continuation."
+                ),
+                "priority": -10017
+            }
+        
+        # Funding tinggi + Greeks SHORT = block
+        if (funding_rate is not None and funding_rate > 0.0007 and
+            greeks_kill == "SHORT"):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"FUNDING-GREEKS CONFLICT: funding={funding_rate:.6f} "
+                    f"(crowded LONG), greeks_kill={greeks_kill}, "
+                    f"who_dies={greeks_who_dies}. "
+                    f"BLOCK AggOFIFullBullish Long. Force SHORT bias."
+                ),
+                "priority": -10017
+            }
+        
+        return {"override": False}
+
+
 class VolumeDryUpReversal:
     """
     Detector: Volume Dry-Up Reversal (Priority -1080)
@@ -888,7 +1153,14 @@ class VolumeDryUpReversal:
     Priority: -1080
     """
     @staticmethod
-    def detect(change_5m: float, volume_ratio: float, rsi6_5m: float) -> Dict:
+    def detect(change_5m: float, volume_ratio: float, rsi6_5m: float,
+               # Tambah parameter konteks
+               funding_rate: float = 0.0,
+               greeks_kill_direction: str = "",
+               greeks_gamma_executing: bool = False,
+               obv_trend: str = "NEUTRAL",
+               long_liq: float = 99.0,
+               short_liq: float = 99.0) -> Dict:
         # Volume mengering setelah pergerakan besar → reversal
         if abs(change_5m) > 2.0 and volume_ratio < 0.6:
             if change_5m > 0 and rsi6_5m > 75:
@@ -899,6 +1171,24 @@ class VolumeDryUpReversal:
                     "priority": -1080
                 }
             if change_5m < 0 and rsi6_5m < 25:
+                
+                # 🔥 GUARD: Greeks sudah committed SHORT dengan gamma executing
+                # VolumeDryUp reversal TIDAK BOLEH override ini
+                if (greeks_kill_direction == "SHORT" and 
+                    greeks_gamma_executing and
+                    funding_rate > 0.0003):
+                    return {"override": False}
+                
+                # 🔥 GUARD: OBV negatif + funding positif = distribusi, bukan bounce
+                if (obv_trend in ("NEGATIVE_EXTREME", "NEGATIVE") and
+                    funding_rate > 0.0005):
+                    return {"override": False}
+                
+                # 🔥 GUARD: long_liq jauh lebih dekat dari short_liq
+                # (HFT mau dump ke long_liq, bukan bounce)
+                if long_liq < short_liq * 0.3:
+                    return {"override": False}
+                
                 return {
                     "override": True,
                     "bias": "LONG",
@@ -2713,6 +3003,12 @@ class StaleOBVDistributionGuard:
         if funding_rate is None:
             funding_rate = 0.0
         
+        # 🔥 GUARD BULLAUSDT: OBV sangat besar positif (>100 juta)
+        # = institutional accumulation NYATA, bukan stale
+        # OBV 426 juta tidak mungkin stale jika masih POSITIVE_EXTREME
+        if obv_trend == "POSITIVE_EXTREME" and obv_value > 100_000_000:
+            return {"override": False}
+        
         # OBV harus POSITIVE_EXTREME (ini yang menipu sistem)
         if obv_trend not in ("POSITIVE_EXTREME", "POSITIVE"):
             return {"override": False}
@@ -3023,6 +3319,104 @@ class OversoldCapitulationLongForce:
         return {"override": False}
 
 
+class InducedDumpBeforeSqueezeDetector:
+    """
+    BULLAUSDT PATTERN: HFT dump 3-5% dulu untuk sweep long_liq DAN
+    mengumpulkan SHORT retail, lalu pump besar ke short_liq
+    
+    Tanda-tanda:
+    1. OBV sangat positif (>100 juta) = institutional sudah akumulasi
+    2. RSI6_5m masih tinggi (>60) = trend 5m belum bearish
+    3. Greeks kill = LONG = arah akhir adalah naik
+    4. Vega aktif = gerakan turun adalah BAIT
+    5. funding positif = crowded LONG tapi delta_crowded = SHORT
+       (artinya SHORT yang akan dikill, bukan LONG)
+    6. long_liq dekat (akan di-sweep dulu sebagai "Dip Then Rip")
+    
+    Berbeda dengan genuine dump:
+    - Genuine dump: OBV negatif, RSI5m turun, delta_crowded = LONG
+    - Induced dump: OBV sangat positif, RSI5m masih tinggi, 
+                    delta_crowded = SHORT
+    
+    Output: LONG (ikuti arah akhir setelah sweep)
+    Note: sistem mungkin akan salah 3-5% dulu tapi benar 12% setelahnya
+    
+    Priority: -10013.8 (lebih tinggi dari TripleConfluence -10013)
+    """
+    @staticmethod
+    def detect(obv_trend: str, obv_value: float,
+               rsi6_5m: float, rsi6: float,
+               greeks_kill_direction: str,
+               greeks_vega_active: bool,
+               greeks_delta_crowded: str,
+               funding_rate: float,
+               long_liq: float, short_liq: float,
+               change_5m: float, volume_ratio: float,
+               agg: float) -> dict:
+        
+        if funding_rate is None:
+            return {"override": False}
+        
+        # OBV harus sangat positif (institutional accumulation)
+        obv_massive_positive = (
+            obv_trend == "POSITIVE_EXTREME" and
+            obv_value > 100_000_000
+        )
+        if not obv_massive_positive:
+            return {"override": False}
+        
+        # RSI 5m harus masih kuat (bukan genuine dump)
+        rsi5m_still_strong = rsi6_5m > 55
+        if not rsi5m_still_strong:
+            return {"override": False}
+        
+        # Greeks harus commit LONG sebagai arah akhir
+        greeks_long = greeks_kill_direction == "LONG"
+        if not greeks_long:
+            return {"override": False}
+        
+        # Harga harus sedang turun (ini adalah induced dump)
+        price_falling = change_5m < -1.5
+        if not price_falling:
+            return {"override": False}
+        
+        # Konfirmasi tambahan (butuh minimal 3 dari 5)
+        confirmations = {
+            "vega_bait": greeks_vega_active,
+            "shorts_crowded": greeks_delta_crowded == "SHORT",
+            "funding_ok": funding_rate > -0.002,
+            "long_liq_sweep_target": long_liq < short_liq * 0.6,
+            "volume_dry_induced": volume_ratio < 0.6,
+        }
+        
+        conf_count = sum(confirmations.values())
+        if conf_count < 3:
+            return {"override": False}
+        
+        # RSI6 1m sangat oversold = retail panik jual (ini yang HFT mau)
+        rsi1m_oversold = rsi6 < 15
+        
+        return {
+            "override": True,
+            "bias": "LONG",
+            "reason": (
+                f"INDUCED DUMP BEFORE SQUEEZE: "
+                f"OBV={obv_trend} ({obv_value:,.0f}) = institutional sudah akumulasi besar. "
+                f"RSI5m={rsi6_5m:.1f} masih kuat (bukan genuine dump). "
+                f"Greeks kill=LONG (arah akhir naik). "
+                f"Vega={greeks_vega_active} (dump ini adalah BAIT). "
+                f"delta_crowded={greeks_delta_crowded} (SHORT yang akan dikill). "
+                f"long_liq={long_liq:.2f}% akan di-sweep dulu, "
+                f"short_liq={short_liq:.2f}% adalah target akhir pump. "
+                f"RSI1m={rsi6:.1f} oversold = retail SHORT masuk (korban siap). "
+                f"Confirmations={conf_count}/5. "
+                f"HFT strategy: dump {long_liq:.1f}% sweep long stop "
+                f"→ pump {short_liq:.1f}% kill all shorts. Force LONG."
+            ),
+            "priority": -10013.8
+        }
+
+
 class OversoldOBVNegativeContinuation:
     """
     🔥 OVERSOLD + OBV NEGATIVE EXTREME + LONG LIQ DEKAT = DUMP CONTINUATION
@@ -3037,6 +3431,11 @@ class OversoldOBVNegativeContinuation:
         
         # 🔥 LECTURER FIX: Guard - RSI < 12 + agg > 0.65 + down_energy = 0 = OBV is stale, don't fire
         if rsi6 < 12 and agg > 0.65 and down_energy < 0.01:
+            return {"override": False}
+        
+        # 🔥 BULLAUSDT GUARD: jangan fire jika OBV sangat positif (bukan negatif)
+        # Detector ini khusus untuk OBV NEGATIVE_EXTREME continuation
+        if obv_trend not in ("NEGATIVE_EXTREME", "NEGATIVE"):
             return {"override": False}
         
         if (obv_trend == "NEGATIVE_EXTREME" and
@@ -11478,7 +11877,23 @@ class AggOFIFullBullishContinuation:
     def detect(agg: float, ofi_bias: str, ofi_strength: float,
                down_energy: float, change_5m: float,
                short_liq: float, rsi6: float,
-               rsi6_5m: float, volume_ratio: float) -> dict:
+               rsi6_5m: float, volume_ratio: float,
+               # Tambah parameter untuk guard AINUSDT
+               funding_rate: float = 0.0,
+               greeks_kill_direction: str = "",
+               greeks_who_dies_first: str = "",
+               greeks_vega_active: bool = False) -> dict:
+        
+        # 🔥 GUARD AINUSDT: funding tinggi + Greeks SHORT + LONG yang mati
+        # = agg tinggi adalah manipulasi, jangan paksa LONG
+        if (funding_rate is not None and funding_rate > 0.0007 and
+            greeks_kill_direction == "SHORT" and
+            greeks_who_dies_first == "LONG_TRADERS"):
+            return {"override": False}
+        
+        # 🔥 GUARD: Vega aktif = ini adalah BAIT, agg tinggi adalah induced
+        if greeks_vega_active and funding_rate is not None and funding_rate > 0.0005:
+            return {"override": False}
         
         # Core: triple full bullish
         full_bullish = (
@@ -11935,7 +12350,22 @@ class ExhaustedSqueezePostSweep:
         if obv_trend == "NEGATIVE_EXTREME" and agg > 0.85:
             return {"override": False}
         
-        sweep_completed = change_5m >= short_liq * 0.7
+        # 🔥 PATCH ARIAUSDT: short_liq ultra close membuat ratio tidak valid
+        # Ketika short_liq < 0.5%, formula change >= short_liq * 0.7 menghasilkan threshold hampir nol
+        # Ini adalah divide-by-near-zero bug yang menyamar sebagai logic
+        if short_liq < 0.5:
+            # Untuk ultra-close, butuh evidence yang jauh lebih kuat
+            # Minimum: agg harus bearish DAN funding harus positif
+            agg_bearish = agg < 0.45
+            funding_long = funding_rate is not None and funding_rate > 0.0001
+            if not (agg_bearish and funding_long):
+                return {"override": False}
+            # Gunakan threshold absolut bukan ratio
+            real_sweep = change_5m >= 3.0  # minimal 3% untuk ultra-close
+        else:
+            real_sweep = change_5m >= short_liq * 1.2
+        
+        sweep_completed = real_sweep
         if not sweep_completed:
             return {"override": False}
         
@@ -11990,6 +12420,84 @@ class ExhaustedSqueezePostSweep:
             }
         
         return {"override": False}
+
+
+class UltraShortLiqSqueezeActiveGuard:
+    """
+    ARIAUSDT PATTERN: short_liq < 0.5% dengan agg > 0.65 + up_energy > 0
+    + funding negatif = squeeze MASIH AKTIF, bukan exhausted
+    
+    ExhaustedSqueezePostSweep salah karena:
+    - short_liq 0.14% membuat threshold change*0.7 = 0.098% (hampir nol)
+    - Setiap candle akan terdeteksi sebagai "sweep completed"
+    - Padahal squeeze baru mulai, target berikutnya masih ada
+    
+    Kaidah: ketika short_liq < 0.5%, "exhausted sweep" TIDAK BISA
+    dievaluasi dari change_5m vs short_liq ratio.
+    Gunakan absolute signals sebagai gantinya:
+    - OBV harus POSITIF untuk konfirmasi exhaustion
+    - agg harus < 0.5 untuk konfirmasi distribusi
+    - funding harus POSITIF (crowded long) untuk konfirmasi reversal
+    
+    Jika syarat-syarat ini tidak terpenuhi = squeeze masih aktif.
+    
+    Priority: -10010.8 (lebih tinggi dari ExhaustedSweep -10010)
+    Bias: LONG (blokir SHORT dari ExhaustedSweep)
+    """
+    @staticmethod
+    def detect(short_liq: float, long_liq: float,
+               agg: float, up_energy: float, down_energy: float,
+               funding_rate: float, rsi6_5m: float,
+               obv_trend: str, obv_value: float,
+               change_5m: float) -> dict:
+        
+        if funding_rate is None:
+            funding_rate = 0.0
+        
+        # Hanya aktif untuk ultra-close short_liq
+        if short_liq >= 0.5:
+            return {"override": False}
+        
+        # short_liq harus lebih dekat dari long_liq
+        if short_liq >= long_liq:
+            return {"override": False}
+        
+        # Konfirmasi squeeze masih aktif (minimal 3 dari 5)
+        confirmations = {
+            "agg_bullish": agg > 0.60,
+            "up_energy_present": up_energy > 0.3,
+            "no_sellers": down_energy < 0.01,
+            "funding_crowded_short": funding_rate < 0,
+            "rsi5m_not_extreme": rsi6_5m < 75,
+        }
+        
+        active_count = sum(confirmations.values())
+        
+        if active_count < 3:
+            return {"override": False}
+        
+        # OBV harus tidak sangat bearish
+        # (jika OBV sangat negatif dan besar, mungkin memang distribusi)
+        obv_ok = not (obv_trend in ("NEGATIVE_EXTREME",) and 
+                      abs(obv_value) > 50_000_000)
+        
+        if not obv_ok:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "LONG",
+            "reason": (
+                f"ULTRA SHORT LIQ SQUEEZE ACTIVE: short_liq={short_liq:.2f}% "
+                f"(<0.5%) membuat ExhaustedSweep threshold tidak valid "
+                f"(threshold={short_liq*0.7:.3f}% hampir nol). "
+                f"agg={agg:.2f}, up_energy={up_energy:.2f}, "
+                f"down_energy={down_energy:.3f}, funding={funding_rate:.6f}, "
+                f"rsi6_5m={rsi6_5m:.1f} → squeeze MASIH AKTIF. "
+                f"Konfirmasi {active_count}/5. Block ExhaustedSweep. Force LONG."
+            ),
+            "priority": -10010.8
+        }
 
 
 class LowVolumeFakePumpTrap:
@@ -12976,76 +13484,6 @@ class LiquidityAmbiguityResolver:
         return down_energy < 0.1 or up_energy < 0.1
 
 
-class PureShortLiquiditySqueezeGuard:
-    """
-    🔥 MEMAKSA LONG saat short_liq ultra dekat, agg bullish, dan tidak ada seller.
-    Mengesampingkan semua sinyal SHORT termasuk dari Greeks dan overbought.
-    Priority -10020 (lebih tinggi dari hampir semua detector lain)
-    """
-    @staticmethod
-    def detect(result_dict: dict) -> dict:
-        # Ambil data dari result_dict (yang sudah berisi semua metrik)
-        short_liq = result_dict.get("short_liq", 99.0)
-        agg = result_dict.get("agg", 0.5)          # ground truth dari result
-        down_energy = result_dict.get("down_energy", 1.0)
-        up_energy = result_dict.get("up_energy", 0.0)
-        rsi6_5m = result_dict.get("rsi6_5m", 50.0)
-        funding = result_dict.get("funding_rate", 0.0)
-        
-        # Kondisi utama
-        if (short_liq < 0.8 and
-            agg > 0.7 and
-            down_energy < 0.01 and
-            up_energy > 0.1 and
-            rsi6_5m < 70 and
-            (funding is None or funding < 0.003)):   # tidak crowded long ekstrem
-            
-            return {
-                "override": True,
-                "bias": "LONG",
-                "reason": f"PURE SHORT LIQUIDITY SQUEEZE: short_liq={short_liq:.2f}%, agg={agg:.2f} (bullish), down_energy=0, up_energy={up_energy:.2f} → HFT akan sweep short stops, force LONG, blokir semua SHORT",
-                "priority": -10020
-            }
-        return {"override": False}
-
-
-class CrowdedLongOversoldStaleOBVTrap:
-    """
-    🔥 BULLAUSDT PATTERN: funding positif (crowded long) + harga turun + oversold + OBV positif ekstrem (stale) + volume kering
-    = HFT akan terus dump untuk likuidasi long, bukan bounce.
-    Priority: -10026 (lebih tinggi dari hampir semua)
-    """
-    @staticmethod
-    def detect(result_dict: dict) -> dict:
-        funding = result_dict.get("funding_rate", 0.0)
-        change_5m = result_dict.get("change_5m", 0.0)
-        rsi6 = result_dict.get("rsi6", 50.0)
-        obv_trend = result_dict.get("obv_trend", "NEUTRAL")
-        volume_ratio = result_dict.get("volume_ratio", 1.0)
-        down_energy = result_dict.get("down_energy", 1.0)
-        long_liq = result_dict.get("long_liq", 99.0)
-        short_liq = result_dict.get("short_liq", 99.0)
-        
-        # Kondisi utama
-        if (funding > 0.0003 and
-            change_5m < -1.5 and
-            rsi6 < 30 and
-            obv_trend == "POSITIVE_EXTREME" and
-            volume_ratio < 0.6 and
-            down_energy < 0.1):
-            
-            # Optional: long_liq tidak terlalu dekat (karena kalau dekat bisa jadi bounce)
-            # Tapi di sini long_liq=11%, jadi aman
-            if long_liq > 3.0:
-                return {
-                    "override": True,
-                    "bias": "SHORT",
-                    "reason": f"CROWDED LONG OVERSOLD STALE OBV TRAP: funding={funding:.5f} (crowded long), price down {change_5m:.1f}%, RSI={rsi6:.1f} oversold, OBV={obv_trend} (stale accumulation), volume={volume_ratio:.2f}x kering, no real sellers (down_energy={down_energy:.2f}) → HFT akan lanjut dump untuk likuidasi long, force SHORT",
-                    "priority": -10026
-                }
-        return {"override": False}
-
-
 class AlgoTypeAnalyzer:
     @staticmethod
     def analyze(order_book: Dict, trades: List[Dict], price: float,
@@ -13855,15 +14293,6 @@ class BinanceAnalyzer:
             result["priority_level"] = micro_spoof["priority"]
             return result
         
-        # ===== PRIORITY -10026: CROWDED LONG OVERSOLD STALE OBV TRAP (TERTINGGI ABSOLUT) =====
-        crowded_long_trap = CrowdedLongOversoldStaleOBVTrap.detect(result)
-        if crowded_long_trap["override"]:
-            result["bias"] = crowded_long_trap["bias"]
-            result["reason"] = f"[CROWDED LONG TRAP] {crowded_long_trap['reason']} | " + result.get("reason", "")
-            result["confidence"] = "ABSOLUTE"
-            result["priority_level"] = crowded_long_trap["priority"]
-            return result
-        
         # ===== PRIORITY -10025: FUNDING EXTREME LONG LIQ TRAP (TERTINGGI ABSOLUT) =====
         funding_long_trap = FundingExtremeLongLiqTrapReversal.detect(
             funding_rate=funding_rate_val,
@@ -13878,6 +14307,34 @@ class BinanceAnalyzer:
             result["reason"] = f"[FUNDING LONG TRAP] {funding_long_trap['reason']} | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = funding_long_trap["priority"]
+            return result
+        
+        # ===== PRIORITY -10018.95: AGG SPOOFING ACTIVE DUMP GUARD =====
+        # Harus paling awal karena ini pattern paling licik HFT
+        agg_spoof_dump = AggSpoofingActiveDumpGuard.detect(
+            agg=agg_val,
+            change_5m=change_5m_val,
+            funding_rate=funding_rate_val,
+            obv_trend=obv_trend,
+            obv_value=result.get("obv_value", 0),
+            greeks_gamma_executing=result.get("greeks_gamma_executing", False),
+            greeks_gamma_exec_score=result.get("greeks_gamma_exec_score", 0),
+            greeks_kill_direction=result.get("greeks_kill_direction", ""),
+            greeks_who_dies_first=result.get("greeks_who_dies_first", ""),
+            long_liq=long_liq,
+            short_liq=short_liq,
+            volume_ratio=volume_ratio,
+            up_energy=up_energy_val,
+            rsi6_5m=rsi6_5m_val
+        )
+        if agg_spoof_dump["override"]:
+            result["bias"] = agg_spoof_dump["bias"]
+            result["reason"] = (
+                f"[AGG SPOOF DUMP] {agg_spoof_dump['reason']} | "
+                + result.get("reason", "")
+            )
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = agg_spoof_dump["priority"]
             return result
         
         # ===== PRIORITY -10024: FUNDING EXTREME RELENTLESS SQUEEZE (TERTINGGI ABSOLUT) =====
@@ -13957,15 +14414,6 @@ class BinanceAnalyzer:
             result["reason"] = f"[EXTREME DROP] {extreme_drop['reason']} | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = extreme_drop["priority"]
-            return result
-        
-        # ===== PRIORITY -10020: PURE SHORT LIQUIDITY SQUEEZE GUARD (TERTINGGI ABSOLUT) =====
-        pure_squeeze = PureShortLiquiditySqueezeGuard.detect(result)
-        if pure_squeeze["override"]:
-            result["bias"] = pure_squeeze["bias"]
-            result["reason"] = f"[PURE SQUEEZE GUARD] {pure_squeeze['reason']} | " + result.get("reason", "")
-            result["confidence"] = "ABSOLUTE"
-            result["priority_level"] = pure_squeeze["priority"]
             return result
         
         # ===== BAIT PHASE SOFT BLOCK (tidak langsung block, tapi turunkan confidence) =====
@@ -14341,6 +14789,34 @@ class BinanceAnalyzer:
             result["priority_level"] = stoch_j_guard["priority"]
             return result
         
+        # ===== PRIORITY -10013.8: INDUCED DUMP BEFORE SQUEEZE (BULLAUSDT PATTERN) =====
+        # Detector untuk HFT dump 3-5% sweep long_liq lalu pump besar ke short_liq
+        # OBV massive positive (>100 juta) = institutional accumulation
+        induced_dump = InducedDumpBeforeSqueezeDetector.detect(
+            obv_trend=obv_trend,
+            obv_value=result.get("obv_value", 0),
+            rsi6_5m=rsi6_5m_val,
+            rsi6=rsi6_val,
+            greeks_kill_direction=result.get("greeks_kill_direction", ""),
+            greeks_vega_active=result.get("greeks_vega_active", False),
+            greeks_delta_crowded=result.get("greeks_delta_crowded", ""),
+            funding_rate=funding_rate_val,
+            long_liq=long_liq,
+            short_liq=short_liq,
+            change_5m=change_5m_val,
+            volume_ratio=volume_ratio,
+            agg=agg_val
+        )
+        if induced_dump["override"]:
+            result["bias"] = induced_dump["bias"]
+            result["reason"] = (
+                f"[INDUCED DUMP BEFORE SQUEEZE] {induced_dump['reason']} | "
+                + result.get("reason", "")
+            )
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = induced_dump["priority"]
+            return result
+        
         # ================= LECTURER'S SARAN: 4 NEW AIOTUSDT FIX DETECTORS =================
         # Detector-detector ini dijalankan SEBELUM OBV-VOLUME VETO dengan priority -10018.7 ke -10018.2
         
@@ -14666,6 +15142,58 @@ class BinanceAnalyzer:
             result["priority_level"] = bid_wall_spoof["priority"]
             return result
 
+        # ===== PRIORITY -10017: DISPLAY-JSON CONSISTENCY VETO (SEBELUM AGG-OFI) =====
+        # Cek data race antara display agg dan JSON ground truth
+        display_agg = result.get("agg_display", agg_val)  # agg dari display snapshot
+        json_agg = agg_val  # agg dari JSON ground truth
+        display_json_veto = DisplayJsonConsistencyVeto.detect(
+            display_agg=display_agg,
+            json_agg=json_agg,
+            ofi_bias=ofi_bias,
+            ofi_strength=ofi_strength,
+            funding_rate=funding_rate_val,
+            greeks_kill=result.get("greeks_kill_direction", ""),
+            greeks_who_dies=result.get("greeks_who_dies_first", "")
+        )
+        if display_json_veto["override"]:
+            result["bias"] = display_json_veto["bias"]
+            result["reason"] = (
+                f"[DISPLAY-JSON VETO] {display_json_veto['reason']} | "
+                + result.get("reason", "")
+            )
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = display_json_veto["priority"]
+            return result
+        
+        # ===== PRIORITY -10016.5: FUNDING HIGH GREEKS SHORT AGG BAIT VETO =====
+        # Harus SEBELUM AggOFIFullBullish (-10016)
+        funding_greeks_veto = FundingHighGreeksShortAggBaitVeto.detect(
+            agg=agg_val,
+            ofi_bias=ofi_bias,
+            ofi_strength=ofi_strength,
+            funding_rate=funding_rate_val,
+            greeks_kill_direction=result.get("greeks_kill_direction", ""),
+            greeks_who_dies_first=result.get("greeks_who_dies_first", ""),
+            greeks_vega_active=result.get("greeks_vega_active", False),
+            obv_trend=obv_trend,
+            obv_value=result.get("obv_value", 0),
+            rsi6_5m=rsi6_5m_val,
+            stoch_j=stoch_j_val,
+            volume_ratio=volume_ratio,
+            short_liq=short_liq,
+            long_liq=long_liq,
+            change_5m=change_5m_val
+        )
+        if funding_greeks_veto["override"]:
+            result["bias"] = funding_greeks_veto["bias"]
+            result["reason"] = (
+                f"[FUNDING GREEKS VETO] {funding_greeks_veto['reason']} | "
+                + result.get("reason", "")
+            )
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = funding_greeks_veto["priority"]
+            return result
+        
         # ===== PRIORITY -10016: AGG-OFI FULL BULLISH CONTINUATION =====
         agg_ofi_bullish = AggOFIFullBullishContinuation.detect(
             agg=result.get("agg", 0.5),
@@ -14676,7 +15204,12 @@ class BinanceAnalyzer:
             short_liq=result.get("short_liq", 99.0),
             rsi6=result.get("rsi6", 50.0),
             rsi6_5m=result.get("rsi6_5m", 50.0),
-            volume_ratio=result.get("volume_ratio", 1.0)
+            volume_ratio=result.get("volume_ratio", 1.0),
+            # Tambah parameter guard AINUSDT
+            funding_rate=funding_rate_val or 0.0,
+            greeks_kill_direction=result.get("greeks_kill_direction", ""),
+            greeks_who_dies_first=result.get("greeks_who_dies_first", ""),
+            greeks_vega_active=result.get("greeks_vega_active", False)
         )
         if agg_ofi_bullish["override"]:
             result["bias"] = agg_ofi_bullish["bias"]
@@ -14922,6 +15455,30 @@ class BinanceAnalyzer:
             )
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = obv_dip_buy["priority"]
+            return result
+        
+        # ===== PRIORITY -10010.8: ULTRA SHORT LIQ SQUEEZE ACTIVE GUARD =====
+        # Harus SEBELUM ExhaustedSqueezePostSweep (-10010)
+        ultra_short_guard = UltraShortLiqSqueezeActiveGuard.detect(
+            short_liq=short_liq,
+            long_liq=long_liq,
+            agg=agg_val,
+            up_energy=up_energy_val,
+            down_energy=down_energy_val,
+            funding_rate=funding_rate_val,
+            rsi6_5m=rsi6_5m_val,
+            obv_trend=result.get("obv_trend", "NEUTRAL"),
+            obv_value=result.get("obv_value", 0),
+            change_5m=change_5m_val
+        )
+        if ultra_short_guard["override"]:
+            result["bias"] = ultra_short_guard["bias"]
+            result["reason"] = (
+                f"[ULTRA SHORT LIQ GUARD] {ultra_short_guard['reason']} | "
+                + result.get("reason", "")
+            )
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = ultra_short_guard["priority"]
             return result
         
         # ===== PRIORITY -10010: EXHAUSTED SQUEEZE POST-SWEEP (TERTINGGI ABSOLUT) =====
@@ -15673,7 +16230,13 @@ class BinanceAnalyzer:
         volume_dryup_result = VolumeDryUpReversal.detect(
             change_5m=change_5m,
             volume_ratio=volume_ratio,
-            rsi6_5m=rsi6_5m
+            rsi6_5m=rsi6_5m,
+            funding_rate=result.get("funding_rate", 0.0),
+            greeks_kill_direction=result.get("greeks_kill_direction", ""),
+            greeks_gamma_executing=result.get("greeks_gamma_executing", False),
+            obv_trend=result.get("obv_trend", "NEUTRAL"),
+            long_liq=result.get("long_liq", 99.0),
+            short_liq=short_liq
         )
         result["volume_dryup_reversal"] = volume_dryup_result
 
