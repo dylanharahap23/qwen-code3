@@ -12976,6 +12976,76 @@ class LiquidityAmbiguityResolver:
         return down_energy < 0.1 or up_energy < 0.1
 
 
+class PureShortLiquiditySqueezeGuard:
+    """
+    🔥 MEMAKSA LONG saat short_liq ultra dekat, agg bullish, dan tidak ada seller.
+    Mengesampingkan semua sinyal SHORT termasuk dari Greeks dan overbought.
+    Priority -10020 (lebih tinggi dari hampir semua detector lain)
+    """
+    @staticmethod
+    def detect(result_dict: dict) -> dict:
+        # Ambil data dari result_dict (yang sudah berisi semua metrik)
+        short_liq = result_dict.get("short_liq", 99.0)
+        agg = result_dict.get("agg", 0.5)          # ground truth dari result
+        down_energy = result_dict.get("down_energy", 1.0)
+        up_energy = result_dict.get("up_energy", 0.0)
+        rsi6_5m = result_dict.get("rsi6_5m", 50.0)
+        funding = result_dict.get("funding_rate", 0.0)
+        
+        # Kondisi utama
+        if (short_liq < 0.8 and
+            agg > 0.7 and
+            down_energy < 0.01 and
+            up_energy > 0.1 and
+            rsi6_5m < 70 and
+            (funding is None or funding < 0.003)):   # tidak crowded long ekstrem
+            
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": f"PURE SHORT LIQUIDITY SQUEEZE: short_liq={short_liq:.2f}%, agg={agg:.2f} (bullish), down_energy=0, up_energy={up_energy:.2f} → HFT akan sweep short stops, force LONG, blokir semua SHORT",
+                "priority": -10020
+            }
+        return {"override": False}
+
+
+class CrowdedLongOversoldStaleOBVTrap:
+    """
+    🔥 BULLAUSDT PATTERN: funding positif (crowded long) + harga turun + oversold + OBV positif ekstrem (stale) + volume kering
+    = HFT akan terus dump untuk likuidasi long, bukan bounce.
+    Priority: -10026 (lebih tinggi dari hampir semua)
+    """
+    @staticmethod
+    def detect(result_dict: dict) -> dict:
+        funding = result_dict.get("funding_rate", 0.0)
+        change_5m = result_dict.get("change_5m", 0.0)
+        rsi6 = result_dict.get("rsi6", 50.0)
+        obv_trend = result_dict.get("obv_trend", "NEUTRAL")
+        volume_ratio = result_dict.get("volume_ratio", 1.0)
+        down_energy = result_dict.get("down_energy", 1.0)
+        long_liq = result_dict.get("long_liq", 99.0)
+        short_liq = result_dict.get("short_liq", 99.0)
+        
+        # Kondisi utama
+        if (funding > 0.0003 and
+            change_5m < -1.5 and
+            rsi6 < 30 and
+            obv_trend == "POSITIVE_EXTREME" and
+            volume_ratio < 0.6 and
+            down_energy < 0.1):
+            
+            # Optional: long_liq tidak terlalu dekat (karena kalau dekat bisa jadi bounce)
+            # Tapi di sini long_liq=11%, jadi aman
+            if long_liq > 3.0:
+                return {
+                    "override": True,
+                    "bias": "SHORT",
+                    "reason": f"CROWDED LONG OVERSOLD STALE OBV TRAP: funding={funding:.5f} (crowded long), price down {change_5m:.1f}%, RSI={rsi6:.1f} oversold, OBV={obv_trend} (stale accumulation), volume={volume_ratio:.2f}x kering, no real sellers (down_energy={down_energy:.2f}) → HFT akan lanjut dump untuk likuidasi long, force SHORT",
+                    "priority": -10026
+                }
+        return {"override": False}
+
+
 class AlgoTypeAnalyzer:
     @staticmethod
     def analyze(order_book: Dict, trades: List[Dict], price: float,
@@ -13785,6 +13855,15 @@ class BinanceAnalyzer:
             result["priority_level"] = micro_spoof["priority"]
             return result
         
+        # ===== PRIORITY -10026: CROWDED LONG OVERSOLD STALE OBV TRAP (TERTINGGI ABSOLUT) =====
+        crowded_long_trap = CrowdedLongOversoldStaleOBVTrap.detect(result)
+        if crowded_long_trap["override"]:
+            result["bias"] = crowded_long_trap["bias"]
+            result["reason"] = f"[CROWDED LONG TRAP] {crowded_long_trap['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = crowded_long_trap["priority"]
+            return result
+        
         # ===== PRIORITY -10025: FUNDING EXTREME LONG LIQ TRAP (TERTINGGI ABSOLUT) =====
         funding_long_trap = FundingExtremeLongLiqTrapReversal.detect(
             funding_rate=funding_rate_val,
@@ -13878,6 +13957,15 @@ class BinanceAnalyzer:
             result["reason"] = f"[EXTREME DROP] {extreme_drop['reason']} | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = extreme_drop["priority"]
+            return result
+        
+        # ===== PRIORITY -10020: PURE SHORT LIQUIDITY SQUEEZE GUARD (TERTINGGI ABSOLUT) =====
+        pure_squeeze = PureShortLiquiditySqueezeGuard.detect(result)
+        if pure_squeeze["override"]:
+            result["bias"] = pure_squeeze["bias"]
+            result["reason"] = f"[PURE SQUEEZE GUARD] {pure_squeeze['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = pure_squeeze["priority"]
             return result
         
         # ===== BAIT PHASE SOFT BLOCK (tidak langsung block, tapi turunkan confidence) =====
