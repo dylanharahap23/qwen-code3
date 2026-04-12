@@ -874,6 +874,105 @@ class DipThenRipSweep:
         return {"override": False}
 
 
+class AggSpoofingActiveDumpGuard:
+    """
+    AINUSDT PATTERN: agg=0.98 (98% buy trades) TAPI price turun -2.9%
+    + OBV NEGATIVE_EXTREME + funding positif tinggi + Greeks gamma executing SHORT
+    
+    Ini adalah HFT "Agg Spoofing Dump" yang paling licik:
+    1. HFT inject ribuan micro-buy trades → agg = 0.98
+    2. Sistem mengira ada buyer kuat → output LONG (reversal)
+    3. Tapi price tetap turun karena sell pressure lebih besar
+    4. Setelah LONG retail masuk → HFT dump besar
+    
+    Kunci pembeda:
+    - Genuine bounce: agg tinggi + price NAIK (atau minimal flat)
+    - Agg spoof: agg tinggi + price TURUN = mustahil jika agg genuine
+    
+    Jika 98% trades adalah BUY genuine, harga PASTI naik.
+    Jika harga turun meski agg=0.98, berarti sell orders jauh lebih besar
+    dalam dollar value (HFT sell satu order besar vs ribuan micro-buy retail).
+    
+    Konfirmasi wajib:
+    - Greeks gamma_executing = True (kill sudah dimulai)
+    - funding positif (crowded LONG = korban tersedia)
+    - OBV negatif (distribusi sudah panjang)
+    - long_liq lebih dekat dari short_liq
+    
+    Priority: -10018.95 (lebih tinggi dari semua reversal detector)
+    Bias: SHORT
+    """
+    @staticmethod
+    def detect(agg: float, change_5m: float, funding_rate: float,
+               obv_trend: str, obv_value: float,
+               greeks_gamma_executing: bool, greeks_gamma_exec_score: int,
+               greeks_kill_direction: str, greeks_who_dies_first: str,
+               long_liq: float, short_liq: float,
+               volume_ratio: float, up_energy: float,
+               rsi6_5m: float) -> dict:
+        
+        if funding_rate is None:
+            return {"override": False}
+        
+        # Core contradiction: agg sangat tinggi tapi harga turun
+        agg_price_contradiction = agg > 0.85 and change_5m < -1.5
+        
+        if not agg_price_contradiction:
+            return {"override": False}
+        
+        # Konfirmasi 1: OBV harus negatif (distribusi nyata)
+        obv_bearish = obv_trend in ("NEGATIVE_EXTREME", "NEGATIVE")
+        
+        if not obv_bearish:
+            return {"override": False}
+        
+        # Konfirmasi 2: funding positif = crowded LONG = korban ada
+        funding_crowded_long = funding_rate > 0.0003
+        
+        if not funding_crowded_long:
+            return {"override": False}
+        
+        # Konfirmasi 3: Greeks sudah committed SHORT
+        greeks_short = (
+            greeks_kill_direction == "SHORT" and
+            greeks_who_dies_first == "LONG_TRADERS"
+        )
+        
+        # Konfirmasi 4: long_liq lebih dekat dari short_liq (target jelas)
+        liq_target_valid = long_liq < short_liq * 3
+        
+        # Hitung score
+        score = sum([
+            obv_bearish,
+            funding_crowded_long,
+            greeks_short,
+            liq_target_valid,
+            greeks_gamma_executing,
+            greeks_gamma_exec_score >= 3,
+            volume_ratio < 0.6,
+        ])
+        
+        if score < 4:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"AGG SPOOFING ACTIVE DUMP: agg={agg:.2f} ({agg*100:.0f}% buy trades) "
+                f"TAPI price turun {change_5m:.1f}% → IMPOSSIBLE jika agg genuine. "
+                f"Ini HFT inject micro-buy untuk jebak reversal signal. "
+                f"OBV={obv_trend} ({obv_value:,.0f}) distribusi panjang, "
+                f"funding={funding_rate:.6f} (crowded LONG = korban siap), "
+                f"Greeks kill=SHORT gamma_executing={greeks_gamma_executing} "
+                f"(exec_score={greeks_gamma_exec_score}), "
+                f"long_liq={long_liq:.2f}% target. "
+                f"Score {score}/7. Force SHORT, blokir semua reversal."
+            ),
+            "priority": -10018.95
+        }
+
+
 class VolumeDryUpReversal:
     """
     Detector: Volume Dry-Up Reversal (Priority -1080)
@@ -888,7 +987,14 @@ class VolumeDryUpReversal:
     Priority: -1080
     """
     @staticmethod
-    def detect(change_5m: float, volume_ratio: float, rsi6_5m: float) -> Dict:
+    def detect(change_5m: float, volume_ratio: float, rsi6_5m: float,
+               # Tambah parameter konteks
+               funding_rate: float = 0.0,
+               greeks_kill_direction: str = "",
+               greeks_gamma_executing: bool = False,
+               obv_trend: str = "NEUTRAL",
+               long_liq: float = 99.0,
+               short_liq: float = 99.0) -> Dict:
         # Volume mengering setelah pergerakan besar → reversal
         if abs(change_5m) > 2.0 and volume_ratio < 0.6:
             if change_5m > 0 and rsi6_5m > 75:
@@ -899,6 +1005,24 @@ class VolumeDryUpReversal:
                     "priority": -1080
                 }
             if change_5m < 0 and rsi6_5m < 25:
+                
+                # 🔥 GUARD: Greeks sudah committed SHORT dengan gamma executing
+                # VolumeDryUp reversal TIDAK BOLEH override ini
+                if (greeks_kill_direction == "SHORT" and 
+                    greeks_gamma_executing and
+                    funding_rate > 0.0003):
+                    return {"override": False}
+                
+                # 🔥 GUARD: OBV negatif + funding positif = distribusi, bukan bounce
+                if (obv_trend in ("NEGATIVE_EXTREME", "NEGATIVE") and
+                    funding_rate > 0.0005):
+                    return {"override": False}
+                
+                # 🔥 GUARD: long_liq jauh lebih dekat dari short_liq
+                # (HFT mau dump ke long_liq, bukan bounce)
+                if long_liq < short_liq * 0.3:
+                    return {"override": False}
+                
                 return {
                     "override": True,
                     "bias": "LONG",
@@ -13894,6 +14018,34 @@ class BinanceAnalyzer:
             result["priority_level"] = funding_long_trap["priority"]
             return result
         
+        # ===== PRIORITY -10018.95: AGG SPOOFING ACTIVE DUMP GUARD =====
+        # Harus paling awal karena ini pattern paling licik HFT
+        agg_spoof_dump = AggSpoofingActiveDumpGuard.detect(
+            agg=agg_val,
+            change_5m=change_5m_val,
+            funding_rate=funding_rate_val,
+            obv_trend=obv_trend,
+            obv_value=result.get("obv_value", 0),
+            greeks_gamma_executing=result.get("greeks_gamma_executing", False),
+            greeks_gamma_exec_score=result.get("greeks_gamma_exec_score", 0),
+            greeks_kill_direction=result.get("greeks_kill_direction", ""),
+            greeks_who_dies_first=result.get("greeks_who_dies_first", ""),
+            long_liq=long_liq,
+            short_liq=short_liq,
+            volume_ratio=volume_ratio,
+            up_energy=up_energy_val,
+            rsi6_5m=rsi6_5m_val
+        )
+        if agg_spoof_dump["override"]:
+            result["bias"] = agg_spoof_dump["bias"]
+            result["reason"] = (
+                f"[AGG SPOOF DUMP] {agg_spoof_dump['reason']} | "
+                + result.get("reason", "")
+            )
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = agg_spoof_dump["priority"]
+            return result
+        
         # ===== PRIORITY -10024: FUNDING EXTREME RELENTLESS SQUEEZE (TERTINGGI ABSOLUT) =====
         relentless = FundingExtremeRelentlessSqueeze.detect(
             funding_rate=funding_rate_val,
@@ -15702,7 +15854,13 @@ class BinanceAnalyzer:
         volume_dryup_result = VolumeDryUpReversal.detect(
             change_5m=change_5m,
             volume_ratio=volume_ratio,
-            rsi6_5m=rsi6_5m
+            rsi6_5m=rsi6_5m,
+            funding_rate=result.get("funding_rate", 0.0),
+            greeks_kill_direction=result.get("greeks_kill_direction", ""),
+            greeks_gamma_executing=result.get("greeks_gamma_executing", False),
+            obv_trend=result.get("obv_trend", "NEUTRAL"),
+            long_liq=result.get("long_liq", 99.0),
+            short_liq=short_liq
         )
         result["volume_dryup_reversal"] = volume_dryup_result
 
