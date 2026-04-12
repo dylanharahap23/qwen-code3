@@ -3374,15 +3374,44 @@ class StochJOverflowReversal:
     """
     🔥 PRIORITY -1114: STOCH J > 105 ADALAH MATHEMATICAL IMPOSSIBILITY → PASTI REVERSAL
     Stochastic J yang overflow menunjukkan kondisi overbought ekstrem tidak wajar.
+    
+    GUARD: Jika short_liq sangat dekat dan gamma extreme, ini squeeze, jangan SHORT.
     """
     @staticmethod
-    def detect(stoch_j: float, volume_ratio: float, change_5m: float) -> Dict:
+    def detect(stoch_j: float, volume_ratio: float, change_5m: float,
+               short_liq: float, gamma_intensity: str, kill_direction: str) -> Dict:
+        # Guard: jika short_liq sangat dekat dan gamma extreme, ini squeeze, jangan SHORT
+        if short_liq < 1.0 and gamma_intensity == "EXTREME" and kill_direction == "LONG":
+            return {"override": False}
         if stoch_j > 105 and volume_ratio < 0.7 and change_5m > 1.0:
             return {
                 "override": True,
                 "bias": "SHORT",
                 "reason": f"STOCH J OVERFLOW: J={stoch_j:.1f}>105, vol={volume_ratio:.2f}x, pump {change_5m:.1f}% → blow-off, force SHORT",
                 "priority": -1114
+            }
+        return {"override": False}
+
+
+class StochJOverflowSqueezeGuard:
+    """
+    🔥 PRIORITY -1114.5: GUARD untuk StochJOverflowReversal
+    Jika stoch_j overflow (>105) TAPI short_liq < 1.0% dan gamma EXTREME dan kill_direction LONG,
+    maka itu adalah SQUEEZE CONTINUATION, BUKAN blow-off top.
+    """
+    @staticmethod
+    def detect(stoch_j: float, short_liq: float, gamma_intensity: str,
+               kill_direction: str, change_5m: float, volume_ratio: float) -> Dict:
+        if stoch_j > 105 and short_liq < 1.0 and gamma_intensity == "EXTREME" and kill_direction == "LONG":
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": (
+                    f"STOCH J OVERFLOW SQUEEZE GUARD: J={stoch_j:.1f}>105 tapi "
+                    f"short_liq={short_liq:.2f}% super close, gamma EXTREME, kill={kill_direction} → "
+                    f"squeeze continuation, NOT blow-off. Force LONG."
+                ),
+                "priority": -1114.5
             }
         return {"override": False}
 
@@ -14157,11 +14186,30 @@ class BinanceAnalyzer:
         # ========== LECTURER'S SARAN: BLOW-OFF REVERSAL DETECTORS (-1116 to -1113) ==========
         # Detector-detector ini harus dijalankan SETELAH OBV-VOLUME VETO dan SEBELUM short squeeze guards
         
-        # ===== PRIORITY -1114: STOCH J OVERFLOW REVERSAL (PALING AWAL) =====
+        # ===== PRIORITY -1114.5: STOCH J OVERFLOW SQUEEZE GUARD (BARU - LEBIH TINGGI) =====
+        stoch_j_guard = StochJOverflowSqueezeGuard.detect(
+            stoch_j=stoch_j_val,
+            short_liq=short_liq,
+            gamma_intensity=result.get("greeks_gamma_intensity", "LOW"),
+            kill_direction=result.get("greeks_kill_direction", ""),
+            change_5m=change_5m_val,
+            volume_ratio=volume_ratio
+        )
+        if stoch_j_guard["override"]:
+            result["bias"] = stoch_j_guard["bias"]
+            result["reason"] = f"[STOCH J SQUEEZE GUARD] {stoch_j_guard['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = stoch_j_guard["priority"]
+            return result
+        
+        # ===== PRIORITY -1114: STOCH J OVERFLOW REVERSAL =====
         stoch_j_overflow = StochJOverflowReversal.detect(
             stoch_j=stoch_j_val,
             volume_ratio=volume_ratio,
-            change_5m=change_5m_val
+            change_5m=change_5m_val,
+            short_liq=short_liq,
+            gamma_intensity=result.get("greeks_gamma_intensity", "LOW"),
+            kill_direction=result.get("greeks_kill_direction", "")
         )
         if stoch_j_overflow["override"]:
             result["bias"] = stoch_j_overflow["bias"]
