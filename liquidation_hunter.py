@@ -10642,6 +10642,103 @@ class OBVPositiveRSIOversoldFundingNegativeReversal:
         return {"override": False}
 
 
+class FundingPositiveLongLiqCascadeGuard:
+    """
+    SYSUSDT PATTERN: RSI sangat oversold + OBV POSITIVE_EXTREME + funding POSITIF
+    + long_liq < 1.5% = BUKAN bounce, ini CROWDED LONG CASCADE
+    
+    Perbedaan kritis dengan genuine bounce:
+    - Genuine bounce: funding NEGATIF (crowded SHORT yang akan di-squeeze)
+    - Crowded Long Cascade: funding POSITIF (crowded LONG yang sedang mati)
+    
+    Ketika funding positif + long_liq sangat dekat:
+    HFT sedang eksekusi LONG secara bertahap. RSI oversold bukan karena
+    panic selling retail, tapi karena forced liquidation LONG yang sudah
+    terjebak sejak harga tinggi.
+    
+    OBV POSITIVE_EXTREME = stale, dibuat waktu akumulasi awal.
+    Sekarang distribusi sudah selesai, tinggal cascade liquidation.
+    
+    Bukti SYSUSDT:
+    - agg = 0.50 (bukan 0.80+ seperti genuine bounce)
+    - up_energy = 0 (tidak ada buyer NYATA di order book)
+    - funding = +0.00005 (crowded LONG)
+    - long_liq = 0.96% (target eksekusi sangat dekat)
+    
+    Priority: -10012.5 (lebih tinggi dari GreekKillReversalAfterCapitulation -10012)
+    Bias: SHORT
+    """
+    @staticmethod
+    def detect(rsi6: float, obv_trend: str, funding_rate: float,
+               long_liq: float, short_liq: float,
+               agg: float, up_energy: float, down_energy: float,
+               change_5m: float, greeks_kill_direction: str,
+               greeks_who_dies_first: str) -> dict:
+        
+        if funding_rate is None:
+            return {"override": False}
+        
+        # Core: funding positif = crowded LONG (bukan SHORT)
+        funding_crowded_long = funding_rate > 0.00003
+        
+        # RSI sangat oversold (terlihat seperti bounce tapi sebenarnya cascade)
+        rsi_fake_oversold = rsi6 < 15
+        
+        # long_liq sangat dekat = target likuidasi
+        long_liq_target = long_liq < 1.5
+        
+        # short_liq sangat jauh = SHORT aman
+        short_liq_safe = short_liq > long_liq * 5
+        
+        if not (funding_crowded_long and rsi_fake_oversold and 
+                long_liq_target and short_liq_safe):
+            return {"override": False}
+        
+        # Konfirmasi: agg tidak terlalu bullish
+        # Genuine bounce = agg > 0.75
+        # Crowded cascade = agg < 0.65 (orang tidak mau beli meski terlihat oversold)
+        agg_not_bullish = agg < 0.65
+        
+        # Konfirmasi: up_energy rendah (tidak ada buyer nyata di book)
+        no_real_buyers = up_energy < 0.5
+        
+        # Greeks harus setuju
+        greeks_confirm = (
+            greeks_kill_direction == "SHORT" and
+            greeks_who_dies_first == "LONG_TRADERS"
+        )
+        
+        # Hitung score konfirmasi
+        score = sum([
+            agg_not_bullish,
+            no_real_buyers,
+            greeks_confirm,
+            abs(change_5m) < 1.0,  # harga bergerak kecil = distribusi diam-diam
+        ])
+        
+        if score >= 2:
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"FUNDING POSITIVE LONG LIQ CASCADE: "
+                    f"funding={funding_rate:.6f} (crowded LONG, bukan SHORT) → "
+                    f"RSI={rsi6:.1f} oversold adalah FAKE (bukan panic retail, "
+                    f"ini forced LONG liquidation bertahap). "
+                    f"long_liq={long_liq:.2f}% target cascade, "
+                    f"short_liq={short_liq:.2f}% aman (ratio {short_liq/long_liq:.1f}x). "
+                    f"agg={agg:.2f} (bukan genuine bounce, genuine bounce = agg>0.75). "
+                    f"OBV POSITIVE_EXTREME adalah STALE dari akumulasi lama. "
+                    f"Greeks konfirmasi: kill={greeks_kill_direction}, "
+                    f"who_dies={greeks_who_dies_first}. "
+                    f"Score konfirmasi: {score}/4. Force SHORT."
+                ),
+                "priority": -10012.5  # lebih tinggi dari GreekKillReversal -10012
+            }
+        
+        return {"override": False}
+
+
 class GreekKillReversalAfterCapitulation:
     """
     🔥 GREEK KILL REVERSAL AFTER CAPITULATION (DIPERBAIKI)
@@ -10658,6 +10755,14 @@ class GreekKillReversalAfterCapitulation:
                down_energy: float, agg: float) -> dict:
         
         if funding_rate is None:
+            return {"override": False}
+        
+        # 🔥 GUARD KRITIS SYSUSDT: funding positif = crowded LONG
+        # Ketika funding > 0, RSI oversold = crowded LONG cascade, BUKAN bounce
+        if funding_rate > 0.00003 and long_liq < short_liq * 0.2:
+            # long_liq jauh lebih kecil dari short_liq = LONG yang akan mati
+            # funding positif mengkonfirmasi LONG crowded
+            # Jangan fire reversal ke LONG
             return {"override": False}
         
         # 🔥 GUARD: Jika funding extreme negatif (< -0.01) dan long_liq masih > 1% dan change_5m > -2%,
@@ -14578,6 +14683,31 @@ class BinanceAnalyzer:
             result["priority_level"] = triple_confluence["priority"]
             return result  # Hard return
 
+        # ===== PRIORITY -10012.5: FUNDING POSITIVE LONG LIQ CASCADE =====
+        # Harus SEBELUM GreekKillReversalAfterCapitulation (-10012)
+        funding_cascade = FundingPositiveLongLiqCascadeGuard.detect(
+            rsi6=rsi6_val,
+            obv_trend=result.get("obv_trend", "NEUTRAL"),
+            funding_rate=result.get("funding_rate", 0.0),
+            long_liq=long_liq,
+            short_liq=short_liq,
+            agg=agg_val,
+            up_energy=up_energy_val,
+            down_energy=down_energy_val,
+            change_5m=change_5m_val,
+            greeks_kill_direction=result.get("greeks_kill_direction", ""),
+            greeks_who_dies_first=result.get("greeks_who_dies_first", "")
+        )
+        if funding_cascade["override"]:
+            result["bias"] = funding_cascade["bias"]
+            result["reason"] = (
+                f"[FUNDING CASCADE GUARD] {funding_cascade['reason']} | "
+                + result.get("reason", "")
+            )
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = funding_cascade["priority"]
+            return result
+        
         # ===== PRIORITY -10012: GREEK KILL REVERSAL AFTER CAPITULATION =====
         greek_kill_rev = GreekKillReversalAfterCapitulation.detect(
             change_5m=change_5m_val,
