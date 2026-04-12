@@ -2676,6 +2676,266 @@ class ShortLiqSqueezeContinuationGuard:
         return {"override": False}
 
 
+class StaleOBVDistributionGuard:
+    """
+    🔥 AIOTUSDT FIX: OBV POSITIVE_EXTREME tapi volume 0.39x + agg 0.19 = OBV stale/lagging
+    
+    OBV POSITIVE_EXTREME dibangun dari volume historis.
+    Ketika volume SEKARANG sangat kering (0.39x) dan 81% trades adalah SELL (agg=0.19),
+    OBV positif itu mencerminkan kondisi MASA LALU, bukan sekarang.
+    
+    Sistem saat ini punya OBVLaggingAggContradictionResolver tapi tidak cukup ketat —
+    detector ini lebih agresif dan punya priority lebih tinggi.
+    
+    Inti: jika agg < 0.35 + volume kering + OBV positive → OBV adalah lagging indicator,
+    percaya agg sebagai ground truth real-time → SHORT.
+    
+    Priority: -10018.5 (lebih tinggi dari OversoldOBVNegativeContinuation -10018)
+    Bias: SHORT
+    """
+    @staticmethod
+    def detect(obv_trend: str, obv_value: float, agg: float,
+               volume_ratio: float, ofi_bias: str, ofi_strength: float,
+               funding_rate: float, change_5m: float,
+               down_energy: float, up_energy: float) -> dict:
+        
+        if funding_rate is None:
+            funding_rate = 0.0
+        
+        # OBV harus POSITIVE_EXTREME (ini yang menipu sistem)
+        if obv_trend not in ("POSITIVE_EXTREME", "POSITIVE"):
+            return {"override": False}
+        
+        # agg harus sangat rendah — 65%+ trades SELL
+        if agg >= 0.35:
+            return {"override": False}
+        
+        # Volume harus kering (membuktikan OBV tidak mencerminkan kondisi sekarang)
+        if volume_ratio >= 0.55:
+            return {"override": False}
+        
+        # Minimal 2 dari 4 konfirmasi tambahan
+        confirmations = sum([
+            ofi_bias == "SHORT" and ofi_strength > 0.5,   # OFI mengkonfirmasi distribusi
+            funding_rate > 0.0008,                          # crowded LONG (akan diliquidasi)
+            abs(change_5m) < 1.0,                           # price flat/kecil (distribusi diam)
+            up_energy > 0 and down_energy < 0.01,           # bid wall spoof (up_energy fake)
+        ])
+        
+        if confirmations < 2:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"STALE OBV DISTRIBUTION GUARD: "
+                f"OBV={obv_trend} ({obv_value:,.0f}) tapi STALE — "
+                f"agg={agg:.2f} ({(1-agg)*100:.0f}% trades SELL real-time), "
+                f"volume={volume_ratio:.2f}x kering → OBV lagging, "
+                f"percaya agg sebagai ground truth. "
+                f"OFI={ofi_bias} {ofi_strength:.2f}, funding={funding_rate:.5f}. "
+                f"confirmations={confirmations}/4 → force SHORT"
+            ),
+            "priority": -10018.5
+        }
+
+
+class PhantomBidWallAggVeto:
+    """
+    🔥 AIOTUSDT FIX: up_energy > 0 tapi agg < 0.35 = bid wall adalah SPOOFED
+    
+    AIOTUSDT: up_energy = 1.4, tapi agg = 0.19 (81% trades SELL)
+    
+    Logika: jika bid wall nyata dan kuat (up_energy=1.4), maka orang akan BUY ke bid wall.
+    Tapi kalau 81% trades SELL dan hanya 19% BUY, bid wall itu tidak nyata —
+    HFT pasang bid wall untuk ilusi support, tapi tidak execute buy di sana.
+    Ini klasik bid wall spoofing untuk memancing short sellers masuk,
+    sebelum HFT sendiri dump besar.
+    
+    Priority: -10018.3
+    Bias: SHORT
+    """
+    @staticmethod
+    def detect(up_energy: float, down_energy: float, agg: float,
+               volume_ratio: float, ofi_bias: str, ofi_strength: float,
+               funding_rate: float, change_5m: float,
+               obv_trend: str) -> dict:
+        
+        if funding_rate is None:
+            funding_rate = 0.0
+        
+        # up_energy harus ada (bid wall terlihat kuat)
+        if up_energy <= 0.3:
+            return {"override": False}
+        
+        # agg harus sangat rendah — bid wall nyata akan menarik buyers
+        if agg >= 0.35:
+            return {"override": False}
+        
+        # Tidak ada seller aktif di book (tapi agg menunjukkan 81% sell)
+        if down_energy >= 0.1:
+            return {"override": False}
+        
+        # Volume harus kering (spoof tidak butuh volume besar)
+        if volume_ratio >= 0.6:
+            return {"override": False}
+        
+        # OFI harus konfirmasi SHORT
+        if ofi_bias != "SHORT" or ofi_strength < 0.5:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"PHANTOM BID WALL AGG VETO: "
+                f"up_energy={up_energy:.2f} terlihat bullish TAPI "
+                f"agg={agg:.2f} ({(1-agg)*100:.0f}% trades SELL) → bid wall adalah PALSU. "
+                f"Jika bid wall nyata, orang akan BUY, bukan SELL 81%. "
+                f"down_energy={down_energy:.3f}, volume={volume_ratio:.2f}x, "
+                f"OFI SHORT {ofi_strength:.2f} → HFT spoof bid untuk jebak short, "
+                f"setelah terisi akan dump. Force SHORT."
+            ),
+            "priority": -10018.3
+        }
+
+
+class CrowdedLongFundingKillConfirmed:
+    """
+    🔥 AIOTUSDT FIX: funding positif tinggi + kill_direction SHORT + who_dies LONG + agg rendah
+    = Liquidasi crowded LONG sudah dikonfirmasi oleh semua layer
+    
+    Ini adalah kondisi paling jelas untuk dump:
+    1. funding_rate > 0.001 → semua orang LONG (crowded)
+    2. greeks_kill_direction = SHORT → Greeks konfirmasi LONG akan mati
+    3. greeks_who_dies_first = LONG_TRADERS → siapa yang mati sudah jelas
+    4. agg < 0.4 → bahkan real-time trades sudah mayoritas SELL
+    5. algo_type_bias = SHORT → algo konfirmasi
+    
+    Ketika 5 layer semuanya menunjuk SHORT, tidak ada excuse untuk LONG.
+    Detector ini memblokir SEMUA override yang mencoba paksa LONG.
+    
+    Priority: -10018.7 (TERTINGGI dari 4 detector baru)
+    Bias: SHORT
+    """
+    @staticmethod
+    def detect(funding_rate: float, kill_direction: str, who_dies_first: str,
+               agg: float, ofi_bias: str, ofi_strength: float,
+               volume_ratio: float, algo_type_bias: str,
+               obv_trend: str, change_5m: float) -> dict:
+        
+        if funding_rate is None:
+            return {"override": False}
+        
+        # funding harus crowded LONG
+        if funding_rate <= 0.0008:
+            return {"override": False}
+        
+        # Greeks harus konfirmasi kill direction SHORT
+        if kill_direction != "SHORT":
+            return {"override": False}
+        
+        # who_dies harus LONG_TRADERS (sudah committed)
+        if who_dies_first != "LONG_TRADERS":
+            return {"override": False}
+        
+        # agg harus < 0.4 (sell dominant)
+        if agg >= 0.4:
+            return {"override": False}
+        
+        # Butuh minimal 2 dari 3 konfirmasi tambahan
+        extra = sum([
+            ofi_bias == "SHORT" and ofi_strength > 0.5,
+            algo_type_bias == "SHORT",
+            volume_ratio < 0.55,
+        ])
+        
+        if extra < 2:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"CROWDED LONG FUNDING KILL CONFIRMED: "
+                f"funding={funding_rate:.5f} (crowded LONG akan diliquidasi), "
+                f"kill_direction={kill_direction}, who_dies={who_dies_first} → "
+                f"Greeks sudah committed. agg={agg:.2f} ({(1-agg)*100:.0f}% SELL), "
+                f"OFI {ofi_bias} {ofi_strength:.2f}, algo={algo_type_bias}. "
+                f"extra_confirmations={extra}/3. "
+                f"SEMUA layer menunjuk SHORT → paksa SHORT, blokir semua LONG override."
+            ),
+            "priority": -10018.7
+        }
+
+
+class ExtremeAggShortDistributionVeto:
+    """
+    🔥 AIOTUSDT FIX: agg < 0.25 (75%+ SELL) + OFI SHORT + funding crowded + volume kering
+    = Distribusi ekstrem yang tidak bisa disangkal
+    
+    Prinsip: agg adalah ground truth transaksi nyata yang paling sulit dispoof.
+    Ketika 75%+ trades adalah SELL secara real-time, tidak ada sinyal lain yang
+    bisa override ini kecuali kondisi yang benar-benar extraordinary.
+    
+    Kondisi extraordinary yang boleh override agg ekstrem:
+    - RSI6 < 5 (capitulation absolut) → mungkin bounce
+    - long_liq < 0.2% (cascade imminent) → mungkin bounce
+    
+    Selain itu, agg < 0.25 = SHORT absolut.
+    
+    Priority: -10018.2
+    Bias: SHORT
+    """
+    @staticmethod
+    def detect(agg: float, ofi_bias: str, ofi_strength: float,
+               funding_rate: float, volume_ratio: float,
+               rsi6: float, long_liq: float,
+               change_5m: float, up_energy: float) -> dict:
+        
+        if funding_rate is None:
+            funding_rate = 0.0
+        
+        # agg harus ekstrem rendah
+        if agg >= 0.25:
+            return {"override": False}
+        
+        # OFI harus SHORT
+        if ofi_bias != "SHORT" or ofi_strength < 0.5:
+            return {"override": False}
+        
+        # Extraordinary exceptions — jika ini terjadi, jangan override
+        if rsi6 < 5:
+            return {"override": False}  # capitulation absolut
+        if long_liq < 0.3:
+            return {"override": False}  # cascade imminent
+        
+        # Minimal 2 dari 3 konfirmasi
+        extra = sum([
+            funding_rate > 0.0005,      # crowded LONG
+            volume_ratio < 0.6,         # distribusi kering
+            abs(change_5m) < 1.0,       # price flat (distribusi diam-diam)
+        ])
+        
+        if extra < 2:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"EXTREME AGG SHORT DISTRIBUTION VETO: "
+                f"agg={agg:.2f} ({(1-agg)*100:.0f}% trades SELL — extreme distribution), "
+                f"OFI SHORT {ofi_strength:.2f}, funding={funding_rate:.5f}. "
+                f"agg adalah ground truth transaksi nyata. "
+                f"Tidak ada alasan untuk LONG ketika 75%+ trades adalah SELL. "
+                f"extra={extra}/3 → veto semua LONG override, force SHORT."
+            ),
+            "priority": -10018.2
+        }
+
+
 class OversoldOBVNegativeContinuation:
     """
     🔥 OVERSOLD + OBV NEGATIVE EXTREME + LONG LIQ DEKAT = DUMP CONTINUATION
@@ -10742,41 +11002,77 @@ class OBVLaggingAggContradictionResolver:
                                    change_5m: float) -> bool:
         """Returns True jika agg lebih reliable dari OBV"""
         
+        # LECTURER FIX: tambahkan case untuk SHORT ekstrem
         # agg sangat tinggi + OFI konfirmasi = real-time bullish nyata
-        agg_reliable = (agg > 0.85 and ofi_strength > 0.7)
+        # ATAU agg sangat rendah + OFI konfirmasi = real-time bearish nyata
+        agg_reliable = (
+            (agg > 0.85 and ofi_strength > 0.7) or   # sisi LONG sudah ada
+            (agg < 0.25 and ofi_strength > 0.5)        # tambah: sisi SHORT ekstrem
+        )
         
         # OBV berlawanan dengan agg
         obv_bearish = obv_trend in ("NEGATIVE_EXTREME", "NEGATIVE")
+        obv_bullish = obv_trend in ("POSITIVE_EXTREME", "POSITIVE")
         
         # Tidak ada seller (konfirmasi agg bukan spoof)
         no_seller = down_energy < 0.01
         
         # Harga naik (konsisten dengan agg bullish)
         price_up = change_5m > 0
+        price_down = change_5m < 0
         
-        return (agg_reliable and obv_bearish and no_seller and price_up)
+        # Trust agg jika:
+        # - LONG side: agg tinggi + OFI kuat + OBV bearish + no seller + price up
+        # - SHORT side: agg rendah + OFI kuat + OBV bullish + price down
+        long_side = (agg > 0.85 and ofi_strength > 0.7 and obv_bearish and no_seller and price_up)
+        short_side = (agg < 0.25 and ofi_strength > 0.5 and obv_bullish and price_down)
+        
+        return long_side or short_side
     
     @staticmethod
     def detect(agg: float, ofi_bias: str, ofi_strength: float,
                obv_trend: str, down_energy: float,
-               change_5m: float, short_liq: float) -> dict:
+               change_5m: float, short_liq: float,
+               long_liq: float, up_energy: float,
+               funding_rate: float) -> dict:
         
-        should_trust_agg = OBVLaggingAggContradictionResolver.should_trust_agg_over_obv(
-            agg, ofi_strength, obv_trend, down_energy, change_5m
+        if funding_rate is None:
+            funding_rate = 0.0
+        
+        # Case LONG: agg ekstrem tinggi + OBV negatif = OBV lagging
+        should_trust_agg_long = (
+            agg > 0.85 and ofi_strength > 0.7 and 
+            obv_trend in ("NEGATIVE_EXTREME", "NEGATIVE") and
+            down_energy < 0.01 and change_5m > 0
         )
         
-        if should_trust_agg and short_liq > 0.3:
+        if should_trust_agg_long and short_liq > 0.3:
             return {
                 "override": True,
                 "bias": "LONG",
                 "reason": (
-                    f"OBV LAGGING AGG CONTRADICTION: "
-                    f"OBV={obv_trend} (stale/lagging) TAPI "
-                    f"agg={agg:.2f} + OFI={ofi_bias} {ofi_strength:.2f} + "
-                    f"down_energy={down_energy:.3f} → "
-                    f"Real-time signal (agg) lebih akurat. "
-                    f"OBV mencerminkan kondisi sebelum pump. "
-                    f"Trust agg: LONG"
+                    f"OBV LAGGING AGG CONTRADICTION (LONG): "
+                    f"agg={agg:.2f} ({agg*100:.0f}% BUY real-time) TAPI "
+                    f"OBV={obv_trend} → OBV lagging/stale, percaya agg. Force LONG."
+                ),
+                "priority": -10015.5
+            }
+        
+        # Case SHORT: agg ekstrem rendah + OBV positif = OBV lagging
+        should_trust_agg_short = (
+            agg < 0.25 and ofi_strength > 0.5 and 
+            obv_trend in ("POSITIVE_EXTREME", "POSITIVE") and
+            change_5m < 0
+        )
+        
+        if should_trust_agg_short and long_liq > 0.3:
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"OBV LAGGING AGG CONTRADICTION (SHORT): "
+                    f"agg={agg:.2f} ({(1-agg)*100:.0f}% SELL real-time) TAPI "
+                    f"OBV={obv_trend} → OBV lagging/stale, percaya agg. Force SHORT."
                 ),
                 "priority": -10015.5
             }
@@ -13288,6 +13584,88 @@ class BinanceAnalyzer:
             return result
 
 
+        # ================= LECTURER'S SARAN: 4 NEW AIOTUSDT FIX DETECTORS =================
+        # Detector-detector ini dijalankan SEBELUM OBV-VOLUME VETO dengan priority -10018.7 ke -10018.2
+        
+        # ===== PRIORITY -10018.7: CROWDED LONG FUNDING KILL CONFIRMED (TERTINGGI BARU) =====
+        crowded_kill = CrowdedLongFundingKillConfirmed.detect(
+            funding_rate=funding_rate_val,
+            kill_direction=result.get("greeks_kill_direction", ""),
+            who_dies_first=result.get("greeks_who_dies_first", ""),
+            agg=agg_val,
+            ofi_bias=ofi_bias,
+            ofi_strength=ofi_strength,
+            volume_ratio=volume_ratio,
+            algo_type_bias=result.get("algo_type_bias", "NEUTRAL"),
+            obv_trend=obv_trend,
+            change_5m=change_5m_val
+        )
+        if crowded_kill["override"]:
+            result["bias"] = crowded_kill["bias"]
+            result["reason"] = f"[CROWDED KILL CONFIRMED] {crowded_kill['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = crowded_kill["priority"]
+            return result
+
+        # ===== PRIORITY -10018.5: STALE OBV DISTRIBUTION GUARD =====
+        stale_obv = StaleOBVDistributionGuard.detect(
+            obv_trend=obv_trend,
+            obv_value=result.get("obv_value", 0),
+            agg=agg_val,
+            volume_ratio=volume_ratio,
+            ofi_bias=ofi_bias,
+            ofi_strength=ofi_strength,
+            funding_rate=funding_rate_val,
+            change_5m=change_5m_val,
+            down_energy=down_energy_val,
+            up_energy=up_energy_val
+        )
+        if stale_obv["override"]:
+            result["bias"] = stale_obv["bias"]
+            result["reason"] = f"[STALE OBV GUARD] {stale_obv['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = stale_obv["priority"]
+            return result
+
+        # ===== PRIORITY -10018.3: PHANTOM BID WALL AGG VETO =====
+        phantom_bid = PhantomBidWallAggVeto.detect(
+            up_energy=up_energy_val,
+            down_energy=down_energy_val,
+            agg=agg_val,
+            volume_ratio=volume_ratio,
+            ofi_bias=ofi_bias,
+            ofi_strength=ofi_strength,
+            funding_rate=funding_rate_val,
+            change_5m=change_5m_val,
+            obv_trend=obv_trend
+        )
+        if phantom_bid["override"]:
+            result["bias"] = phantom_bid["bias"]
+            result["reason"] = f"[PHANTOM BID WALL] {phantom_bid['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = phantom_bid["priority"]
+            return result
+
+        # ===== PRIORITY -10018.2: EXTREME AGG SHORT DISTRIBUTION VETO =====
+        extreme_agg_veto = ExtremeAggShortDistributionVeto.detect(
+            agg=agg_val,
+            ofi_bias=ofi_bias,
+            ofi_strength=ofi_strength,
+            funding_rate=funding_rate_val,
+            volume_ratio=volume_ratio,
+            rsi6=rsi6_val,
+            long_liq=long_liq,
+            change_5m=change_5m_val,
+            up_energy=up_energy_val
+        )
+        if extreme_agg_veto["override"]:
+            result["bias"] = extreme_agg_veto["bias"]
+            result["reason"] = f"[EXTREME AGG VETO] {extreme_agg_veto['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = extreme_agg_veto["priority"]
+            return result
+
+
         # ========== OBV-VOLUME VETO (LECTURER FIX 3) ==========
         # Jika OBV NEGATIVE_EXTREME + volume_ratio < 0.4 dan bias = LONG → paksa SHORT
         if obv_trend == "NEGATIVE_EXTREME" and volume_ratio < 0.4 and result.get("bias") == "LONG":
@@ -13517,7 +13895,10 @@ class BinanceAnalyzer:
             obv_trend=result.get("obv_trend", "NEUTRAL"),
             down_energy=result.get("down_energy", 0.0),
             change_5m=result.get("change_5m", 0.0),
-            short_liq=result.get("short_liq", 99.0)
+            short_liq=result.get("short_liq", 99.0),
+            long_liq=result.get("long_liq", 99.0),
+            up_energy=result.get("up_energy", 0.0),
+            funding_rate=result.get("funding_rate", 0.0)
         )
         if obv_lag["override"]:
             result["bias"] = obv_lag["bias"]
