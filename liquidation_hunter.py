@@ -11935,7 +11935,22 @@ class ExhaustedSqueezePostSweep:
         if obv_trend == "NEGATIVE_EXTREME" and agg > 0.85:
             return {"override": False}
         
-        sweep_completed = change_5m >= short_liq * 0.7
+        # 🔥 PATCH ARIAUSDT: short_liq ultra close membuat ratio tidak valid
+        # Ketika short_liq < 0.5%, formula change >= short_liq * 0.7 menghasilkan threshold hampir nol
+        # Ini adalah divide-by-near-zero bug yang menyamar sebagai logic
+        if short_liq < 0.5:
+            # Untuk ultra-close, butuh evidence yang jauh lebih kuat
+            # Minimum: agg harus bearish DAN funding harus positif
+            agg_bearish = agg < 0.45
+            funding_long = funding_rate is not None and funding_rate > 0.0001
+            if not (agg_bearish and funding_long):
+                return {"override": False}
+            # Gunakan threshold absolut bukan ratio
+            real_sweep = change_5m >= 3.0  # minimal 3% untuk ultra-close
+        else:
+            real_sweep = change_5m >= short_liq * 1.2
+        
+        sweep_completed = real_sweep
         if not sweep_completed:
             return {"override": False}
         
@@ -11990,6 +12005,84 @@ class ExhaustedSqueezePostSweep:
             }
         
         return {"override": False}
+
+
+class UltraShortLiqSqueezeActiveGuard:
+    """
+    ARIAUSDT PATTERN: short_liq < 0.5% dengan agg > 0.65 + up_energy > 0
+    + funding negatif = squeeze MASIH AKTIF, bukan exhausted
+    
+    ExhaustedSqueezePostSweep salah karena:
+    - short_liq 0.14% membuat threshold change*0.7 = 0.098% (hampir nol)
+    - Setiap candle akan terdeteksi sebagai "sweep completed"
+    - Padahal squeeze baru mulai, target berikutnya masih ada
+    
+    Kaidah: ketika short_liq < 0.5%, "exhausted sweep" TIDAK BISA
+    dievaluasi dari change_5m vs short_liq ratio.
+    Gunakan absolute signals sebagai gantinya:
+    - OBV harus POSITIF untuk konfirmasi exhaustion
+    - agg harus < 0.5 untuk konfirmasi distribusi
+    - funding harus POSITIF (crowded long) untuk konfirmasi reversal
+    
+    Jika syarat-syarat ini tidak terpenuhi = squeeze masih aktif.
+    
+    Priority: -10010.8 (lebih tinggi dari ExhaustedSweep -10010)
+    Bias: LONG (blokir SHORT dari ExhaustedSweep)
+    """
+    @staticmethod
+    def detect(short_liq: float, long_liq: float,
+               agg: float, up_energy: float, down_energy: float,
+               funding_rate: float, rsi6_5m: float,
+               obv_trend: str, obv_value: float,
+               change_5m: float) -> dict:
+        
+        if funding_rate is None:
+            funding_rate = 0.0
+        
+        # Hanya aktif untuk ultra-close short_liq
+        if short_liq >= 0.5:
+            return {"override": False}
+        
+        # short_liq harus lebih dekat dari long_liq
+        if short_liq >= long_liq:
+            return {"override": False}
+        
+        # Konfirmasi squeeze masih aktif (minimal 3 dari 5)
+        confirmations = {
+            "agg_bullish": agg > 0.60,
+            "up_energy_present": up_energy > 0.3,
+            "no_sellers": down_energy < 0.01,
+            "funding_crowded_short": funding_rate < 0,
+            "rsi5m_not_extreme": rsi6_5m < 75,
+        }
+        
+        active_count = sum(confirmations.values())
+        
+        if active_count < 3:
+            return {"override": False}
+        
+        # OBV harus tidak sangat bearish
+        # (jika OBV sangat negatif dan besar, mungkin memang distribusi)
+        obv_ok = not (obv_trend in ("NEGATIVE_EXTREME",) and 
+                      abs(obv_value) > 50_000_000)
+        
+        if not obv_ok:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "LONG",
+            "reason": (
+                f"ULTRA SHORT LIQ SQUEEZE ACTIVE: short_liq={short_liq:.2f}% "
+                f"(<0.5%) membuat ExhaustedSweep threshold tidak valid "
+                f"(threshold={short_liq*0.7:.3f}% hampir nol). "
+                f"agg={agg:.2f}, up_energy={up_energy:.2f}, "
+                f"down_energy={down_energy:.3f}, funding={funding_rate:.6f}, "
+                f"rsi6_5m={rsi6_5m:.1f} → squeeze MASIH AKTIF. "
+                f"Konfirmasi {active_count}/5. Block ExhaustedSweep. Force LONG."
+            ),
+            "priority": -10010.8
+        }
 
 
 class LowVolumeFakePumpTrap:
@@ -14834,6 +14927,30 @@ class BinanceAnalyzer:
             )
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = obv_dip_buy["priority"]
+            return result
+        
+        # ===== PRIORITY -10010.8: ULTRA SHORT LIQ SQUEEZE ACTIVE GUARD =====
+        # Harus SEBELUM ExhaustedSqueezePostSweep (-10010)
+        ultra_short_guard = UltraShortLiqSqueezeActiveGuard.detect(
+            short_liq=short_liq,
+            long_liq=long_liq,
+            agg=agg_val,
+            up_energy=up_energy_val,
+            down_energy=down_energy_val,
+            funding_rate=funding_rate_val,
+            rsi6_5m=rsi6_5m_val,
+            obv_trend=result.get("obv_trend", "NEUTRAL"),
+            obv_value=result.get("obv_value", 0),
+            change_5m=change_5m_val
+        )
+        if ultra_short_guard["override"]:
+            result["bias"] = ultra_short_guard["bias"]
+            result["reason"] = (
+                f"[ULTRA SHORT LIQ GUARD] {ultra_short_guard['reason']} | "
+                + result.get("reason", "")
+            )
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = ultra_short_guard["priority"]
             return result
         
         # ===== PRIORITY -10010: EXHAUSTED SQUEEZE POST-SWEEP (TERTINGGI ABSOLUT) =====
