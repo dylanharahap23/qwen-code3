@@ -2837,6 +2837,12 @@ class StaleOBVDistributionGuard:
         if funding_rate is None:
             funding_rate = 0.0
         
+        # 🔥 GUARD BULLAUSDT: OBV sangat besar positif (>100 juta)
+        # = institutional accumulation NYATA, bukan stale
+        # OBV 426 juta tidak mungkin stale jika masih POSITIVE_EXTREME
+        if obv_trend == "POSITIVE_EXTREME" and obv_value > 100_000_000:
+            return {"override": False}
+        
         # OBV harus POSITIVE_EXTREME (ini yang menipu sistem)
         if obv_trend not in ("POSITIVE_EXTREME", "POSITIVE"):
             return {"override": False}
@@ -3147,6 +3153,104 @@ class OversoldCapitulationLongForce:
         return {"override": False}
 
 
+class InducedDumpBeforeSqueezeDetector:
+    """
+    BULLAUSDT PATTERN: HFT dump 3-5% dulu untuk sweep long_liq DAN
+    mengumpulkan SHORT retail, lalu pump besar ke short_liq
+    
+    Tanda-tanda:
+    1. OBV sangat positif (>100 juta) = institutional sudah akumulasi
+    2. RSI6_5m masih tinggi (>60) = trend 5m belum bearish
+    3. Greeks kill = LONG = arah akhir adalah naik
+    4. Vega aktif = gerakan turun adalah BAIT
+    5. funding positif = crowded LONG tapi delta_crowded = SHORT
+       (artinya SHORT yang akan dikill, bukan LONG)
+    6. long_liq dekat (akan di-sweep dulu sebagai "Dip Then Rip")
+    
+    Berbeda dengan genuine dump:
+    - Genuine dump: OBV negatif, RSI5m turun, delta_crowded = LONG
+    - Induced dump: OBV sangat positif, RSI5m masih tinggi, 
+                    delta_crowded = SHORT
+    
+    Output: LONG (ikuti arah akhir setelah sweep)
+    Note: sistem mungkin akan salah 3-5% dulu tapi benar 12% setelahnya
+    
+    Priority: -10013.8 (lebih tinggi dari TripleConfluence -10013)
+    """
+    @staticmethod
+    def detect(obv_trend: str, obv_value: float,
+               rsi6_5m: float, rsi6: float,
+               greeks_kill_direction: str,
+               greeks_vega_active: bool,
+               greeks_delta_crowded: str,
+               funding_rate: float,
+               long_liq: float, short_liq: float,
+               change_5m: float, volume_ratio: float,
+               agg: float) -> dict:
+        
+        if funding_rate is None:
+            return {"override": False}
+        
+        # OBV harus sangat positif (institutional accumulation)
+        obv_massive_positive = (
+            obv_trend == "POSITIVE_EXTREME" and
+            obv_value > 100_000_000
+        )
+        if not obv_massive_positive:
+            return {"override": False}
+        
+        # RSI 5m harus masih kuat (bukan genuine dump)
+        rsi5m_still_strong = rsi6_5m > 55
+        if not rsi5m_still_strong:
+            return {"override": False}
+        
+        # Greeks harus commit LONG sebagai arah akhir
+        greeks_long = greeks_kill_direction == "LONG"
+        if not greeks_long:
+            return {"override": False}
+        
+        # Harga harus sedang turun (ini adalah induced dump)
+        price_falling = change_5m < -1.5
+        if not price_falling:
+            return {"override": False}
+        
+        # Konfirmasi tambahan (butuh minimal 3 dari 5)
+        confirmations = {
+            "vega_bait": greeks_vega_active,
+            "shorts_crowded": greeks_delta_crowded == "SHORT",
+            "funding_ok": funding_rate > -0.002,
+            "long_liq_sweep_target": long_liq < short_liq * 0.6,
+            "volume_dry_induced": volume_ratio < 0.6,
+        }
+        
+        conf_count = sum(confirmations.values())
+        if conf_count < 3:
+            return {"override": False}
+        
+        # RSI6 1m sangat oversold = retail panik jual (ini yang HFT mau)
+        rsi1m_oversold = rsi6 < 15
+        
+        return {
+            "override": True,
+            "bias": "LONG",
+            "reason": (
+                f"INDUCED DUMP BEFORE SQUEEZE: "
+                f"OBV={obv_trend} ({obv_value:,.0f}) = institutional sudah akumulasi besar. "
+                f"RSI5m={rsi6_5m:.1f} masih kuat (bukan genuine dump). "
+                f"Greeks kill=LONG (arah akhir naik). "
+                f"Vega={greeks_vega_active} (dump ini adalah BAIT). "
+                f"delta_crowded={greeks_delta_crowded} (SHORT yang akan dikill). "
+                f"long_liq={long_liq:.2f}% akan di-sweep dulu, "
+                f"short_liq={short_liq:.2f}% adalah target akhir pump. "
+                f"RSI1m={rsi6:.1f} oversold = retail SHORT masuk (korban siap). "
+                f"Confirmations={conf_count}/5. "
+                f"HFT strategy: dump {long_liq:.1f}% sweep long stop "
+                f"→ pump {short_liq:.1f}% kill all shorts. Force LONG."
+            ),
+            "priority": -10013.8
+        }
+
+
 class OversoldOBVNegativeContinuation:
     """
     🔥 OVERSOLD + OBV NEGATIVE EXTREME + LONG LIQ DEKAT = DUMP CONTINUATION
@@ -3161,6 +3265,11 @@ class OversoldOBVNegativeContinuation:
         
         # 🔥 LECTURER FIX: Guard - RSI < 12 + agg > 0.65 + down_energy = 0 = OBV is stale, don't fire
         if rsi6 < 12 and agg > 0.65 and down_energy < 0.01:
+            return {"override": False}
+        
+        # 🔥 BULLAUSDT GUARD: jangan fire jika OBV sangat positif (bukan negatif)
+        # Detector ini khusus untuk OBV NEGATIVE_EXTREME continuation
+        if obv_trend not in ("NEGATIVE_EXTREME", "NEGATIVE"):
             return {"override": False}
         
         if (obv_trend == "NEGATIVE_EXTREME" and
@@ -14496,6 +14605,34 @@ class BinanceAnalyzer:
             result["reason"] = f"[STOCH J FALSE BLOWOFF] {stoch_j_guard['reason']} | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = stoch_j_guard["priority"]
+            return result
+        
+        # ===== PRIORITY -10013.8: INDUCED DUMP BEFORE SQUEEZE (BULLAUSDT PATTERN) =====
+        # Detector untuk HFT dump 3-5% sweep long_liq lalu pump besar ke short_liq
+        # OBV massive positive (>100 juta) = institutional accumulation
+        induced_dump = InducedDumpBeforeSqueezeDetector.detect(
+            obv_trend=obv_trend,
+            obv_value=result.get("obv_value", 0),
+            rsi6_5m=rsi6_5m_val,
+            rsi6=rsi6_val,
+            greeks_kill_direction=result.get("greeks_kill_direction", ""),
+            greeks_vega_active=result.get("greeks_vega_active", False),
+            greeks_delta_crowded=result.get("greeks_delta_crowded", ""),
+            funding_rate=funding_rate_val,
+            long_liq=long_liq,
+            short_liq=short_liq,
+            change_5m=change_5m_val,
+            volume_ratio=volume_ratio,
+            agg=agg_val
+        )
+        if induced_dump["override"]:
+            result["bias"] = induced_dump["bias"]
+            result["reason"] = (
+                f"[INDUCED DUMP BEFORE SQUEEZE] {induced_dump['reason']} | "
+                + result.get("reason", "")
+            )
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = induced_dump["priority"]
             return result
         
         # ================= LECTURER'S SARAN: 4 NEW AIOTUSDT FIX DETECTORS =================
