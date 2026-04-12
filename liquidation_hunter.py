@@ -460,6 +460,91 @@ def _check_bias_kill_conflict(data: dict, final_bias: str) -> dict:
     }
 
 
+# ========== LECTURER'S SARAN: HFT ANTI-MANIPULATION OVERRIDE (PRIORITY TERTINGGI) ==========
+# 3 Layer prioritas tertinggi di awal _apply_stability_filters, sebelum semua detector lain
+
+class NoSellerNoBuyerOverride:
+    """
+    🔥 PRIORITY -20000: Jika down_energy == 0 → TIDAK ADA SELLER → LONG.
+       Jika up_energy == 0 → TIDAK ADA BUYER → SHORT.
+       Ini mengalahkan SEMUA sinyal lain karena market structure.
+    """
+    @staticmethod
+    def detect(down_energy: float, up_energy: float,
+               agg: float, change_5m: float) -> dict:
+        if down_energy < 0.01:
+            # Tidak ada seller, harga bisa naik bebas
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": f"NO SELLER (down_energy={down_energy:.3f}) → forced LONG",
+                "priority": -20000
+            }
+        if up_energy < 0.01:
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"NO BUYER (up_energy={up_energy:.3f}) → forced SHORT",
+                "priority": -20000
+            }
+        return {"override": False}
+
+
+class ExhaustionReversalOverride:
+    """
+    🔥 PRIORITY -19900: Deteksi exhaustion dump/pump tanpa volume.
+    - Dump >6% dalam 5m, volume <0.6x, down_energy=0 → reversal LONG
+    - Pump >6% dalam 5m, volume <0.6x, up_energy=0 → reversal SHORT
+    """
+    @staticmethod
+    def detect(change_5m: float, volume_ratio: float,
+               down_energy: float, up_energy: float) -> dict:
+        # Exhaustion dump → LONG
+        if change_5m < -6.0 and volume_ratio < 0.6 and down_energy < 0.01:
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": f"EXHAUSTION DUMP: {change_5m:.1f}% drop, vol {volume_ratio:.2f}x, no sellers → reversal LONG",
+                "priority": -19900
+            }
+        # Exhaustion pump → SHORT
+        if change_5m > 6.0 and volume_ratio < 0.6 and up_energy < 0.01:
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"EXHAUSTION PUMP: +{change_5m:.1f}%, vol {volume_ratio:.2f}x, no buyers → reversal SHORT",
+                "priority": -19900
+            }
+        return {"override": False}
+
+
+class VacuumContinuationOverride:
+    """
+    🔥 PRIORITY -19800: Jika tidak ada seller tapi agg bullish → continuation LONG.
+       Jika tidak ada buyer tapi agg bearish → continuation SHORT.
+    """
+    @staticmethod
+    def detect(down_energy: float, up_energy: float,
+               agg: float, change_5m: float) -> dict:
+        # Tidak ada seller + agg tinggi + harga naik (atau flat) → continuation LONG
+        if down_energy < 0.01 and agg > 0.7 and change_5m > -1.0:
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": f"VACUUM CONTINUATION: down_energy=0, agg={agg:.2f} → forced LONG",
+                "priority": -19800
+            }
+        # Tidak ada buyer + agg rendah + harga turun → continuation SHORT
+        if up_energy < 0.01 and agg < 0.3 and change_5m < 1.0:
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"VACUUM CONTINUATION: up_energy=0, agg={agg:.2f} → forced SHORT",
+                "priority": -19800
+            }
+        return {"override": False}
+
+
 # ========== NEW DETECTORS FROM LECTURER FEEDBACK ==========
 
 class BullishOrderFlowDivergence:
@@ -14337,6 +14422,55 @@ class BinanceAnalyzer:
             # Tidak perlu proses filter lain
             return result
         
+        # ========== LAYER 0: ENERGY & EXHAUSTION OVERRIDE (PRIORITAS TERTINGGI) ==========
+        # Harus di awal, sebelum PHASE LOCK dan GREEKS
+        # Detector-detector dari dosen untuk anti-HFT manipulation
+        
+        # 0.1 No Seller / No Buyer Override (PRIORITY -20000)
+        no_seller_buyer = NoSellerNoBuyerOverride.detect(
+            down_energy=down_energy_val,
+            up_energy=up_energy_val,
+            agg=agg_val,
+            change_5m=change_5m_val
+        )
+        if no_seller_buyer["override"]:
+            result["bias"] = no_seller_buyer["bias"]
+            result["reason"] = f"[NO SELLER/BUYER] {no_seller_buyer['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = no_seller_buyer["priority"]
+            result["entry_allowed"] = True
+            return result
+        
+        # 0.2 Exhaustion Reversal Override (PRIORITY -19900)
+        exhaustion = ExhaustionReversalOverride.detect(
+            change_5m=change_5m_val,
+            volume_ratio=volume_ratio,
+            down_energy=down_energy_val,
+            up_energy=up_energy_val
+        )
+        if exhaustion["override"]:
+            result["bias"] = exhaustion["bias"]
+            result["reason"] = f"[EXHAUSTION REVERSAL] {exhaustion['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = exhaustion["priority"]
+            result["entry_allowed"] = True
+            return result
+        
+        # 0.3 Vacuum Continuation Override (PRIORITY -19800)
+        vacuum = VacuumContinuationOverride.detect(
+            down_energy=down_energy_val,
+            up_energy=up_energy_val,
+            agg=agg_val,
+            change_5m=change_5m_val
+        )
+        if vacuum["override"]:
+            result["bias"] = vacuum["bias"]
+            result["reason"] = f"[VACUUM CONTINUATION] {vacuum['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = vacuum["priority"]
+            result["entry_allowed"] = True
+            return result
+        
         # ================= LECTURER'S SARAN: HFT TRAP DETECTORS (HIGHEST PRIORITY) =================
         # Detector-detector ini harus dijalankan PALING AWAL dengan priority tertinggi (-1110 ke atas)
         
@@ -19100,6 +19234,34 @@ class BinanceAnalyzer:
                 result["phase"] = "GAMMA_LIQUIDITY_ALIGNMENT"
                 result["priority_level"] = gamma_spoof["priority"]
                 result["greeks_override"] = True  # tandai bahwa Greeks di-override
+
+            # ========== POST-KILL BEHAVIOR DETECTOR ==========
+            # Jika gamma sudah executing dan kill_speed > 0, maka arah akhir = kill_direction.
+            # Namun jika long_liq atau short_liq masih sangat dekat (<1.5%) dan belum tersapu,
+            # maka harga akan bergerak ke arah kebalikan terlebih dahulu (sweep).
+
+            kill_speed = result.get("greeks_kill_speed", 0)
+            gamma_exec = result.get("greeks_gamma_executing", False)
+            long_liq_val = result.get("long_liq", 99.0)
+            short_liq_val = result.get("short_liq", 99.0)
+            kill_dir = result.get("greeks_kill_direction", "")
+
+            # Jika kill sudah mulai (gamma executing), ikuti arah kill
+            if gamma_exec and kill_speed > 0.5 and kill_dir in ("LONG", "SHORT"):
+                result["bias"] = kill_dir
+                result["reason"] = f"[POST-KILL FOLLOW] kill_direction={kill_dir}, gamma_executing=True → {kill_dir} | " + result.get("reason", "")
+                result["confidence"] = "ABSOLUTE"
+            else:
+                # Jika belum executing, cek apakah ada liquidity yang sangat dekat (pre-sweep)
+                if long_liq_val < 1.5 and long_liq_val < short_liq_val:
+                    # Long liq lebih dekat → harga akan turun dulu (sweep long)
+                    result["bias"] = "SHORT"
+                    result["reason"] = f"[PRE-KILL SWEEP] long_liq={long_liq_val:.2f}% sangat dekat → harga turun dulu, jangan LONG | " + result.get("reason", "")
+                    result["entry_allowed"] = False
+                elif short_liq_val < 1.5 and short_liq_val < long_liq_val:
+                    result["bias"] = "LONG"
+                    result["reason"] = f"[PRE-KILL SWEEP] short_liq={short_liq_val:.2f}% sangat dekat → harga naik dulu, jangan SHORT | " + result.get("reason", "")
+                    result["entry_allowed"] = False
 
             # ========== STABILITY FILTERS (Flip Cooldown, Phase Lock, Confirmation, Gamma Delay, Entry) ==========
             # Simpan flag extreme override ke result sebelum stability filter
