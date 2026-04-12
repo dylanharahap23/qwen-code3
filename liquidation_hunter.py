@@ -3003,6 +3003,55 @@ class OversoldOBVNegativeContinuation:
         return {"override": False}
 
 
+class ExtremeOversoldLongLiqSqueeze:
+    """
+    🔥 PRIORITY -10018.8: EXTREME OVERSOLD + LONG LIQ ULTRA CLOSE + BUY PRESSURE + FUNDING NEGATIF
+    = SHORT SQUEEZE (LONG) meskipun OBV negatif ekstrem (stale/lagging).
+    
+    Kondisi:
+    - long_liq < 1.0% (target sangat dekat)
+    - rsi6 < 15 (oversold ekstrem)
+    - change_5m < -2.0% (harga sudah turun signifikan)
+    - volume_ratio < 0.7 (volume kering, exhaustion)
+    - down_energy < 0.1 (tidak ada seller aktif)
+    - up_energy > 1.0 (buy pressure nyata)
+    - funding_rate < -0.0005 (crowded short → squeeze target)
+    - agg > 0.5 (mayoritas trades BUY)
+    
+    Override OBV NEGATIVE_EXTREME yang stale.
+    Priority: -10018.8 (lebih tinggi dari OversoldOBVNegativeContinuation -10018)
+    Bias: LONG
+    """
+    @staticmethod
+    def detect(long_liq: float, rsi6: float, change_5m: float,
+               volume_ratio: float, down_energy: float, up_energy: float,
+               funding_rate: float, agg: float) -> dict:
+        if funding_rate is None:
+            return {"override": False}
+        
+        if (long_liq < 1.0 and
+            rsi6 < 15 and
+            change_5m < -2.0 and
+            volume_ratio < 0.7 and
+            down_energy < 0.1 and
+            up_energy > 1.0 and
+            funding_rate < -0.0005 and
+            agg > 0.5):
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": (
+                    f"EXTREME OVERSOLD LONG LIQ SQUEEZE: long_liq={long_liq:.2f}% ultra close, "
+                    f"RSI={rsi6:.1f} oversold, price dropped {change_5m:.1f}%, "
+                    f"volume={volume_ratio:.2f}x kering, down_energy={down_energy:.2f} (no sellers), "
+                    f"up_energy={up_energy:.2f} (buyer aktif), funding={funding_rate:.6f} (crowded short), "
+                    f"agg={agg:.2f} → OBV negative stale, HFT akan pump untuk sweep long stop. Force LONG."
+                ),
+                "priority": -10018.8
+            }
+        return {"override": False}
+
+
 class FundingExtremeSqueezeContinuation:
     """
     🔥 FUNDING EXTREME + SQUEEZE MASIH AKTIF = LONG
@@ -13865,6 +13914,23 @@ class BinanceAnalyzer:
             result["priority_level"] = oversold_dump["priority"]
             return result
 
+        # ===== NEW: EXTREME OVERSOLD LONG LIQ SQUEEZE (PRIORITY -10018.8) =====
+        extreme_oversold_squeeze = ExtremeOversoldLongLiqSqueeze.detect(
+            long_liq=long_liq,
+            rsi6=rsi6_val,
+            change_5m=change_5m_val,
+            volume_ratio=volume_ratio,
+            down_energy=down_energy_val,
+            up_energy=up_energy_val,
+            funding_rate=funding_rate_val,
+            agg=agg_val
+        )
+        if extreme_oversold_squeeze["override"]:
+            result["bias"] = extreme_oversold_squeeze["bias"]
+            result["reason"] = f"[EXTREME OVERSOLD SQUEEZE] {extreme_oversold_squeeze['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = extreme_oversold_squeeze["priority"]
+            return result
 
         # ===== PRIORITY -10018: OVERSOLD OBV NEGATIVE CONTINUATION (PALING TINGGI) =====
         obv_negative_cont = OversoldOBVNegativeContinuation.detect(
