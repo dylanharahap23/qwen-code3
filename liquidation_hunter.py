@@ -973,6 +973,172 @@ class AggSpoofingActiveDumpGuard:
         }
 
 
+class FundingHighGreeksShortAggBaitVeto:
+    """
+    AINUSDT PATTERN: agg=1.00 + OFI=LONG 1.00 TAPI
+    funding positif tinggi + greeks_kill=SHORT + greeks_who_dies=LONG
+    + OBV negatif + RSI5m overbought
+    
+    Ini adalah kondisi paling berbahaya:
+    HFT inject 100% micro-buy trades untuk membuat AggOFIFullBullish trigger,
+    tapi semua sinyal fundamental menunjuk SHORT.
+    
+    Kaidah: ketika funding > 0.0008 DAN greeks_who_dies = LONG_TRADERS,
+    agg=1.00 adalah 100% manipulasi. Greeks sudah committed bahwa LONG
+    yang akan mati. Tidak ada alasan untuk LONG.
+    
+    Pembeda dengan genuine squeeze:
+    - Genuine: funding NEGATIF (crowded SHORT yang squeeze)
+    - Bait: funding POSITIF (crowded LONG yang akan dump)
+    
+    Priority: -10016.5 (lebih tinggi dari AggOFIFullBullish -10016)
+    Bias: SHORT
+    """
+    @staticmethod
+    def detect(agg: float, ofi_bias: str, ofi_strength: float,
+               funding_rate: float,
+               greeks_kill_direction: str,
+               greeks_who_dies_first: str,
+               greeks_vega_active: bool,
+               obv_trend: str, obv_value: float,
+               rsi6_5m: float, stoch_j: float,
+               volume_ratio: float, short_liq: float,
+               long_liq: float, change_5m: float) -> dict:
+        
+        if funding_rate is None:
+            return {"override": False}
+        
+        # Funding harus tinggi positif (crowded LONG)
+        if funding_rate < 0.0007:
+            return {"override": False}
+        
+        # Greeks harus committed SHORT dengan LONG yang mati
+        greeks_committed_short = (
+            greeks_kill_direction == "SHORT" and
+            greeks_who_dies_first == "LONG_TRADERS"
+        )
+        if not greeks_committed_short:
+            return {"override": False}
+        
+        # agg atau OFI harus terlihat sangat bullish (ini yang membuat
+        # AggOFIFullBullish atau detector lain terjebak)
+        looks_bullish = agg > 0.60 or (ofi_bias == "LONG" and ofi_strength > 0.5)
+        if not looks_bullish:
+            return {"override": False}
+        
+        # Konfirmasi bahwa ini adalah bait (minimal 3 dari 5)
+        confirmations = {
+            "vega_bait": greeks_vega_active,
+            "obv_not_positive": obv_trend not in ("POSITIVE_EXTREME", "POSITIVE"),
+            "rsi5m_overbought": rsi6_5m > 70,
+            "stoch_maximal": stoch_j > 90,
+            "volume_ultra_dry": volume_ratio < 0.4,
+        }
+        
+        conf_count = sum(confirmations.values())
+        if conf_count < 3:
+            return {"override": False}
+        
+        # long_liq harus lebih jauh (target dump ada di sana)
+        # short_liq dekat hanya sebagai umpan
+        liq_trap = long_liq > short_liq * 2
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"FUNDING HIGH GREEKS SHORT AGG BAIT VETO: "
+                f"funding={funding_rate:.6f} (crowded LONG {funding_rate*100:.4f}%/8h), "
+                f"greeks_kill={greeks_kill_direction}, "
+                f"who_dies={greeks_who_dies_first} → LONG akan mati. "
+                f"agg={agg:.2f} + OFI={ofi_bias} {ofi_strength:.2f} adalah BAIT "
+                f"(Vega={greeks_vega_active} konfirmasi fake move). "
+                f"OBV={obv_trend} ({obv_value:,.0f}), "
+                f"RSI5m={rsi6_5m:.1f} overbought, "
+                f"Stoch J={stoch_j:.1f} maximal, "
+                f"volume={volume_ratio:.2f}x kering. "
+                f"short_liq={short_liq:.2f}% adalah UMPAN, "
+                f"target sebenarnya long_liq={long_liq:.2f}%. "
+                f"Confirmations={conf_count}/5. "
+                f"Veto AggOFIFullBullish. Force SHORT."
+            ),
+            "priority": -10016.5
+        }
+
+
+class DisplayJsonConsistencyVeto:
+    """
+    Ketika AggOFIFullBullish akan fire berdasarkan agg display,
+    cek apakah result["agg"] (JSON ground truth) konsisten.
+    
+    Jika gap > 0.25 antara display agg dan JSON agg,
+    dan JSON agg < 0.75, jangan fire AggOFIFullBullish.
+    
+    Priority: -10017 (lebih tinggi dari AggOFIFullBullish -10016)
+    """
+    @staticmethod
+    def should_block_agg_ofi_bullish(display_agg: float,
+                                      json_agg: float,
+                                      json_ofi_bias: str,
+                                      funding_rate: float,
+                                      greeks_kill: str) -> bool:
+        gap = abs(display_agg - json_agg)
+        
+        # Data race terdeteksi
+        if gap > 0.20:
+            # Percaya JSON, bukan display
+            if json_agg < 0.75:
+                return True  # block AggOFIFullBullish
+        
+        # Bahkan jika konsisten, funding tinggi + Greeks SHORT = block
+        if (funding_rate is not None and funding_rate > 0.0007 and
+            greeks_kill == "SHORT"):
+            return True
+        
+        return False
+    
+    @staticmethod
+    def detect(display_agg: float, json_agg: float,
+               ofi_bias: str, ofi_strength: float,
+               funding_rate: float, greeks_kill: str,
+               greeks_who_dies: str) -> dict:
+        """
+        Version detect() yang return dict lengkap untuk integrasi.
+        """
+        gap = abs(display_agg - json_agg)
+        
+        # Data race terdeteksi
+        if gap > 0.20 and json_agg < 0.75:
+            return {
+                "override": True,
+                "bias": "NEUTRAL",
+                "reason": (
+                    f"DISPLAY-JSON DATA RACE DETECTED: "
+                    f"display_agg={display_agg:.2f} vs json_agg={json_agg:.2f} "
+                    f"(gap={gap:.2f}). Percaya JSON ground truth. "
+                    f"BLOCK AggOFIFullBullish Continuation."
+                ),
+                "priority": -10017
+            }
+        
+        # Funding tinggi + Greeks SHORT = block
+        if (funding_rate is not None and funding_rate > 0.0007 and
+            greeks_kill == "SHORT"):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"FUNDING-GREEKS CONFLICT: funding={funding_rate:.6f} "
+                    f"(crowded LONG), greeks_kill={greeks_kill}, "
+                    f"who_dies={greeks_who_dies}. "
+                    f"BLOCK AggOFIFullBullish Long. Force SHORT bias."
+                ),
+                "priority": -10017
+            }
+        
+        return {"override": False}
+
+
 class VolumeDryUpReversal:
     """
     Detector: Volume Dry-Up Reversal (Priority -1080)
@@ -11711,7 +11877,23 @@ class AggOFIFullBullishContinuation:
     def detect(agg: float, ofi_bias: str, ofi_strength: float,
                down_energy: float, change_5m: float,
                short_liq: float, rsi6: float,
-               rsi6_5m: float, volume_ratio: float) -> dict:
+               rsi6_5m: float, volume_ratio: float,
+               # Tambah parameter untuk guard AINUSDT
+               funding_rate: float = 0.0,
+               greeks_kill_direction: str = "",
+               greeks_who_dies_first: str = "",
+               greeks_vega_active: bool = False) -> dict:
+        
+        # 🔥 GUARD AINUSDT: funding tinggi + Greeks SHORT + LONG yang mati
+        # = agg tinggi adalah manipulasi, jangan paksa LONG
+        if (funding_rate is not None and funding_rate > 0.0007 and
+            greeks_kill_direction == "SHORT" and
+            greeks_who_dies_first == "LONG_TRADERS"):
+            return {"override": False}
+        
+        # 🔥 GUARD: Vega aktif = ini adalah BAIT, agg tinggi adalah induced
+        if greeks_vega_active and funding_rate is not None and funding_rate > 0.0005:
+            return {"override": False}
         
         # Core: triple full bullish
         full_bullish = (
@@ -14960,6 +15142,58 @@ class BinanceAnalyzer:
             result["priority_level"] = bid_wall_spoof["priority"]
             return result
 
+        # ===== PRIORITY -10017: DISPLAY-JSON CONSISTENCY VETO (SEBELUM AGG-OFI) =====
+        # Cek data race antara display agg dan JSON ground truth
+        display_agg = result.get("agg_display", agg_val)  # agg dari display snapshot
+        json_agg = agg_val  # agg dari JSON ground truth
+        display_json_veto = DisplayJsonConsistencyVeto.detect(
+            display_agg=display_agg,
+            json_agg=json_agg,
+            ofi_bias=ofi_bias,
+            ofi_strength=ofi_strength,
+            funding_rate=funding_rate_val,
+            greeks_kill=result.get("greeks_kill_direction", ""),
+            greeks_who_dies=result.get("greeks_who_dies_first", "")
+        )
+        if display_json_veto["override"]:
+            result["bias"] = display_json_veto["bias"]
+            result["reason"] = (
+                f"[DISPLAY-JSON VETO] {display_json_veto['reason']} | "
+                + result.get("reason", "")
+            )
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = display_json_veto["priority"]
+            return result
+        
+        # ===== PRIORITY -10016.5: FUNDING HIGH GREEKS SHORT AGG BAIT VETO =====
+        # Harus SEBELUM AggOFIFullBullish (-10016)
+        funding_greeks_veto = FundingHighGreeksShortAggBaitVeto.detect(
+            agg=agg_val,
+            ofi_bias=ofi_bias,
+            ofi_strength=ofi_strength,
+            funding_rate=funding_rate_val,
+            greeks_kill_direction=result.get("greeks_kill_direction", ""),
+            greeks_who_dies_first=result.get("greeks_who_dies_first", ""),
+            greeks_vega_active=result.get("greeks_vega_active", False),
+            obv_trend=obv_trend,
+            obv_value=result.get("obv_value", 0),
+            rsi6_5m=rsi6_5m_val,
+            stoch_j=stoch_j_val,
+            volume_ratio=volume_ratio,
+            short_liq=short_liq,
+            long_liq=long_liq,
+            change_5m=change_5m_val
+        )
+        if funding_greeks_veto["override"]:
+            result["bias"] = funding_greeks_veto["bias"]
+            result["reason"] = (
+                f"[FUNDING GREEKS VETO] {funding_greeks_veto['reason']} | "
+                + result.get("reason", "")
+            )
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = funding_greeks_veto["priority"]
+            return result
+        
         # ===== PRIORITY -10016: AGG-OFI FULL BULLISH CONTINUATION =====
         agg_ofi_bullish = AggOFIFullBullishContinuation.detect(
             agg=result.get("agg", 0.5),
@@ -14970,7 +15204,12 @@ class BinanceAnalyzer:
             short_liq=result.get("short_liq", 99.0),
             rsi6=result.get("rsi6", 50.0),
             rsi6_5m=result.get("rsi6_5m", 50.0),
-            volume_ratio=result.get("volume_ratio", 1.0)
+            volume_ratio=result.get("volume_ratio", 1.0),
+            # Tambah parameter guard AINUSDT
+            funding_rate=funding_rate_val or 0.0,
+            greeks_kill_direction=result.get("greeks_kill_direction", ""),
+            greeks_who_dies_first=result.get("greeks_who_dies_first", ""),
+            greeks_vega_active=result.get("greeks_vega_active", False)
         )
         if agg_ofi_bullish["override"]:
             result["bias"] = agg_ofi_bullish["bias"]
