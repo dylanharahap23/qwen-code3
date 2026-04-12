@@ -2966,6 +2966,63 @@ class ExtremeAggShortDistributionVeto:
         }
 
 
+class OversoldCapitulationLongForce:
+    """
+    🔥 RSI6 < 12 (absolute capitulation) + down_energy = 0 + agg > 0.65
+    + long_liq < 0.5% (ultra close) = LONG FORCE regardless of OBV
+    
+    Priority: -10018.95 (just above OversoldOBVNegativeContinuation -10018)
+    
+    OBV NEGATIVE_EXTREME at RSI=10 is ALWAYS stale/lagging.
+    No one is selling (down_energy=0), 80% trades are BUY.
+    The long_liq at 0.31% will be swept and then price pumps.
+    """
+    @staticmethod
+    def detect(rsi6: float, down_energy: float, agg: float,
+               long_liq: float, up_energy: float,
+               obv_trend: str, funding_rate: float) -> dict:
+        
+        if funding_rate is None:
+            funding_rate = 0.0
+        
+        # Absolute capitulation conditions
+        absolute_capitulation = (
+            rsi6 < 12 and           # RSI di bawah 12 = capitulation absolut
+            down_energy < 0.01 and  # zero sellers
+            agg > 0.65 and          # majority BUY
+            long_liq < 0.5 and      # target ultra close
+            up_energy > 1.0         # real buy pressure
+        )
+        
+        if not absolute_capitulation:
+            return {"override": False}
+        
+        # OBV harus berlawanan (itulah yang bikin sistem salah)
+        obv_lying = obv_trend in ("NEGATIVE_EXTREME", "NEGATIVE")
+        
+        # Funding negatif = crowded short = squeeze target
+        funding_ok = funding_rate < 0.0005  # tidak crowded LONG
+        
+        if obv_lying and funding_ok:
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": (
+                    f"OVERSOLD CAPITULATION LONG FORCE: RSI6={rsi6:.1f} (<12 absolute capitulation), "
+                    f"down_energy={down_energy:.3f} (zero sellers), "
+                    f"agg={agg:.2f} ({agg*100:.0f}% BUY real-time), "
+                    f"long_liq={long_liq:.2f}% ultra close, "
+                    f"up_energy={up_energy:.2f} → "
+                    f"OBV {obv_trend} adalah STALE/LAGGING. "
+                    f"Tidak ada yang jual, semua beli. "
+                    f"long_liq akan tersapu → pump. Force LONG."
+                ),
+                "priority": -10018.95  # lebih tinggi dari OversoldOBVNegativeContinuation -10018
+            }
+        
+        return {"override": False}
+
+
 class OversoldOBVNegativeContinuation:
     """
     🔥 OVERSOLD + OBV NEGATIVE EXTREME + LONG LIQ DEKAT = DUMP CONTINUATION
@@ -2977,6 +3034,10 @@ class OversoldOBVNegativeContinuation:
     def detect(obv_trend: str, long_liq: float, change_5m: float,
                volume_ratio: float, down_energy: float, rsi6: float,
                agg: float) -> dict:
+        
+        # 🔥 LECTURER FIX: Guard - RSI < 12 + agg > 0.65 + down_energy = 0 = OBV is stale, don't fire
+        if rsi6 < 12 and agg > 0.65 and down_energy < 0.01:
+            return {"override": False}
         
         if (obv_trend == "NEGATIVE_EXTREME" and
             long_liq < 2.0 and
@@ -11410,14 +11471,18 @@ class OBVLaggingAggContradictionResolver:
                obv_trend: str, down_energy: float,
                change_5m: float, short_liq: float,
                long_liq: float, up_energy: float,
-               funding_rate: float) -> dict:
+               funding_rate: float, rsi6: float = 50.0) -> dict:
         
         if funding_rate is None:
             funding_rate = 0.0
         
+        # 🔥 LECTURER FIX: Lower agg threshold to 0.65 when RSI < 12 (capitulation)
+        # At capitulation levels even 65% buy pressure with zero sellers is definitive
+        agg_threshold = 0.65 if rsi6 < 12 else 0.85
+        
         # Case LONG: agg ekstrem tinggi + OBV negatif = OBV lagging
         should_trust_agg_long = (
-            agg > 0.85 and ofi_strength > 0.7 and 
+            agg > agg_threshold and ofi_strength > 0.7 and 
             obv_trend in ("NEGATIVE_EXTREME", "NEGATIVE") and
             down_energy < 0.01 and change_5m > 0
         )
@@ -11430,6 +11495,7 @@ class OBVLaggingAggContradictionResolver:
                     f"OBV LAGGING AGG CONTRADICTION (LONG): "
                     f"agg={agg:.2f} ({agg*100:.0f}% BUY real-time) TAPI "
                     f"OBV={obv_trend} → OBV lagging/stale, percaya agg. Force LONG."
+                    + (f" [RSI={rsi6:.1f} < 12 capitulation: lowered agg threshold to 0.65]" if rsi6 < 12 else "")
                 ),
                 "priority": -10015.5
             }
@@ -13961,6 +14027,24 @@ class BinanceAnalyzer:
             result["priority_level"] = extreme_oversold_squeeze["priority"]
             return result
 
+        # ===== PRIORITY -10018.95: OVERSOLD CAPITULATION LONG FORCE =====
+        # Harus dipanggil SEBELUM OversoldOBVNegativeContinuation (-10018)
+        capitulation_long = OversoldCapitulationLongForce.detect(
+            rsi6=rsi6_val,
+            down_energy=down_energy_val,
+            agg=agg_val,
+            long_liq=long_liq,
+            up_energy=up_energy_val,
+            obv_trend=obv_trend,
+            funding_rate=funding_rate_val
+        )
+        if capitulation_long["override"]:
+            result["bias"] = capitulation_long["bias"]
+            result["reason"] = f"[CAPITULATION LONG FORCE] {capitulation_long['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = capitulation_long["priority"]
+            return result
+        
         # ===== PRIORITY -10018: OVERSOLD OBV NEGATIVE CONTINUATION (PALING TINGGI) =====
         obv_negative_cont = OversoldOBVNegativeContinuation.detect(
             obv_trend=result.get("obv_trend", "NEUTRAL"),
@@ -14419,7 +14503,8 @@ class BinanceAnalyzer:
             short_liq=result.get("short_liq", 99.0),
             long_liq=result.get("long_liq", 99.0),
             up_energy=result.get("up_energy", 0.0),
-            funding_rate=result.get("funding_rate", 0.0)
+            funding_rate=result.get("funding_rate", 0.0),
+            rsi6=rsi6_val  # NEW: untuk lower threshold saat capitulation
         )
         if obv_lag["override"]:
             result["bias"] = obv_lag["bias"]
