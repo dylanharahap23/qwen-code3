@@ -463,6 +463,125 @@ def _check_bias_kill_conflict(data: dict, final_bias: str) -> dict:
 # ========== LECTURER'S SARAN: HFT ANTI-MANIPULATION OVERRIDE (PRIORITY TERTINGGI) ==========
 # 3 Layer prioritas tertinggi di awal _apply_stability_filters, sebelum semua detector lain
 
+# ========== LECTURER'S SARAN: PHANTOM VACUUM TRAP & ASTRONOMICAL OBV STALE VETO ==========
+# PRIORITY -25000 dan -24000: Harus PALING AWAL sebelum NoSellerNoBuyerOverride (-20000)
+# untuk menghindari jebakan HFT manipulation pada kasus BULLAUSDT dan AIOUSDT
+
+class PhantomVacuumTrap:
+    """
+    PRIORITY -25000 (HIGHEST OF ALL):
+    
+    The most dangerous HFT manipulation pattern:
+    - down_energy == 0 → looks like "no sellers" → triggers NoSeller LONG
+    - BUT ask_slope >> bid_slope (15x+) → there IS a massive sell wall above
+    - AND funding positive → crowded LONG (victims ready)
+    - AND greeks_kill = SHORT → Greeks already know LONG will die
+    
+    This pattern fools NoSellerNoBuyerOverride EVERY TIME.
+    The "vacuum" is artificial — HFT removed bids below to make
+    down_energy=0, while placing massive asks above.
+    
+    This must fire BEFORE NoSellerNoBuyerOverride.
+    
+    Kasus nyata: BULLAUSDT, AIOUSDT — LONG signal → dumped 8% down
+    """
+    @staticmethod
+    def detect(ask_slope: float, bid_slope: float,
+               down_energy: float, up_energy: float,
+               funding_rate: float,
+               greeks_kill_direction: str,
+               volume_ratio: float,
+               obv_value: float,
+               change_5m: float) -> dict:
+        
+        if bid_slope <= 0 or funding_rate is None:
+            return {"override": False}
+        
+        ask_bid_ratio = ask_slope / bid_slope
+        
+        # Core: massive ask wall + no sellers (phantom vacuum) + crowded LONG + Greeks SHORT
+        if (ask_bid_ratio >= 15.0 and
+            down_energy < 0.01 and
+            funding_rate > 0.0003 and
+            greeks_kill_direction == "SHORT" and
+            volume_ratio < 0.75):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"PHANTOM VACUUM TRAP: ask/bid={ask_bid_ratio:.0f}x "
+                    f"(massive sell wall), down_energy={down_energy:.3f} (fake vacuum), "
+                    f"funding={funding_rate:.6f} (crowded LONG = victims), "
+                    f"greeks_kill=SHORT → HFT removed bids to fake vacuum, "
+                    f"dump imminent. Overrides NoSeller."
+                ),
+                "priority": -25000
+            }
+        
+        # Mirror: massive bid wall + no buyers + crowded SHORT + Greeks LONG
+        bid_ask_ratio = bid_slope / ask_slope if ask_slope > 0 else 0
+        if (bid_ask_ratio >= 15.0 and
+            up_energy < 0.01 and
+            funding_rate < -0.0003 and
+            greeks_kill_direction == "LONG" and
+            volume_ratio < 0.75):
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": (
+                    f"PHANTOM VACUUM TRAP (SHORT side): bid/ask={bid_ask_ratio:.0f}x, "
+                    f"up_energy={up_energy:.3f} (fake vacuum), "
+                    f"funding={funding_rate:.6f} (crowded SHORT), "
+                    f"greeks_kill=LONG → pump imminent."
+                ),
+                "priority": -25000
+            }
+        
+        return {"override": False}
+
+
+class AstronomicalOBVStaleVeto:
+    """
+    PRIORITY -24000:
+    OBV > 500 million BUT current volume_ratio < 0.7 AND
+    ask_slope >> bid_slope AND funding positive AND greeks SHORT
+    = OBV is ancient history, not current reality.
+    
+    Kasus nyata: BULLAUSDT OBV=1.3 billion tapi volume_ratio=0.6x
+    OBV positif adalah trap dari akumulasi lama, bukan kondisi saat ini.
+    """
+    @staticmethod
+    def detect(obv_value: float, volume_ratio: float,
+               ask_slope: float, bid_slope: float,
+               funding_rate: float,
+               greeks_kill_direction: str) -> dict:
+        
+        if bid_slope <= 0 or funding_rate is None:
+            return {"override": False}
+        
+        ask_bid_ratio = ask_slope / bid_slope
+        
+        if (obv_value > 500_000_000 and
+            volume_ratio < 0.70 and
+            ask_bid_ratio > 10.0 and
+            funding_rate > 0.0003 and
+            greeks_kill_direction == "SHORT"):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"ASTRONOMICAL OBV STALE VETO: OBV={obv_value:,.0f} "
+                    f"(ancient history, not current), volume={volume_ratio:.2f}x dry, "
+                    f"ask/bid={ask_bid_ratio:.0f}x (real resistance), "
+                    f"funding={funding_rate:.6f} crowded LONG → "
+                    f"OBV positive is a trap. Force SHORT."
+                ),
+                "priority": -24000
+            }
+        
+        return {"override": False}
+
+
 class NoSellerNoBuyerOverride:
     """
     🔥 PRIORITY -20000: Jika down_energy == 0 → TIDAK ADA SELLER → LONG.
@@ -14461,6 +14580,47 @@ class BinanceAnalyzer:
         # ========== LAYER 0: ENERGY & EXHAUSTION OVERRIDE (PRIORITAS TERTINGGI) ==========
         # Harus di awal, sebelum PHASE LOCK dan GREEKS
         # Detector-detector dari dosen untuk anti-HFT manipulation
+        
+        # ===== PRIORITY -25000: PHANTOM VACUUM TRAP (MUST BE FIRST, BEFORE EVERYTHING) =====
+        # Kasus BULLAUSDT & AIOUSDT: LONG signal → dumped 8% down
+        # Pattern: ask_slope >> bid_slope (28x) + down_energy=0 + funding positive + greeks SHORT
+        phantom_vacuum = PhantomVacuumTrap.detect(
+            ask_slope=result.get("ask_slope", 0),
+            bid_slope=result.get("bid_slope", 1),
+            down_energy=down_energy_val,
+            up_energy=up_energy_val,
+            funding_rate=funding_rate_val,
+            greeks_kill_direction=kill_direction,
+            volume_ratio=volume_ratio,
+            obv_value=obv_value,
+            change_5m=change_5m_val
+        )
+        if phantom_vacuum["override"]:
+            result["bias"] = phantom_vacuum["bias"]
+            result["reason"] = f"[PHANTOM VACUUM] {phantom_vacuum['reason']}"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = phantom_vacuum["priority"]
+            result["entry_allowed"] = True
+            return result
+        
+        # ===== PRIORITY -24000: ASTRONOMICAL OBV STALE VETO =====
+        # OBV > 500 juta tapi volume kering + ask wall besar + funding positive + greeks SHORT
+        # = OBV adalah sejarah lama, bukan realitas saat ini
+        astro_obv = AstronomicalOBVStaleVeto.detect(
+            obv_value=obv_value,
+            volume_ratio=volume_ratio,
+            ask_slope=result.get("ask_slope", 0),
+            bid_slope=result.get("bid_slope", 1),
+            funding_rate=funding_rate_val,
+            greeks_kill_direction=kill_direction
+        )
+        if astro_obv["override"]:
+            result["bias"] = astro_obv["bias"]
+            result["reason"] = f"[ASTRO OBV STALE] {astro_obv['reason']}"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = astro_obv["priority"]
+            result["entry_allowed"] = True
+            return result
         
         # 0.1 No Seller / No Buyer Override (PRIORITY -20000)
         no_seller_buyer = NoSellerNoBuyerOverride.detect(
