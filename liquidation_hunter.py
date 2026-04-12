@@ -2337,10 +2337,21 @@ class FakeMicroSqueezeTrap:
     Priority -10020 (PALING TINGGI)
     Memaksa SHORT ketika agg=1.00 tapi up_energy sangat kecil, volume kering.
     HFT melakukan micro-buy untuk memancing LONG, lalu dump.
+    
+    🔥 TRADOORUSDT FIX: Tambahan guard untuk kondisi squeeze nyata
     """
     @staticmethod
     def detect(short_liq: float, change_5m: float, agg: float,
-               up_energy: float, volume_ratio: float, down_energy: float) -> dict:
+               up_energy: float, volume_ratio: float, down_energy: float,
+               rsi6_5m: float = 50.0, result_agg: float = -1.0) -> dict:
+        
+        # 🔥 GUARD 1: Jika rsi6_5m < 60 (5m tidak overbought) = bukan fake, ini squeeze nyata
+        if rsi6_5m is not None and rsi6_5m < 60:
+            return {"override": False}
+        
+        # 🔥 GUARD 2: Jika result_agg (JSON ground truth) > 0.80 = agg tinggi adalah nyata, bukan micro spoof
+        if result_agg >= 0 and result_agg > 0.80:
+            return {"override": False}
         
         if (short_liq < 1.0 and
             change_5m > 0 and
@@ -2818,14 +2829,33 @@ class CrowdedLongFundingKillConfirmed:
     
     Priority: -10018.7 (TERTINGGI dari 4 detector baru)
     Bias: SHORT
+    
+    🔥 TRADOORUSDT FIX: Tambahan guard untuk data race dan squeeze kondisi
     """
     @staticmethod
     def detect(funding_rate: float, kill_direction: str, who_dies_first: str,
                agg: float, ofi_bias: str, ofi_strength: float,
                volume_ratio: float, algo_type_bias: str,
-               obv_trend: str, change_5m: float) -> dict:
+               obv_trend: str, change_5m: float,
+               # TAMBAH parameter baru untuk TRADOORUSDT fix:
+               result_agg: float = -1.0,        # agg dari result dict (JSON ground truth)
+               result_ofi_bias: str = "",        # OFI dari result dict
+               short_liq: float = 99.0) -> dict: # short_liq untuk context
         
         if funding_rate is None:
+            return {"override": False}
+        
+        # 🔥 GUARD KRITIS: jika result_agg (JSON ground truth) sangat bertentangan
+        # dengan agg yang diterima (display snapshot), batalkan detector ini
+        if result_agg >= 0 and abs(result_agg - agg) > 0.35:
+            # Data race terdeteksi — percaya result_agg
+            if result_agg > 0.65:
+                # JSON bilang bullish, display bilang bearish → ini data race
+                # Jangan fire CrowdedKill berdasarkan data display yang salah
+                return {"override": False}
+        
+        # 🔥 GUARD: short_liq ultra close + result_agg bullish = squeeze, bukan kill
+        if short_liq < 0.6 and result_agg > 0.75:
             return {"override": False}
         
         # funding harus crowded LONG
@@ -10533,6 +10563,274 @@ class GreekKillReversalAfterCapitulation:
         return {"override": False}
 
 
+# ================= LECTURER'S TRADOORUSDT FIX: 4 NEW DETECTORS =================
+
+class DisplayJsonAggValidator:
+    """
+    🔥 CRITICAL FIX: Display agg vs JSON agg race condition
+    
+    Masalah: _apply_stability_filters() menerima agg_val dari
+    parameter yang bisa berasal dari snapshot berbeda dengan result["agg"].
+    
+    result["agg"] = dari main analyzer (sama pipeline dengan greeks)
+    agg_val di stability filter = bisa dari display snapshot berbeda
+    
+    Ketika keduanya konflik lebih dari 0.4 gap (misal 0.35 vs 0.93),
+    SELALU percaya result["agg"] karena itu yang konsisten dengan
+    greeks_kill_direction dan who_dies_first.
+    
+    Jika result["agg"] > 0.65 tapi stability filter menerima agg < 0.4:
+    → batalkan semua SHORT override yang triggered oleh agg rendah
+    → kembalikan ke bias yang diset oleh main analyzer
+    """
+    @staticmethod
+    def validate_and_get_trusted_agg(
+        stability_agg: float,
+        result_agg: float,
+        result_ofi_bias: str,
+        result_ofi_strength: float
+    ) -> tuple:
+        """
+        Returns: (trusted_agg, trusted_ofi_bias, trusted_ofi_strength, was_corrected)
+        """
+        agg_gap = abs(stability_agg - result_agg)
+        
+        # Jika gap kecil (<0.15), keduanya konsisten → pakai stability_agg
+        if agg_gap < 0.15:
+            return stability_agg, result_ofi_bias, result_ofi_strength, False
+        
+        # Gap besar (>0.4) = data race yang signifikan → percaya result["agg"]
+        if agg_gap >= 0.4:
+            return result_agg, result_ofi_bias, result_ofi_strength, True
+        
+        # Gap sedang (0.15-0.4) → ambil yang lebih ekstrem
+        # karena data race biasanya bergeser ke arah yang lebih kuat
+        if abs(result_agg - 0.5) > abs(stability_agg - 0.5):
+            return result_agg, result_ofi_bias, result_ofi_strength, True
+        
+        return stability_agg, result_ofi_bias, result_ofi_strength, False
+
+
+class StochJOverboughtWithRSI5mGuard:
+    """
+    🔥 TRADOORUSDT FIX: stoch_j overflow (>100) TIDAK SELALU blow-off top
+    
+    stoch_j = 3K - 2D. Ketika J > 100, ini memang mathematical overflow,
+    TAPI hanya berarti blow-off jika RSI 5m JUGA overbought.
+    
+    Jika RSI 5m < 55 (belum overbought), stoch_j overflow di 1m
+    hanya menunjukkan spike momentum jangka pendek, BUKAN exhaustion.
+    
+    Case TRADOORUSDT:
+    - stoch_j = 120.2 (overflow) → sistem kira blow-off
+    - rsi6_5m = 45.9 (belum overbought!) → masih ada room naik
+    - short_liq = 0.44% (ultra close) → squeeze target nyata
+    → hasilnya: LONG 8%
+    
+    Fix: StochasticJMaximalBlowOff harus diblokir jika rsi6_5m < 55
+    dan short_liq < 1.0% (squeeze setup nyata).
+    
+    Ini adalah guard yang dipanggil SEBELUM StochasticJMaximalBlowOff.
+    Priority: -10013.6 (lebih tinggi dari StochasticJMaximalBlowOff -10013.5)
+    """
+    @staticmethod
+    def detect(stoch_j: float, rsi6_5m: float, short_liq: float,
+               long_liq: float, agg: float, up_energy: float,
+               down_energy: float, funding_rate: float) -> dict:
+        
+        if funding_rate is None:
+            funding_rate = 0.0
+        
+        # Hanya relevan jika stoch_j overflow (>100)
+        if stoch_j <= 100:
+            return {"override": False}
+        
+        # Jika rsi6_5m < 55 = 5m BELUM overbought = bukan exhaustion
+        if rsi6_5m >= 55:
+            return {"override": False}
+        
+        # short_liq harus dekat (squeeze setup nyata)
+        if short_liq >= 1.5:
+            return {"override": False}
+        
+        # agg harus bullish (real buying)
+        if agg < 0.6:
+            return {"override": False}
+        
+        # Harus ada buyer (down_energy=0 + up_energy ada)
+        if down_energy >= 0.1 or up_energy <= 0:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "LONG",
+            "reason": (
+                f"STOCH J OVERFLOW FALSE BLOW-OFF GUARD: "
+                f"stoch_j={stoch_j:.1f} (overflow) tapi "
+                f"rsi6_5m={rsi6_5m:.1f} (<55, belum overbought di 5m) → "
+                f"ini BUKAN exhaustion, hanya 1m momentum spike. "
+                f"short_liq={short_liq:.2f}% ultra close, agg={agg:.2f} bullish, "
+                f"down_energy={down_energy:.3f} (no sellers). "
+                f"Blokir StochasticJMaximalBlowOff, force LONG."
+            ),
+            "priority": -10013.6
+        }
+
+
+class LiquidityExtremeAggConsistencyCheck:
+    """
+    🔥 TRADOORUSDT FIX: Ketika _liquidity_extreme_override = True,
+    validator bahwa agg dari result dict konsisten dengan override.
+    
+    Jika _liquidity_extreme_override sudah true (short_liq ultra close
+    triggered LiquidityProximityAbsolute atau serupa), dan result["agg"] > 0.7,
+    maka SEMUA detector SHORT di stability filter harus diblokir.
+    
+    Logika: liquidity extreme override artinya kondisi squeeze sudah
+    dikonfirmasi oleh liquidity proximity layer. Jika agg juga bullish,
+    ini double confirmation → tidak ada detector SHORT yang boleh menang.
+    
+    Priority: -10018.9 (lebih tinggi dari CrowdedLongFundingKillConfirmed -10018.7)
+    Bias: Ikuti _liquidity_extreme_override direction
+    """
+    @staticmethod
+    def detect(liquidity_extreme_override: bool,
+               result_agg: float,
+               result_ofi_bias: str,
+               result_ofi_strength: float,
+               short_liq: float,
+               long_liq: float,
+               down_energy: float,
+               rsi6_5m: float,
+               funding_rate: float) -> dict:
+        
+        if funding_rate is None:
+            funding_rate = 0.0
+        
+        # Hanya aktif jika liquidity extreme override sudah fired
+        if not liquidity_extreme_override:
+            return {"override": False}
+        
+        # result["agg"] harus bullish (konsisten dengan squeeze)
+        if result_agg < 0.65:
+            return {"override": False}
+        
+        # OFI dari result harus LONG
+        if result_ofi_bias != "LONG" or result_ofi_strength < 0.7:
+            return {"override": False}
+        
+        # Tidak ada seller nyata
+        if down_energy >= 0.2:
+            return {"override": False}
+        
+        # short_liq harus close (squeeze target)
+        if short_liq >= 1.5:
+            return {"override": False}
+        
+        # rsi6_5m tidak boleh terlalu overbought
+        if rsi6_5m >= 75:
+            return {"override": False}
+        
+        # Funding tidak boleh terlalu positif dengan short_liq dekat
+        # (jika funding sangat positif + short_liq close = mungkin memang mau dump dulu)
+        # Tapi jika short_liq < 0.5%, liquidity extreme lebih kuat
+        if funding_rate > 0.003 and short_liq >= 0.8:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "LONG",
+            "reason": (
+                f"LIQUIDITY EXTREME AGG CONSISTENCY: "
+                f"_liquidity_extreme_override=True + result_agg={result_agg:.2f} "
+                f"(bullish, konsisten) + OFI LONG {result_ofi_strength:.2f}, "
+                f"short_liq={short_liq:.2f}% (ultra close), "
+                f"down_energy={down_energy:.3f} (no sellers), "
+                f"rsi6_5m={rsi6_5m:.1f} (not overbought) → "
+                f"SEMUA detector SHORT di stability filter diblokir. "
+                f"Liquidity extreme + agg konfirmasi = squeeze nyata. Force LONG."
+            ),
+            "priority": -10018.9
+        }
+
+
+class ShortLiqUltraCloseAggBullishForce:
+    """
+    🔥 TRADOORUSDT FIX: short_liq < 0.5% + result_agg > 0.85 + rsi6_5m < 60
+    + down_energy = 0 = SQUEEZE PALING MURNI, tidak ada yang bisa override ke SHORT
+    
+    Ini adalah kondisi squeeze paling ideal:
+    - short_liq < 0.5%: target hanya 0.5% di atas, hampir pasti tersapu
+    - agg > 0.85: 85%+ trades adalah BUY (bukan spoof, ini nyata)
+    - rsi6_5m < 60: 5m belum overbought, ada banyak room naik
+    - down_energy = 0: tidak ada satu pun seller di order book
+    
+    Ketika keempat kondisi ini terpenuhi secara BERSAMAAN,
+    probabilitas squeeze hampir 100%. Tidak ada logika lain yang bisa
+    lebih kuat dari ini.
+    
+    Guard: funding tidak boleh > 0.005 (terlalu crowded LONG → dump risk)
+    
+    Priority: -10019.5 (lebih tinggi dari semua detector baru)
+    Bias: LONG
+    """
+    @staticmethod
+    def detect(short_liq: float, long_liq: float,
+               result_agg: float,
+               rsi6_5m: float, down_energy: float,
+               up_energy: float, funding_rate: float,
+               result_ofi_bias: str, result_ofi_strength: float,
+               change_5m: float) -> dict:
+        
+        if funding_rate is None:
+            funding_rate = 0.0
+        
+        # short_liq harus ultra close
+        if short_liq >= 0.6:
+            return {"override": False}
+        
+        # result_agg (dari JSON, bukan display) harus sangat bullish
+        if result_agg < 0.80:
+            return {"override": False}
+        
+        # 5m tidak boleh overbought (ada room naik)
+        if rsi6_5m >= 65:
+            return {"override": False}
+        
+        # Tidak ada seller sama sekali
+        if down_energy >= 0.05:
+            return {"override": False}
+        
+        # Harus ada buy pressure
+        if up_energy <= 0:
+            return {"override": False}
+        
+        # Funding tidak terlalu ekstrem positif
+        if funding_rate > 0.005:
+            return {"override": False}
+        
+        # short_liq harus lebih dekat dari long_liq
+        if short_liq >= long_liq:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "LONG",
+            "reason": (
+                f"SHORT LIQ ULTRA CLOSE AGG BULLISH FORCE: "
+                f"short_liq={short_liq:.2f}% (<0.6%, target ultra dekat), "
+                f"result_agg={result_agg:.2f} (JSON ground truth, {result_agg*100:.0f}% BUY), "
+                f"rsi6_5m={rsi6_5m:.1f} (<65, banyak room naik), "
+                f"down_energy={down_energy:.3f} (zero sellers), "
+                f"up_energy={up_energy:.2f} (buyer aktif). "
+                f"funding={funding_rate:.5f} (ok, tidak ekstrem). "
+                f"Ini kondisi squeeze PALING MURNI — "
+                f"blokir semua SHORT override. Force LONG."
+            ),
+            "priority": -10019.5
+        }
+
+
 class FundingExtremeLongLiqTrapReversal:
     """
     🔥 FUNDING EXTREME + LONG LIQ DEKAT + HARGA FLAT = TRAP
@@ -13538,7 +13836,9 @@ class BinanceAnalyzer:
             agg=agg_val,
             up_energy=up_energy_val,
             volume_ratio=volume_ratio,
-            down_energy=down_energy_val
+            down_energy=down_energy_val,
+            rsi6_5m=rsi6_5m_val,
+            result_agg=result.get("agg", agg_val)
         )
         if fake_micro["override"]:
             result["bias"] = fake_micro["bias"]
@@ -13584,6 +13884,91 @@ class BinanceAnalyzer:
             return result
 
 
+        # ========== CRITICAL: VALIDATE AGG DATA CONSISTENCY ==========
+        # agg_val yang diambil dari result mungkin berbeda dengan yang
+        # digunakan di stability filter karena race condition.
+        # Selalu gunakan result["agg"] sebagai ground truth karena
+        # konsisten dengan greeks/kill_direction pipeline.
+        result_agg = result.get("agg", agg_val)
+        result_ofi_bias = result.get("ofi_bias", ofi_bias)
+        result_ofi_strength = result.get("ofi_strength", ofi_strength)
+        
+        trusted_agg, trusted_ofi_bias, trusted_ofi_strength, was_corrected = \
+            DisplayJsonAggValidator.validate_and_get_trusted_agg(
+                stability_agg=agg_val,
+                result_agg=result_agg,
+                result_ofi_bias=result_ofi_bias,
+                result_ofi_strength=result_ofi_strength
+            )
+        
+        if was_corrected:
+            result["reason"] = (
+                f"[AGG DATA CORRECTED: display={agg_val:.2f} → json={result_agg:.2f}] "
+                + result.get("reason", "")
+            )
+            # Update agg_val untuk semua detector di bawah
+            agg_val = trusted_agg
+            ofi_bias = trusted_ofi_bias
+            ofi_strength = trusted_ofi_strength
+        
+        # ===== PRIORITY -10019.5: SHORT LIQ ULTRA CLOSE AGG BULLISH FORCE =====
+        ultra_liq_agg = ShortLiqUltraCloseAggBullishForce.detect(
+            short_liq=short_liq,
+            long_liq=long_liq,
+            result_agg=result.get("agg", agg_val),   # pakai result["agg"], bukan agg_val
+            rsi6_5m=rsi6_5m_val,
+            down_energy=down_energy_val,
+            up_energy=up_energy_val,
+            funding_rate=funding_rate_val,
+            result_ofi_bias=result.get("ofi_bias", ofi_bias),
+            result_ofi_strength=result.get("ofi_strength", ofi_strength),
+            change_5m=change_5m_val
+        )
+        if ultra_liq_agg["override"]:
+            result["bias"] = ultra_liq_agg["bias"]
+            result["reason"] = f"[ULTRA LIQ AGG FORCE] {ultra_liq_agg['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = ultra_liq_agg["priority"]
+            return result
+        
+        # ===== PRIORITY -10018.9: LIQUIDITY EXTREME AGG CONSISTENCY =====
+        liq_ext_agg = LiquidityExtremeAggConsistencyCheck.detect(
+            liquidity_extreme_override=result.get("_liquidity_extreme_override", False),
+            result_agg=result.get("agg", agg_val),
+            result_ofi_bias=result.get("ofi_bias", ofi_bias),
+            result_ofi_strength=result.get("ofi_strength", ofi_strength),
+            short_liq=short_liq,
+            long_liq=long_liq,
+            down_energy=down_energy_val,
+            rsi6_5m=rsi6_5m_val,
+            funding_rate=funding_rate_val
+        )
+        if liq_ext_agg["override"]:
+            result["bias"] = liq_ext_agg["bias"]
+            result["reason"] = f"[LIQ EXT AGG CHECK] {liq_ext_agg['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = liq_ext_agg["priority"]
+            return result
+        
+        # ===== PRIORITY -10013.6: STOCH J FALSE BLOW-OFF GUARD =====
+        # Harus dipanggil SEBELUM StochasticJMaximalBlowOff (-10013.5)
+        stoch_j_guard = StochJOverboughtWithRSI5mGuard.detect(
+            stoch_j=stoch_j_val,
+            rsi6_5m=rsi6_5m_val,
+            short_liq=short_liq,
+            long_liq=long_liq,
+            agg=result.get("agg", agg_val),  # pakai result["agg"]
+            up_energy=up_energy_val,
+            down_energy=down_energy_val,
+            funding_rate=funding_rate_val
+        )
+        if stoch_j_guard["override"]:
+            result["bias"] = stoch_j_guard["bias"]
+            result["reason"] = f"[STOCH J FALSE BLOWOFF] {stoch_j_guard['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = stoch_j_guard["priority"]
+            return result
+        
         # ================= LECTURER'S SARAN: 4 NEW AIOTUSDT FIX DETECTORS =================
         # Detector-detector ini dijalankan SEBELUM OBV-VOLUME VETO dengan priority -10018.7 ke -10018.2
         
@@ -13598,13 +13983,35 @@ class BinanceAnalyzer:
             volume_ratio=volume_ratio,
             algo_type_bias=result.get("algo_type_bias", "NEUTRAL"),
             obv_trend=obv_trend,
-            change_5m=change_5m_val
+            change_5m=change_5m_val,
+            # TAMBAH:
+            result_agg=result.get("agg", agg_val),   # JSON ground truth
+            result_ofi_bias=result.get("ofi_bias", ""),
+            short_liq=short_liq
         )
         if crowded_kill["override"]:
             result["bias"] = crowded_kill["bias"]
             result["reason"] = f"[CROWDED KILL CONFIRMED] {crowded_kill['reason']} | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = crowded_kill["priority"]
+            return result
+
+        # ===== PRIORITY -10020: FAKE MICRO SQUEEZE TRAP (PALING TINGGI) =====
+        fake_micro = FakeMicroSqueezeTrap.detect(
+            short_liq=short_liq,
+            change_5m=change_5m_val,
+            agg=agg_val,
+            up_energy=up_energy_val,
+            volume_ratio=volume_ratio,
+            down_energy=down_energy_val,
+            rsi6_5m=rsi6_5m_val,
+            result_agg=result.get("agg", agg_val)
+        )
+        if fake_micro["override"]:
+            result["bias"] = fake_micro["bias"]
+            result["reason"] = f"[FAKE MICRO SQUEEZE] {fake_micro['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = fake_micro["priority"]
             return result
 
         # ===== PRIORITY -10018.5: STALE OBV DISTRIBUTION GUARD =====
