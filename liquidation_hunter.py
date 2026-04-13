@@ -801,7 +801,7 @@ class NoSellerNoBuyerOverride:
     🛡️ KILL PHASE GUARD: Jangan paksa LONG/SHORT jika bertentangan dengan Greeks dan liquidity proximity.
        - Jika KILL phase + greeks_kill_direction jelas + liq lebih dekat mendukung Greeks + funding crowded → override NoSeller/NoBuyer
        
-    🛡️ NEW: BLOCK NoSeller/NoBuyer jika bertentangan dengan Greeks kill direction dan BAIT phase.
+    🛡️ NEW: BLOCK NoSeller/NoBuyer jika OFI SHORT kuat + harga turun (IRYSUSDT pattern).
     """
     @staticmethod
     def detect(down_energy: float, up_energy: float,
@@ -810,9 +810,27 @@ class NoSellerNoBuyerOverride:
                short_liq: float, long_liq: float,
                gamma_executing: bool,
                greeks_kill_direction: str = "",
-               funding_rate: float = 0.0) -> dict:
+               funding_rate: float = 0.0,
+               # ===== NEW PARAMETERS =====
+               ofi_bias: str = "NEUTRAL",
+               ofi_strength: float = 0.0) -> dict:
         
-        # ========== NEW GUARD: Jangan override jika Greeks kill direction bertentangan ==========
+        # ========== GUARD: OFI SHORT kuat + harga turun = BLOCK LONG override ==========
+        if down_energy < 0.01:
+            if (ofi_bias == "SHORT" and ofi_strength > 0.7 and
+                change_5m < 0 and
+                (funding_rate < -0.0002 or market_phase == "BAIT")):
+                # Jangan paksa LONG, biarkan sinyal OFI SHORT yang menentukan
+                return {"override": False}
+        
+        # ========== GUARD: OFI LONG kuat + harga naik = BLOCK SHORT override ==========
+        if up_energy < 0.01:
+            if (ofi_bias == "LONG" and ofi_strength > 0.7 and
+                change_5m > 0 and
+                (funding_rate > 0.0002 or market_phase == "BAIT")):
+                return {"override": False}
+        
+        # ========== GUARD: Jangan override jika Greeks kill direction bertentangan ==========
         # Kondisi: BAIT phase + volume rendah + funding positif (crowded long) + kill_direction SHORT
         # maka NO SELLER override ke LONG adalah jebakan. Kita block override.
         if down_energy < 0.01:
@@ -14942,7 +14960,10 @@ class BinanceAnalyzer:
             long_liq=long_liq,               # ← dari result
             gamma_executing=gamma_executing, # ← dari result
             greeks_kill_direction=result.get("greeks_kill_direction", ""),  # ← dari result
-            funding_rate=result.get("funding_rate", 0.0)                    # ← dari result
+            funding_rate=result.get("funding_rate", 0.0),                    # ← dari result
+            # ===== NEW PARAMETERS =====
+            ofi_bias=result.get("ofi_bias", "NEUTRAL"),
+            ofi_strength=result.get("ofi_strength", 0.0)
         )
         if no_seller_buyer["override"]:
             result["bias"] = no_seller_buyer["bias"]
