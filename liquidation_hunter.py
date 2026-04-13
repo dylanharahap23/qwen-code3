@@ -19585,9 +19585,30 @@ class BinanceAnalyzer:
                     final_confidence = "ABSOLUTE"
                     final_phase = "LOW_CAP_DOUBLE_SWEEP"
                 else:
-                    # 🔥 Jangan override jika extreme oversold/overbought dengan volume rendah
-                    if volume_ratio < 0.6 and (rsi6 < 20 or rsi6 > 80):
-                        final_reason += f" | Low cap but extreme RSI6 ({rsi6:.1f}) with low volume → skip liquidity override"
+                    # 🔥 GUARD BARU: Jangan override jika Greeks sudah committed SHORT
+                    # dan crowded LONG dengan RSI ekstrem
+                    greeks_committed_short = (
+                        result.get("greeks_kill_direction", "") == "SHORT" and
+                        result.get("greeks_who_dies_first", "") == "LONG_TRADERS" and
+                        result.get("greeks_delta_exposure", 0) > 0.80
+                    )
+                    
+                    funding_crowded_long = (
+                        funding_rate is not None and
+                        funding_rate > 0.0005
+                    )
+                    
+                    rsi_extreme = rsi6 > 85 or rsi6_5m > 75
+                    
+                    # Jika Greeks committed + crowded LONG + RSI extreme
+                    # Low cap sniper TIDAK BOLEH override ke LONG
+                    if greeks_committed_short and funding_crowded_long and rsi_extreme:
+                        final_reason += f" | Low cap GUARD: Greeks committed SHORT + crowded LONG + RSI extreme → SKIP liquidity override, keep {final_bias}"
+                        # Jangan ubah final_bias
+                    
+                    elif volume_ratio < 0.6 and (rsi6 < 20 or rsi6 > 80):
+                        final_reason += f" | Low cap but extreme RSI6 ({rsi6:.1f}) → skip liquidity override"
+                    
                     else:
                         if liq["short_dist"] < liq["long_dist"]:
                             if final_bias != "LONG":
