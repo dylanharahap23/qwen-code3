@@ -463,6 +463,101 @@ def _check_bias_kill_conflict(data: dict, final_bias: str) -> dict:
 # ========== LECTURER'S SARAN: HFT ANTI-MANIPULATION OVERRIDE (PRIORITY TERTINGGI) ==========
 # 3 Layer prioritas tertinggi di awal _apply_stability_filters, sebelum semua detector lain
 
+
+# ========== LECTURER'S SARAN: LIQUIDITY EXTREME FALSE POSITIVE GUARD ==========
+# PRIORITY -26000 (HIGHEST ABSOLUTE): Cancel _liquidity_extreme_override jika false positive
+# untuk menghindari jebakan HFT pada kasus seperti BEATUSDT
+
+class LiquidityExtremeFalsePositiveGuard:
+    """
+    PRIORITY -26000 (TERTINGGI ABSOLUT - di atas segalanya):
+    
+    _liquidity_extreme_override fires LONG ketika short_liq < 0.5%
+    TAPI ini adalah JEBAKAN jika:
+    
+    1. funding_rate > 0 (crowded LONG, bukan SHORT)
+       → short_liq dekat bukan karena banyak short yang perlu di-squeeze
+       → tapi karena HFT pasang target kecil sebagai umpan LONG entry
+    
+    2. greeks_who_dies_first = LONG_TRADERS
+       → Greeks sudah tahu siapa yang mati
+    
+    3. greeks_delta_exposure > 0.9 (MAXIMUM crowding LONG)
+       → Semua orang sudah LONG, tidak ada short yang perlu di-squeeze
+    
+    4. stoch_j > 100 (mathematical overflow = blow-off top)
+       → Momentum sudah tidak valid secara matematis
+    
+    GENUINE short squeeze membutuhkan:
+    - funding NEGATIF (crowded SHORT yang akan di-squeeze)
+    - greeks_who_dies = SHORT_TRADERS
+    - stoch_j < 100 (momentum masih valid)
+    
+    Tanpa syarat ini, short_liq dekat = UMPAN bukan TARGET.
+    """
+    @staticmethod
+    def detect(
+        liquidity_extreme_override_direction: str,  # arah yang akan dipaksa
+        funding_rate: float,
+        greeks_who_dies_first: str,
+        greeks_delta_exposure: float,
+        greeks_kill_direction: str,
+        stoch_j: float,
+        rsi6_5m: float,
+        short_liq: float,
+        long_liq: float,
+        volume_ratio: float,
+        market_phase: str
+    ) -> dict:
+        
+        if funding_rate is None:
+            return {"override": False}
+        
+        # Hanya relevant jika liquidity extreme akan memaksa LONG
+        if liquidity_extreme_override_direction != "LONG":
+            # Mirror untuk SHORT
+            if (liquidity_extreme_override_direction == "SHORT" and
+                funding_rate < -0.0003 and
+                greeks_who_dies_first == "SHORT_TRADERS" and
+                greeks_delta_exposure > 0.9):
+                return {"override": False}  # genuine short squeeze, biarkan
+            return {"override": False}
+        
+        # Hitung berapa banyak "LONG akan mati" signals
+        death_signals = {
+            "funding_crowded_long": funding_rate > 0.0003,
+            "greeks_kills_long": greeks_who_dies_first == "LONG_TRADERS",
+            "max_delta_exposure": greeks_delta_exposure > 0.85,
+            "greeks_short": greeks_kill_direction == "SHORT",
+            "stoch_overflow": stoch_j > 100,
+            "rsi5m_overbought": rsi6_5m > 72,
+            "bait_phase": market_phase == "BAIT",
+            "volume_dry": volume_ratio < 0.5,
+        }
+        
+        death_count = sum(death_signals.values())
+        
+        # Jika 5+ dari 8 sinyal menunjukkan LONG akan mati → ini jebakan
+        if death_count >= 5:
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"LIQUIDITY EXTREME FALSE POSITIVE GUARD: "
+                    f"short_liq={short_liq:.2f}% tampak dekat tapi INI JEBAKAN. "
+                    f"funding={funding_rate:.6f} (crowded LONG bukan SHORT = tidak ada short yang perlu di-squeeze), "
+                    f"greeks_who_dies={greeks_who_dies_first} (LONG yang mati), "
+                    f"delta_exposure={greeks_delta_exposure:.3f} (maximum crowding LONG), "
+                    f"stoch_j={stoch_j:.1f} ({'OVERFLOW' if stoch_j > 100 else 'extreme'}), "
+                    f"RSI5m={rsi6_5m:.1f} overbought, phase={market_phase}. "
+                    f"Death signals: {death_count}/8. "
+                    f"_liquidity_extreme_override CANCELLED. Force SHORT."
+                ),
+                "priority": -26000
+            }
+        
+        return {"override": False}
+
 # ========== LECTURER'S SARAN: PHANTOM VACUUM TRAP & ASTRONOMICAL OBV STALE VETO ==========
 # PRIORITY -25000 dan -24000: Harus PALING AWAL sebelum NoSellerNoBuyerOverride (-20000)
 # untuk menghindari jebakan HFT manipulation pada kasus BULLAUSDT dan AIOUSDT
@@ -14580,6 +14675,35 @@ class BinanceAnalyzer:
         # ========== LAYER 0: ENERGY & EXHAUSTION OVERRIDE (PRIORITAS TERTINGGI) ==========
         # Harus di awal, sebelum PHASE LOCK dan GREEKS
         # Detector-detector dari dosen untuk anti-HFT manipulation
+        
+        # ===== PRIORITY -26000: LIQUIDITY EXTREME FALSE POSITIVE GUARD (HIGHEST ABSOLUTE) =====
+        # Harus PERTAMA karena membatalkan _liquidity_extreme_override
+        liq_extreme_direction = "LONG" if result.get("_liquidity_extreme_override") and result.get("bias") == "LONG" else \
+                                "SHORT" if result.get("_liquidity_extreme_override") and result.get("bias") == "SHORT" else \
+                                "NONE"
+
+        if liq_extreme_direction != "NONE":
+            liq_false_positive = LiquidityExtremeFalsePositiveGuard.detect(
+                liquidity_extreme_override_direction=liq_extreme_direction,
+                funding_rate=result.get("funding_rate", 0),
+                greeks_who_dies_first=result.get("greeks_who_dies_first", ""),
+                greeks_delta_exposure=result.get("greeks_delta_exposure", 0),
+                greeks_kill_direction=result.get("greeks_kill_direction", ""),
+                stoch_j=result.get("stoch_j", 50),
+                rsi6_5m=result.get("rsi6_5m", 50),
+                short_liq=result.get("short_liq", 99),
+                long_liq=result.get("long_liq", 99),
+                volume_ratio=result.get("volume_ratio", 1),
+                market_phase=result.get("market_phase", "UNKNOWN")
+            )
+            if liq_false_positive["override"]:
+                result["bias"] = liq_false_positive["bias"]
+                result["reason"] = f"[LIQ EXTREME FALSE POS] {liq_false_positive['reason']}"
+                result["confidence"] = "ABSOLUTE"
+                result["priority_level"] = liq_false_positive["priority"]
+                result["_liquidity_extreme_override"] = False  # batalkan flag
+                result["entry_allowed"] = True
+                return result
         
         # ===== PRIORITY -25000: PHANTOM VACUUM TRAP (MUST BE FIRST, BEFORE EVERYTHING) =====
         # Kasus BULLAUSDT & AIOUSDT: LONG signal → dumped 8% down
