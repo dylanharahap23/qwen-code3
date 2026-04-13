@@ -788,6 +788,53 @@ class AstronomicalOBVStaleVeto:
         return {"override": False}
 
 
+class LowVolumeOverboughtFakeSqueeze:
+    """
+    🔥 PRIORITY -20020: Deteksi pump palsu volume rendah + overbought
+    Kondisi:
+    - change_5m > 2% (pump signifikan)
+    - volume_ratio < 0.5 (volume sangat rendah)
+    - rsi6_5m > 85 (5m overbought ekstrem)
+    - short_liq > 1.5% (bukan squeeze super dekat)
+    - agg < 0.8 (tidak ada buy dominance ekstrem)
+    - down_energy < 0.1 (tidak ada seller di book - jebakan)
+    
+    Guard: jangan trigger jika short_liq < 1.5% (squeeze nyata) atau funding_rate < -0.003 (crowded short)
+    """
+    @staticmethod
+    def detect(change_5m: float, volume_ratio: float, rsi6_5m: float,
+               short_liq: float, agg: float, down_energy: float,
+               funding_rate: float) -> dict:
+        
+        if funding_rate is None:
+            funding_rate = 0.0
+        
+        # Guard: jika short liq super dekat (squeeze nyata) atau funding sangat negatif (crowded short)
+        if short_liq < 1.5 or funding_rate < -0.003:
+            return {"override": False}
+        
+        # Kondisi utama
+        if (change_5m > 2.0 and
+            volume_ratio < 0.5 and
+            rsi6_5m > 85 and
+            short_liq < 10.0 and
+            agg < 0.8 and
+            down_energy < 0.1):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"LOW VOLUME OVERBOUGHT FAKE SQUEEZE: "
+                    f"pump {change_5m:.1f}% dengan volume {volume_ratio:.2f}x (sangat rendah), "
+                    f"RSI5m={rsi6_5m:.1f} overbought ekstrem, short_liq={short_liq:.2f}% (tidak super dekat), "
+                    f"agg={agg:.2f}, down_energy={down_energy:.3f} → HFT pump palsu tanpa volume, "
+                    f"dump imminent. Force SHORT."
+                ),
+                "priority": -20020
+            }
+        return {"override": False}
+
+
 class NoSellerNoBuyerOverride:
     """
     🔥 PRIORITY -20000: Jika down_energy == 0 → TIDAK ADA SELLER → LONG.
@@ -15142,6 +15189,23 @@ class BinanceAnalyzer:
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = capitulation_squeeze["priority"]
             result["entry_allowed"] = True
+            return result
+        
+        # ===== PRIORITY -20020: LOW VOLUME OVERBOUGHT FAKE SQUEEZE =====
+        fake_squeeze = LowVolumeOverboughtFakeSqueeze.detect(
+            change_5m=change_5m_val,
+            volume_ratio=volume_ratio,
+            rsi6_5m=rsi6_5m_val,
+            short_liq=short_liq,
+            agg=agg_val,
+            down_energy=down_energy_val,
+            funding_rate=funding_rate_val
+        )
+        if fake_squeeze["override"]:
+            result["bias"] = fake_squeeze["bias"]
+            result["reason"] = f"[FAKE SQUEEZE] {fake_squeeze['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = fake_squeeze["priority"]
             return result
         
         # 0.2 Exhaustion Reversal Override (PRIORITY -19900)
