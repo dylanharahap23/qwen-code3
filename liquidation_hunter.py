@@ -686,18 +686,34 @@ class NoSellerNoBuyerOverride:
     🛡️ BAIT VACUUM TRAP DETECTION: Membedakan genuine vacuum vs HFT bait.
        - Jika BAIT phase + volume rendah + gerakan kecil + liq lebih dekat di sisi lawan → itu jebakan
        - Jika KILL phase atau gamma executing → genuine vacuum
+    
+    🛡️ KILL PHASE GUARD: Jangan paksa LONG/SHORT jika bertentangan dengan Greeks dan liquidity proximity.
+       - Jika KILL phase + greeks_kill_direction jelas + liq lebih dekat mendukung Greeks + funding crowded → override NoSeller/NoBuyer
     """
     @staticmethod
     def detect(down_energy: float, up_energy: float,
                agg: float, change_5m: float,
                market_phase: str, volume_ratio: float,
                short_liq: float, long_liq: float,
-               gamma_executing: bool) -> dict:
+               gamma_executing: bool,
+               greeks_kill_direction: str = "",
+               funding_rate: float = 0.0) -> dict:
         
         # KASUS down_energy == 0 (tidak ada seller)
         if down_energy < 0.01:
-            # 🔥 BAIT VACUUM TRAP: Jika masih BAIT phase, volume sangat rendah, gerakan kecil
-            # dan short_liq lebih dekat (umpan) → sebenarnya SHORT
+            # 🔥 GUARD DI KILL PHASE: Jangan paksa LONG jika Greeks bilang SHORT & long_liq lebih dekat & funding positif
+            if (market_phase == "KILL" and
+                greeks_kill_direction == "SHORT" and
+                long_liq < short_liq and
+                funding_rate > 0.0003):
+                return {
+                    "override": True,
+                    "bias": "SHORT",
+                    "reason": f"KILL PHASE GUARD: down_energy=0 tapi Greeks kill=SHORT, long_liq={long_liq:.2f}% < short_liq, funding={funding_rate:.5f} crowded long → forced SHORT (override NoSeller)",
+                    "priority": -20001  # lebih tinggi dari NoSeller original
+                }
+            
+            # 🔥 BAIT VACUUM TRAP (existing)
             if (market_phase == "BAIT" and 
                 volume_ratio < 0.4 and 
                 abs(change_5m) < 1.5 and 
@@ -709,8 +725,7 @@ class NoSellerNoBuyerOverride:
                     "priority": -20000
                 }
             
-            # 🔥 KILL VACUUM (genuine): Jika sudah KILL phase, gamma executing, atau gerakan besar
-            # Maka LONG adalah benar
+            # Genuine vacuum (existing)
             return {
                 "override": True,
                 "bias": "LONG",
@@ -718,8 +733,19 @@ class NoSellerNoBuyerOverride:
                 "priority": -20000
             }
         
-        # KASUS up_energy == 0 (tidak ada buyer)
+        # KASUS up_energy == 0 (tidak ada buyer) - mirror guard
         if up_energy < 0.01:
+            if (market_phase == "KILL" and
+                greeks_kill_direction == "LONG" and
+                short_liq < long_liq and
+                funding_rate < -0.0003):
+                return {
+                    "override": True,
+                    "bias": "LONG",
+                    "reason": f"KILL PHASE GUARD: up_energy=0 tapi Greeks kill=LONG, short_liq={short_liq:.2f}% < long_liq, funding={funding_rate:.5f} crowded short → forced LONG (override NoBuyer)",
+                    "priority": -20001
+                }
+            
             if (market_phase == "BAIT" and 
                 volume_ratio < 0.4 and 
                 abs(change_5m) < 1.5 and 
@@ -730,6 +756,7 @@ class NoSellerNoBuyerOverride:
                     "reason": f"BAIT VACUUM TRAP: up_energy=0 tapi BAIT phase, vol={volume_ratio:.2f}x, move={change_5m:.1f}%, long_liq={long_liq:.2f}% < short_liq={short_liq:.2f}% → HFT bait, forced LONG",
                     "priority": -20000
                 }
+            
             return {
                 "override": True,
                 "bias": "SHORT",
@@ -14756,7 +14783,9 @@ class BinanceAnalyzer:
             volume_ratio=volume_ratio,       # ← sudah ada
             short_liq=short_liq,             # ← dari result
             long_liq=long_liq,               # ← dari result
-            gamma_executing=gamma_executing  # ← dari result
+            gamma_executing=gamma_executing, # ← dari result
+            greeks_kill_direction=result.get("greeks_kill_direction", ""),  # ← dari result
+            funding_rate=result.get("funding_rate", 0.0)                    # ← dari result
         )
         if no_seller_buyer["override"]:
             result["bias"] = no_seller_buyer["bias"]
