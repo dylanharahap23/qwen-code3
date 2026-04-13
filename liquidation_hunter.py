@@ -879,6 +879,297 @@ class CapitulationDumpLongLiqClose:
         return {"override": False}
 
 
+# ================================================================================
+# LECTURER'S SARAN LOGIC: BASEDUSDT & AIOUSDT FIXES
+# Priority ladder: -26900 to -26600 (highest absolute, before NoSeller/NoBuyer)
+# ================================================================================
+
+class LiquidityRatioMaxPainV2:
+    """
+    🔥 PRIORITY -26900: LIQUIDITY RATIO MAX PAIN V2 (EXTREME)
+    
+    Versi upgrade dari AsymmetricLiquidityMaxPain yang lebih agresif
+    untuk rasio ekstrem > 20x.
+    
+    BASEDUSDT: long_liq=6.12%, short_liq=0.04% → ratio = 153x
+    
+    Ketika ratio > 20x DAN RSI semua TF > 85 DAN crowded LONG:
+    Market PASTI menuju yang lebih besar (long_liq).
+    Tidak ada kondisi lain yang bisa override ini.
+    """
+    RATIO_EXTREME_V2 = 20.0
+    
+    @staticmethod
+    def detect(short_liq: float, long_liq: float,
+               rsi6: float, rsi6_5m: float,
+               delta_crowded: str, kill_direction: str,
+               volume_ratio: float, funding_rate: float = 0.0,
+               stoch_j: float = 50.0) -> dict:
+        
+        if funding_rate is None:
+            funding_rate = 0.0
+        
+        if short_liq <= 0 or long_liq <= 0:
+            return {"override": False}
+        
+        ratio = long_liq / short_liq
+        
+        if ratio < LiquidityRatioMaxPainV2.RATIO_EXTREME_V2:
+            return {"override": False}
+        
+        # RSI semua TF harus elevated
+        if not (rsi6 > 80 or rsi6_5m > 80):
+            return {"override": False}
+        
+        # Crowded LONG yang akan mati
+        if delta_crowded != "LONG" or kill_direction != "SHORT":
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "cancel_liquidity_extreme_override": True,
+            "reason": (
+                f"LIQUIDITY RATIO MAX PAIN V2 (EXTREME): "
+                f"long_liq={long_liq:.2f}% vs short_liq={short_liq:.2f}% "
+                f"(ratio {ratio:.0f}x >> threshold {LiquidityRatioMaxPainV2.RATIO_EXTREME_V2}x), "
+                f"RSI6={rsi6:.1f} RSI5m={rsi6_5m:.1f}, "
+                f"delta=LONG kill=SHORT → "
+                f"Market menuju LONG_LIQ yang jauh lebih besar. "
+                f"Short_liq micro-sweep sudah atau hampir selesai. Force SHORT."
+            ),
+            "priority": -26900
+        }
+
+
+class PostMicroSweepDumpDetector:
+    """
+    🔥 PRIORITY -26850: POST MICRO-SWEEP DUMP
+    
+    Setelah short_liq < 0.2% di-sweep (harga naik tipis),
+    sistem harus segera flip ke SHORT untuk catch dump ke long_liq.
+    
+    Trigger: change_5m > short_liq * 0.8 (harga sudah melewati target)
+    DAN RSI masih tinggi DAN long_liq masih jauh
+    DAN crowded LONG
+    
+    Priority: -26850
+    """
+    @staticmethod
+    def detect(change_5m: float, short_liq: float, long_liq: float,
+               rsi6: float, rsi6_5m: float,
+               delta_crowded: str, kill_direction: str,
+               volume_ratio: float) -> dict:
+        
+        # short_liq harus sudah dekat (kondisi awal)
+        if short_liq >= 0.5:
+            return {"override": False}
+        
+        # Harga sudah melewati short_liq (sweep hampir/sudah selesai)
+        sweep_done = change_5m > short_liq * 0.7
+        if not sweep_done:
+            return {"override": False}
+        
+        # RSI masih tinggi (overbought = tidak ada ruang naik lebih)
+        if rsi6 < 80:
+            return {"override": False}
+        
+        # long_liq masih jauh (target dump ada)
+        if long_liq < 3.0:
+            return {"override": False}
+        
+        # delta_crowded LONG (banyak LONG yang akan diliquidasi)
+        if delta_crowded != "LONG":
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"POST MICRO-SWEEP DUMP: short_liq={short_liq:.2f}% sudah di-sweep "
+                f"(change={change_5m:.2f}% > {short_liq*0.7:.2f}%), "
+                f"RSI={rsi6:.1f} overbought, long_liq={long_liq:.2f}% (target dump), "
+                f"delta=LONG → micro-sweep selesai, dump ke long_liq imminent. Force SHORT."
+            ),
+            "priority": -26850
+        }
+
+
+class UltraShortLiqBeforeGiantLongLiq:
+    """
+    🔥 PRIORITY -26800: ULTRA SHORT LIQ BEFORE GIANT LONG LIQ TRAP
+    
+    Ketika short_liq < 0.2% tapi long_liq > 4x jarak short_liq,
+    dan RSI semua TF > 85, dan delta_crowded = LONG:
+    
+    Ini adalah MICRO-SWEEP trap:
+    Binance sweep short_liq dulu (< 0.2% = hampir tidak bergerak),
+    lalu langsung dump ke long_liq yang jauh lebih besar.
+    
+    _liquidity_extreme_override TIDAK BOLEH berlaku di sini.
+    """
+    @staticmethod
+    def detect(short_liq: float, long_liq: float,
+               rsi6: float, rsi6_5m: float,
+               delta_crowded: str, kill_direction: str,
+               stoch_j: float, funding_rate: float = 0.0) -> dict:
+        
+        if funding_rate is None:
+            funding_rate = 0.0
+        
+        if short_liq >= 0.2:
+            return {"override": False}
+        
+        # long_liq jauh lebih besar (ratio > 20x)
+        if long_liq < short_liq * 20:
+            return {"override": False}
+        
+        # RSI semua TF overbought
+        rsi_all_overbought = rsi6 > 85 and rsi6_5m > 85
+        if not rsi_all_overbought:
+            return {"override": False}
+        
+        # Crowded LONG yang akan mati
+        crowded_long_dies = (delta_crowded == "LONG" and kill_direction == "SHORT")
+        
+        if crowded_long_dies:
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "cancel_liquidity_extreme_override": True,
+                "reason": (
+                    f"ULTRA SHORT LIQ BEFORE GIANT LONG LIQ TRAP: "
+                    f"short_liq={short_liq:.2f}% (akan di-micro-sweep), "
+                    f"long_liq={long_liq:.2f}% (target dump sesungguhnya, ratio {long_liq/short_liq:.0f}x), "
+                    f"RSI6={rsi6:.1f} RSI5m={rsi6_5m:.1f} (overbought semua TF), "
+                    f"delta_crowded=LONG kill=SHORT → "
+                    f"Binance micro-sweep short liq dulu lalu dump ke long liq. "
+                    f"CANCEL _liquidity_extreme_override. Force SHORT."
+                ),
+                "priority": -26800
+            }
+        
+        return {"override": False}
+
+
+class RSIAllTimeframeOverboughtDumpGuard:
+    """
+    🔥 PRIORITY -26700: RSI ALL TIMEFRAME OVERBOUGHT DUMP
+    
+    RSI6_1m > 90 DAN RSI6_5m > 90 secara bersamaan = kondisi paling berbahaya.
+    
+    Sistem sering force LONG karena no seller / short_liq dekat, tapi ketika
+    KEDUA timeframe sudah > 90, tidak ada lagi ruang untuk naik.
+    Binance PASTI akan dump karena tidak ada buyer baru yang bisa masuk.
+    
+    Exception: hanya jika short_liq < 0.1% (hampir mau di-sweep dalam detik)
+    dan long_liq > 10% (tidak ada long target dekat)
+    
+    Priority: -26700
+    """
+    @staticmethod
+    def detect(rsi6: float, rsi6_5m: float,
+               delta_crowded: str, kill_direction: str,
+               short_liq: float, long_liq: float,
+               volume_ratio: float, stoch_j: float = 50.0) -> dict:
+        
+        # Keduanya harus > 90
+        if not (rsi6 > 90 and rsi6_5m > 90):
+            return {"override": False}
+        
+        # Exception: short_liq ultra close dan long_liq jauh
+        if short_liq < 0.1 and long_liq > 10:
+            return {"override": False}
+        
+        # kill_direction harus SHORT
+        if kill_direction != "SHORT":
+            return {"override": False}
+        
+        # delta_crowded harus LONG (yang akan mati)
+        if delta_crowded != "LONG":
+            return {"override": False}
+        
+        # Volume kering (tidak ada momentum nyata)
+        if volume_ratio >= 0.8:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"RSI ALL TIMEFRAME OVERBOUGHT DUMP: "
+                f"RSI6_1m={rsi6:.1f} DAN RSI6_5m={rsi6_5m:.1f} keduanya > 90, "
+                f"delta_crowded=LONG, kill=SHORT, volume={volume_ratio:.2f}x → "
+                f"Tidak ada buyer baru. LONG akan dilikuidasi. "
+                f"Override semua NoSeller/LiquidityExtreme signal. Force SHORT."
+            ),
+            "priority": -26700
+        }
+
+
+class StochJOverflowShortLiqMicroSweepGuard:
+    """
+    🔥 PRIORITY -26600: STOCH J OVERFLOW MICRO-SWEEP GUARD
+    
+    stoch_j > 100 + short_liq < 0.5% + funding tidak ekstrem negatif
+    = BUKAN blow-off top, ini micro-sweep short liq sebelum pump.
+    
+    Sistem sekarang: stoch_j overflow → kira blow-off → SHORT
+    Kenyataan AIOUSDT: stoch_j = 106 tapi short_liq = 0.36% → pump +8%
+    
+    Guard: batalkan semua SHORT signal ketika kondisi ini terpenuhi.
+    Priority: -26600 (lebih tinggi dari LiquidityExtremeFalsePositiveGuard -26000)
+    """
+    @staticmethod
+    def detect(stoch_j: float, short_liq: float, long_liq: float,
+               funding_rate: float, rsi6_5m: float,
+               agg: float, down_energy: float, change_5m: float) -> dict:
+        
+        if funding_rate is None:
+            funding_rate = 0.0
+        
+        # stoch_j harus overflow
+        if stoch_j <= 100:
+            return {"override": False}
+        
+        # short_liq harus sangat dekat
+        if short_liq >= 0.6:
+            return {"override": False}
+        
+        # short_liq lebih dekat dari long_liq
+        if short_liq >= long_liq:
+            return {"override": False}
+        
+        # Funding tidak boleh sangat positif (jika sangat positif = mungkin memang blow-off)
+        if funding_rate > 0.003:
+            return {"override": False}
+        
+        # RSI 5m tidak boleh sangat overbought (< 75 = masih ada room)
+        if rsi6_5m > 75:
+            return {"override": False}
+        
+        # down_energy harus nol (tidak ada seller nyata)
+        if down_energy >= 0.1:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "LONG",
+            "cancel_stoch_overflow_short": True,
+            "reason": (
+                f"STOCH J OVERFLOW MICRO-SWEEP GUARD: "
+                f"stoch_j={stoch_j:.1f} (overflow) TAPI short_liq={short_liq:.2f}% "
+                f"sangat dekat (ratio ke long_liq={long_liq/short_liq:.1f}x), "
+                f"RSI5m={rsi6_5m:.1f} (<75, masih ada room), "
+                f"funding={funding_rate:.6f} (tidak ekstrem), "
+                f"down_energy={down_energy:.3f} (zero sellers) → "
+                f"Ini BUKAN blow-off top. Stoch overflow = momentum spike. "
+                f"Short liq akan di-sweep → pump. Cancel SHORT. Force LONG."
+            ),
+            "priority": -26600
+        }
+
+
 class NoSellerNoBuyerOverride:
     """
     🔥 PRIORITY -20000: Jika down_energy == 0 → TIDAK ADA SELLER → LONG.
@@ -15089,6 +15380,96 @@ class BinanceAnalyzer:
         # ========== LAYER 0: ENERGY & EXHAUSTION OVERRIDE (PRIORITAS TERTINGGI) ==========
         # Harus di awal, sebelum PHASE LOCK dan GREEKS
         # Detector-detector dari dosen untuk anti-HFT manipulation
+        
+        # ===== PRIORITY -26900: LIQUIDITY RATIO MAX PAIN V2 (HIGHEST ABSOLUTE) =====
+        # Kasus BASEDUSDT: long_liq >> short_liq dengan ratio ekstrem + crowded LONG
+        liq_ratio_v2 = LiquidityRatioMaxPainV2.detect(
+            short_liq=short_liq, long_liq=long_liq,
+            rsi6=rsi6_val, rsi6_5m=rsi6_5m_val,
+            delta_crowded=result.get("greeks_delta_crowded", ""),
+            kill_direction=result.get("greeks_kill_direction", ""),
+            volume_ratio=volume_ratio,
+            funding_rate=funding_rate_val,
+            stoch_j=stoch_j_val
+        )
+        if liq_ratio_v2["override"]:
+            if liq_ratio_v2.get("cancel_liquidity_extreme_override"):
+                result["_liquidity_extreme_override"] = False
+            result["bias"] = liq_ratio_v2["bias"]
+            result["reason"] = f"[LIQ RATIO V2] {liq_ratio_v2['reason']}"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = liq_ratio_v2["priority"]
+            result["entry_allowed"] = True
+            return result
+        
+        # ===== PRIORITY -26850: POST MICRO-SWEEP DUMP =====
+        # Deteksi setelah short_liq micro-sweep selesai, dump ke long_liq imminent
+        post_micro = PostMicroSweepDumpDetector.detect(
+            change_5m=change_5m_val, short_liq=short_liq, long_liq=long_liq,
+            rsi6=rsi6_val, rsi6_5m=rsi6_5m_val,
+            delta_crowded=result.get("greeks_delta_crowded", ""),
+            kill_direction=result.get("greeks_kill_direction", ""),
+            volume_ratio=volume_ratio
+        )
+        if post_micro["override"]:
+            result["_liquidity_extreme_override"] = False
+            result["bias"] = post_micro["bias"]
+            result["reason"] = f"[POST MICRO-SWEEP] {post_micro['reason']}"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = post_micro["priority"]
+            result["entry_allowed"] = True
+            return result
+        
+        # ===== PRIORITY -26800: ULTRA SHORT LIQ BEFORE GIANT LONG LIQ =====
+        # Kasus BASEDUSDT exact: short_liq < 0.2% tapi long_liq >> short_liq + crowded LONG
+        ultra_short_giant = UltraShortLiqBeforeGiantLongLiq.detect(
+            short_liq=short_liq, long_liq=long_liq,
+            rsi6=rsi6_val, rsi6_5m=rsi6_5m_val,
+            delta_crowded=result.get("greeks_delta_crowded", ""),
+            kill_direction=result.get("greeks_kill_direction", ""),
+            stoch_j=stoch_j_val, funding_rate=funding_rate_val
+        )
+        if ultra_short_giant["override"]:
+            result["_liquidity_extreme_override"] = False
+            result["bias"] = ultra_short_giant["bias"]
+            result["reason"] = f"[ULTRA SHORT LIQ GIANT LONG] {ultra_short_giant['reason']}"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = ultra_short_giant["priority"]
+            result["entry_allowed"] = True
+            return result
+        
+        # ===== PRIORITY -26700: RSI ALL TIMEFRAME OVERBOUGHT =====
+        # RSI6_1m > 90 DAN RSI6_5m > 90 = tidak ada buyer baru, dump imminent
+        rsi_all_ob = RSIAllTimeframeOverboughtDumpGuard.detect(
+            rsi6=rsi6_val, rsi6_5m=rsi6_5m_val,
+            delta_crowded=result.get("greeks_delta_crowded", ""),
+            kill_direction=result.get("greeks_kill_direction", ""),
+            short_liq=short_liq, long_liq=long_liq,
+            volume_ratio=volume_ratio, stoch_j=stoch_j_val
+        )
+        if rsi_all_ob["override"]:
+            result["_liquidity_extreme_override"] = False
+            result["bias"] = rsi_all_ob["bias"]
+            result["reason"] = f"[RSI ALL TF OVERBOUGHT] {rsi_all_ob['reason']}"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = rsi_all_ob["priority"]
+            result["entry_allowed"] = True
+            return result
+        
+        # ===== PRIORITY -26600: STOCH J OVERFLOW MICRO-SWEEP GUARD =====
+        # Kasus AIOUSDT: stoch_j overflow tapi short_liq dekat = micro-sweep, BUKAN blow-off
+        stoch_micro = StochJOverflowShortLiqMicroSweepGuard.detect(
+            stoch_j=stoch_j_val, short_liq=short_liq, long_liq=long_liq,
+            funding_rate=funding_rate_val, rsi6_5m=rsi6_5m_val,
+            agg=agg_val, down_energy=down_energy_val, change_5m=change_5m_val
+        )
+        if stoch_micro["override"]:
+            result["bias"] = stoch_micro["bias"]
+            result["reason"] = f"[STOCH J MICRO-SWEEP] {stoch_micro['reason']}"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = stoch_micro["priority"]
+            result["entry_allowed"] = True
+            return result
         
         # ===== PRIORITY -26500: CROWDED LONG RSI5M EXTREME OVERBOUGHT TRAP (HIGHEST ABSOLUTE) =====
         # Kasus VELVETUSDT: LONG tapi dump 8% — tidak tertangkap guard lain karena market_phase = BAIT
