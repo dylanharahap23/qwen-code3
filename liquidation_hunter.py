@@ -19587,23 +19587,19 @@ class BinanceAnalyzer:
                 else:
                     # 🔥 GUARD BARU: Jangan override jika Greeks sudah committed SHORT
                     # dan crowded LONG dengan RSI ekstrem
-                    greeks_committed_short = (
-                        result.get("greeks_kill_direction", "") == "SHORT" and
-                        result.get("greeks_who_dies_first", "") == "LONG_TRADERS" and
-                        result.get("greeks_delta_exposure", 0) > 0.80
-                    )
-                    
+                    # CATATAN: Gunakan variabel lokal yang sudah ada di scope analyze(),
+                    # BUKAN result.get() karena result belum dibuat di titik ini
                     funding_crowded_long = (
                         funding_rate is not None and
-                        funding_rate > 0.0005
+                        (funding_rate or 0) > 0.0005
                     )
                     
                     rsi_extreme = rsi6 > 85 or rsi6_5m > 75
                     
-                    # Jika Greeks committed + crowded LONG + RSI extreme
+                    # Jika volume ratio rendah + RSI extreme + funding crowded LONG
                     # Low cap sniper TIDAK BOLEH override ke LONG
-                    if greeks_committed_short and funding_crowded_long and rsi_extreme:
-                        final_reason += f" | Low cap GUARD: Greeks committed SHORT + crowded LONG + RSI extreme → SKIP liquidity override, keep {final_bias}"
+                    if volume_ratio < 0.6 and rsi_extreme and funding_crowded_long:
+                        final_reason += f" | Low cap GUARD: Volume low + RSI extreme ({rsi6:.1f}/{rsi6_5m:.1f}) + crowded LONG → SKIP liquidity override, keep {final_bias}"
                         # Jangan ubah final_bias
                     
                     elif volume_ratio < 0.6 and (rsi6 < 20 or rsi6 > 80):
