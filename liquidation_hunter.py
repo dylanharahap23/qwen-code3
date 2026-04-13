@@ -835,6 +835,50 @@ class LowVolumeOverboughtFakeSqueeze:
         return {"override": False}
 
 
+class CapitulationDumpLongLiqClose:
+    """
+    🔥 PRIORITY -20030: Deteksi capitulation dump dengan long liq sangat dekat
+    Kondisi:
+    - change_5m < -5% (drop drastis)
+    - long_liq < 2% (target sangat dekat)
+    - down_energy < 0.01 (tidak ada seller di book - jebakan)
+    - agg > 0.7 (retail beli dip, bukan smart money)
+    - obv_trend in ("POSITIVE_EXTREME", "POSITIVE") dan volume_ratio < 0.6 (OBV stale)
+    - rsi6_5m < 25 (oversold)
+    - funding_rate > 0 (tidak ada short squeeze)
+    Force SHORT, override NoSellerNoBuyerOverride.
+    """
+    @staticmethod
+    def detect(change_5m: float, long_liq: float, down_energy: float,
+               agg: float, obv_trend: str, volume_ratio: float,
+               rsi6_5m: float, funding_rate: float) -> dict:
+        
+        if funding_rate is None:
+            funding_rate = 0.0
+        
+        if (change_5m < -5.0 and
+            long_liq < 2.0 and
+            down_energy < 0.01 and
+            agg > 0.7 and
+            obv_trend in ("POSITIVE_EXTREME", "POSITIVE") and
+            volume_ratio < 0.6 and
+            rsi6_5m < 25 and
+            funding_rate > 0):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"CAPITULATION DUMP LONG LIQ CLOSE: price dropped {change_5m:.1f}%, "
+                    f"long_liq={long_liq:.2f}% ultra close, down_energy=0 (jebakan), "
+                    f"agg={agg:.2f} (retail beli dip), OBV={obv_trend} stale (volume {volume_ratio:.2f}x), "
+                    f"RSI5m={rsi6_5m:.1f} oversold, funding={funding_rate:.5f} positif → "
+                    f"HFT akan dump untuk sweep long stop, BUKAN bounce. Force SHORT."
+                ),
+                "priority": -20030
+            }
+        return {"override": False}
+
+
 class NoSellerNoBuyerOverride:
     """
     🔥 PRIORITY -20000: Jika down_energy == 0 → TIDAK ADA SELLER → LONG.
@@ -15206,6 +15250,24 @@ class BinanceAnalyzer:
             result["reason"] = f"[FAKE SQUEEZE] {fake_squeeze['reason']} | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = fake_squeeze["priority"]
+            return result
+        
+        # ===== PRIORITY -20030: CAPITULATION DUMP LONG LIQ CLOSE =====
+        cap_dump = CapitulationDumpLongLiqClose.detect(
+            change_5m=change_5m_val,
+            long_liq=long_liq,
+            down_energy=down_energy_val,
+            agg=agg_val,
+            obv_trend=obv_trend,
+            volume_ratio=volume_ratio,
+            rsi6_5m=rsi6_5m_val,
+            funding_rate=funding_rate_val
+        )
+        if cap_dump["override"]:
+            result["bias"] = cap_dump["bias"]
+            result["reason"] = f"[CAPITULATION DUMP] {cap_dump['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = cap_dump["priority"]
             return result
         
         # 0.2 Exhaustion Reversal Override (PRIORITY -19900)
