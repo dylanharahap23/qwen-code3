@@ -558,6 +558,117 @@ class LiquidityExtremeFalsePositiveGuard:
         
         return {"override": False}
 
+
+# ========== LECTURER'S SARAN: CROWDED LONG RSI5M EXTREME OVERBOUGHT TRAP ==========
+# PRIORITY -26500 (LEBIH TINGGI DARI LIQUIDITY EXTREME FALSE POSITIVE GUARD)
+# Kasus VELVETUSDT: LONG tapi dump 8% — tidak tertangkap guard lain karena market_phase = BAIT
+
+class CrowdedLongRSI5mExtremeOverboughtTrap:
+    """
+    PRIORITY -26500 (TERTINGGI ABSOLUT - di atas LiquidityExtremeFalsePositiveGuard):
+    
+    Pattern: Semua sinyal tampak LONG tapi ini adalah distribusi puncak.
+    
+    Kondisi yang TIDAK BISA DIPALSUKAN bersamaan:
+    1. funding_rate > 0.0005 (crowded LONG - data exchange)
+    2. greeks_who_dies_first = LONG_TRADERS (Greeks matematis)
+    3. greeks_delta_exposure > 0.85 (maximum crowding)
+    4. rsi6_5m > 80 (overbought di timeframe lebih besar = trend sudah habis)
+    5. greeks_kill_direction = SHORT
+    6. market_phase = BAIT (gerakan palsu)
+    
+    Sinyal yang TERLIHAT bullish tapi palsu:
+    - down_energy = 0 (HFT hapus bid untuk fake vacuum)
+    - agg = 1.00 (micro-trade spoofing)
+    - short_liq dekat (umpan untuk tarik LONG masuk)
+    - ofi = LONG kuat (order book spoofing)
+    
+    Prinsip: RSI 5m > 80 + crowded LONG + Greeks SHORT = 
+    tidak ada ruang naik, semua orang sudah LONG, akan dump.
+    short_liq yang "dekat" adalah umpan terakhir sebelum crash.
+    """
+    @staticmethod
+    def detect(
+        funding_rate: float,
+        greeks_who_dies_first: str,
+        greeks_delta_exposure: float,
+        greeks_kill_direction: str,
+        rsi6_5m: float,
+        rsi6: float,
+        market_phase: str,
+        down_energy: float,
+        agg: float,
+        volume_ratio: float,
+        short_liq: float,
+        long_liq: float,
+        ofi_strength: float
+    ) -> dict:
+        
+        if funding_rate is None:
+            return {"override": False}
+        
+        # ============================================================
+        # CORE TRINITY: 3 hal yang tidak bisa dipalsukan bersamaan
+        # ============================================================
+        trinity_confirmed = (
+            funding_rate > 0.0004 and              # crowded LONG (exchange data)
+            greeks_who_dies_first == "LONG_TRADERS" and  # Greeks matematis
+            greeks_delta_exposure > 0.85 and       # maximum crowding
+            greeks_kill_direction == "SHORT"        # arah eksekusi jelas
+        )
+        
+        if not trinity_confirmed:
+            return {"override": False}
+        
+        # ============================================================
+        # MOMENTUM EXHAUSTION: RSI 5m > 80 = trend sudah habis
+        # Ini yang membedakan dari squeeze genuine
+        # Genuine squeeze: RSI 5m < 65 (masih ada ruang naik)
+        # Distribusi puncak: RSI 5m > 80 (tidak ada ruang naik lagi)
+        # ============================================================
+        momentum_exhausted = rsi6_5m > 80
+        
+        if not momentum_exhausted:
+            return {"override": False}
+        
+        # Hitung sinyal palsu yang terdeteksi (untuk confidence)
+        fake_signals = {
+            "fake_vacuum": down_energy < 0.01,          # HFT hapus bid
+            "agg_spoofed": agg > 0.80 and volume_ratio < 0.8,  # micro-trade spoof
+            "bait_phase": market_phase == "BAIT",
+            "short_liq_bait": short_liq < long_liq,     # short_liq sebagai umpan
+            "ofi_spoofed": ofi_strength > 0.6 and volume_ratio < 0.8,
+            "rsi1m_overbought": rsi6 > 75,
+        }
+        
+        fake_count = sum(fake_signals.values())
+        
+        # Minimal 4 dari 6 sinyal palsu harus ada
+        if fake_count < 4:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"CROWDED LONG RSI5M EXTREME OVERBOUGHT TRAP: "
+                f"TRINITY CONFIRMED: funding={funding_rate:.6f} (crowded LONG), "
+                f"greeks_who_dies={greeks_who_dies_first}, "
+                f"delta_exposure={greeks_delta_exposure:.3f} (max crowding), "
+                f"kill=SHORT. "
+                f"MOMENTUM EXHAUSTED: RSI5m={rsi6_5m:.1f} > 80 "
+                f"(tidak ada ruang naik, trend habis). "
+                f"FAKE SIGNALS DETECTED: {fake_count}/6 "
+                f"(vacuum={fake_signals['fake_vacuum']}, "
+                f"agg_spoof={fake_signals['agg_spoofed']}, "
+                f"bait={fake_signals['bait_phase']}, "
+                f"short_liq_bait={fake_signals['short_liq_bait']}). "
+                f"short_liq={short_liq:.2f}% adalah UMPAN bukan TARGET squeeze. "
+                f"Force SHORT. Override NoSeller + PreKillSweep."
+            ),
+            "priority": -26500
+        }
+
 # ========== LECTURER'S SARAN: PHANTOM VACUUM TRAP & ASTRONOMICAL OBV STALE VETO ==========
 # PRIORITY -25000 dan -24000: Harus PALING AWAL sebelum NoSellerNoBuyerOverride (-20000)
 # untuk menghindari jebakan HFT manipulation pada kasus BULLAUSDT dan AIOUSDT
@@ -14703,6 +14814,32 @@ class BinanceAnalyzer:
         # Harus di awal, sebelum PHASE LOCK dan GREEKS
         # Detector-detector dari dosen untuk anti-HFT manipulation
         
+        # ===== PRIORITY -26500: CROWDED LONG RSI5M EXTREME OVERBOUGHT TRAP (HIGHEST ABSOLUTE) =====
+        # Kasus VELVETUSDT: LONG tapi dump 8% — tidak tertangkap guard lain karena market_phase = BAIT
+        # Pattern: crowded LONG + RSI5m extreme overbought + agg=1.00 spoofed + funding positive + Greeks SHORT
+        crowded_rsi5m_trap = CrowdedLongRSI5mExtremeOverboughtTrap.detect(
+            funding_rate=result.get("funding_rate", 0),
+            greeks_who_dies_first=result.get("greeks_who_dies_first", ""),
+            greeks_delta_exposure=result.get("greeks_delta_exposure", 0),
+            greeks_kill_direction=result.get("greeks_kill_direction", ""),
+            rsi6_5m=result.get("rsi6_5m", 50),
+            rsi6=result.get("rsi6", 50),
+            market_phase=result.get("market_phase", "UNKNOWN"),
+            down_energy=down_energy_val,
+            agg=agg_val,
+            volume_ratio=volume_ratio,
+            short_liq=short_liq,
+            long_liq=long_liq,
+            ofi_strength=ofi_strength
+        )
+        if crowded_rsi5m_trap["override"]:
+            result["bias"] = crowded_rsi5m_trap["bias"]
+            result["reason"] = f"[CROWDED RSI5M TRAP] {crowded_rsi5m_trap['reason']}"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = crowded_rsi5m_trap["priority"]
+            result["entry_allowed"] = True
+            return result
+
         # ===== PRIORITY -26000: LIQUIDITY EXTREME FALSE POSITIVE GUARD (HIGHEST ABSOLUTE) =====
         # Harus PERTAMA karena membatalkan _liquidity_extreme_override
         liq_extreme_direction = "LONG" if result.get("_liquidity_extreme_override") and result.get("bias") == "LONG" else \
