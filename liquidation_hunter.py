@@ -13210,6 +13210,58 @@ class UltraShortLiqSqueezeActiveGuard:
         }
 
 
+class CapitulationSqueezeOverride:
+    """
+    🔥 PRIORITY -20010: Deteksi kondisi capitulation + squeeze nyata
+    - OBV sangat negatif (stale, lagging indicator)
+    - Tapi real-time: agg > 0.9, ofi LONG, down_energy=0, price naik
+    - RSI 5m sangat oversold (<25) = capitulation di timeframe lebih besar
+    Force LONG, override Greeks kill direction.
+    
+    Kasus AKEUSDT:
+    - agg 1.00, ofi_bias LONG, ofi_strength 1.00, down_energy 0, change_5m 2.13%
+    - obv_trend NEGATIVE_EXTREME, obv_value -631M
+    - rsi6_5m 18 (< 25) = capitulation
+    Semua kondisi terpenuhi → override ke LONG dengan priority -20010
+    """
+    @staticmethod
+    def detect(agg: float, ofi_bias: str, ofi_strength: float,
+               down_energy: float, change_5m: float,
+               obv_trend: str, obv_value: float,
+               rsi6_5m: float, funding_rate: float,
+               short_liq: float, long_liq: float) -> dict:
+        
+        if funding_rate is None:
+            funding_rate = 0.0
+        
+        # Kondisi core: real-time bullish extreme
+        real_bullish = (agg > 0.85 and ofi_bias == "LONG" and ofi_strength > 0.7 
+                        and down_energy < 0.01 and change_5m > 0)
+        
+        # OBV sangat negatif (stale) - tanda capitulation di masa lalu
+        obv_stale = (obv_trend in ("NEGATIVE_EXTREME", "NEGATIVE") 
+                     and abs(obv_value) > 50_000_000)
+        
+        # RSI 5m oversold (capitulation di timeframe lebih besar)
+        rsi_capitulation = rsi6_5m < 25
+        
+        if real_bullish and obv_stale and rsi_capitulation:
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": (
+                    f"CAPITULATION SQUEEZE OVERRIDE: "
+                    f"agg={agg:.2f} (100% buy), OFI LONG {ofi_strength:.2f}, down_energy=0, "
+                    f"OBV={obv_trend} (stale/lagging), RSI5m={rsi6_5m:.1f} capitulation, "
+                    f"funding={funding_rate:.5f} → real-time squeeze aktif, "
+                    f"override Greeks kill direction. Force LONG."
+                ),
+                "priority": -20010
+            }
+        
+        return {"override": False}
+
+
 class LowVolumeFakePumpTrap:
     """
     🔥 BULLAUSDT EXACT PATTERN: Pump besar dengan volume kering = SELALU fake
@@ -15067,6 +15119,28 @@ class BinanceAnalyzer:
             result["reason"] = f"[NO SELLER/BUYER] {no_seller_buyer['reason']} | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = no_seller_buyer["priority"]
+            result["entry_allowed"] = True
+            return result
+        
+        # ===== PRIORITY -20010: CAPITULATION SQUEEZE OVERRIDE =====
+        capitulation_squeeze = CapitulationSqueezeOverride.detect(
+            agg=agg_val,
+            ofi_bias=result.get("ofi_bias", "NEUTRAL"),
+            ofi_strength=result.get("ofi_strength", 0.0),
+            down_energy=down_energy_val,
+            change_5m=change_5m_val,
+            obv_trend=obv_trend,
+            obv_value=obv_value,
+            rsi6_5m=rsi6_5m_val,
+            funding_rate=funding_rate_val,
+            short_liq=short_liq,
+            long_liq=long_liq
+        )
+        if capitulation_squeeze["override"]:
+            result["bias"] = capitulation_squeeze["bias"]
+            result["reason"] = f"[CAPITULATION SQUEEZE] {capitulation_squeeze['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = capitulation_squeeze["priority"]
             result["entry_allowed"] = True
             return result
         
