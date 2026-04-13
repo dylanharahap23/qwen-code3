@@ -1170,6 +1170,234 @@ class StochJOverflowShortLiqMicroSweepGuard:
         }
 
 
+# ========== LECTURER'S SARAN LOGIC: ULTRA LOW VOLUME AGG SPOOFING & FUNDING+DELTA+KILL ==========\n
+# PRIORITY -27000 dan -26950: Deteksi pattern VELVETUSDT "Low Volume Crowded Long Distribution"
+# Pattern paling licik: semua sinyal terlihat bullish tapi volume ultra-rendah (<15% MA10)
+
+class UltraLowVolumeAggSpoofingGuard:
+    """
+    🔥 PRIORITY -27000 (TERTINGGI ABSOLUT — lebih tinggi dari semua guard lain):
+    
+    VELVETUSDT PATTERN: Low Volume Crowded Long Distribution
+    
+    Ketika latest_volume < 15% dari volume_ma10 (ultra kering),
+    agg = 1.00 adalah PASTI manipulasi.
+    
+    Matematika sederhana:
+    - volume_ma10 = 135,703 (normal)
+    - latest_volume = 8,024 (hanya 5.9% dari normal)
+    - Untuk bikin agg = 1.00, HFT hanya perlu inject beberapa buy order kecil
+    - Biaya: sangat murah karena volume total sangat kecil
+    - Efek: sistem percaya "100% buy pressure" padahal itu micro-injection
+    
+    Genuine agg = 1.00 hanya bisa terjadi jika volume TINGGI (> 0.7x MA10)
+    
+    Kombinasi sinyal untuk SHORT:
+    - latest_volume < 15% dari volume_ma10 (ultra kering)
+    - agg > 0.85 (terlihat sangat bullish tapi tidak mungkin genuine)  
+    - funding_rate > 0 (crowded LONG)
+    - greeks_kill_direction = SHORT
+    - greeks_delta_crowded = LONG
+    - long_liq < short_liq * 2.5 (long liq tidak terlalu jauh)
+    
+    Priority: -27000 (TERTINGGI ABSOLUT)
+    """
+    ULTRA_DRY_RATIO = 0.15   # volume < 15% dari MA10 = ultra kering
+    
+    @staticmethod
+    def detect(latest_volume: float, volume_ma10: float, agg: float,
+               funding_rate: float, kill_direction: str, delta_crowded: str,
+               delta_exposure: float, long_liq: float, short_liq: float,
+               market_phase: str, rsi6: float, rsi6_5m: float,
+               down_energy: float) -> dict:
+        
+        if volume_ma10 <= 0 or funding_rate is None:
+            return {"override": False}
+        
+        # Hitung real volume ratio
+        real_ratio = latest_volume / volume_ma10
+        
+        # Volume harus ultra kering
+        if real_ratio >= UltraLowVolumeAggSpoofingGuard.ULTRA_DRY_RATIO:
+            return {"override": False}
+        
+        # agg harus tinggi (terlihat bullish)
+        if agg < 0.80:
+            return {"override": False}
+        
+        # Funding harus positif (crowded LONG)
+        if funding_rate <= 0:
+            return {"override": False}
+        
+        # Greeks harus kill SHORT (LONG yang akan mati)
+        if kill_direction != "SHORT" or delta_crowded != "LONG":
+            return {"override": False}
+        
+        # Delta exposure harus tinggi (banyak LONG yang terperangkap)
+        if delta_exposure < 0.7:
+            return {"override": False}
+        
+        # down_energy harus nol (ini yang bikin NoSeller trigger)
+        if down_energy >= 0.1:
+            return {"override": False}
+        
+        # long_liq harus ada (ada target dump)
+        if long_liq <= 0 or long_liq > 10:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "cancel_no_seller_override": True,
+            "cancel_pre_kill_sweep": True,
+            "reason": (
+                f"ULTRA LOW VOLUME AGG SPOOFING: "
+                f"latest_volume={latest_volume:,.0f} vs MA10={volume_ma10:,.0f} "
+                f"(real_ratio={real_ratio:.3f} = {real_ratio*100:.1f}% dari normal, "
+                f"jauh di bawah threshold 15%), "
+                f"agg={agg:.2f} adalah MANIPULASI (HFT inject micro-buy dengan biaya murah), "
+                f"funding={funding_rate:.6f} (crowded LONG), "
+                f"delta_exposure={delta_exposure:.3f} ({delta_exposure*100:.0f}% LONG terperangkap), "
+                f"kill=SHORT, down_energy=0 (palsu — tidak ada seller karena volume kosong). "
+                f"long_liq={long_liq:.2f}% adalah target dump. "
+                f"Force SHORT. Cancel NoSeller dan PreKillSweep."
+            ),
+            "priority": -27000
+        }
+
+
+class FundingPositiveDeltaExposureHighShortKill:
+    """
+    🔥 PRIORITY -26950: FUNDING+DELTA+KILL CONVERGENCE
+    
+    Kondisi paling fundamental untuk SHORT:
+    1. funding_rate > 0 (ada yang bayar LONG, berarti LONG lebih banyak)
+    2. delta_exposure > 0.8 (88%+ crowding LONG)
+    3. kill_direction = SHORT (Greeks sudah committed)
+    4. long_liq < 5% (ada target dump yang reachable)
+    5. market_phase = BAIT (gerakan sekarang adalah fake)
+    6. real_volume_ratio < 0.2 (volume sangat kering = HFT control penuh)
+    
+    Jika SEMUA 6 kondisi ini terpenuhi, tidak ada alasan untuk LONG.
+    Force SHORT tanpa pengecualian.
+    
+    Priority: -26950
+    """
+    @staticmethod
+    def detect(funding_rate: float, delta_exposure: float, kill_direction: str,
+               long_liq: float, market_phase: str, latest_volume: float,
+               volume_ma10: float, agg: float, down_energy: float,
+               rsi6: float) -> dict:
+        
+        if funding_rate is None or volume_ma10 <= 0:
+            return {"override": False}
+        
+        real_ratio = latest_volume / volume_ma10
+        
+        conditions = {
+            "funding_positive": funding_rate > 0,
+            "delta_exposure_high": delta_exposure > 0.8,
+            "kill_short": kill_direction == "SHORT",
+            "long_liq_reachable": 0 < long_liq < 5.0,
+            "bait_phase": market_phase == "BAIT",
+            "volume_ultra_dry": real_ratio < 0.2,
+        }
+        
+        # Semua 6 harus terpenuhi
+        if not all(conditions.values()):
+            return {"override": False}
+        
+        triggered = [k for k, v in conditions.items() if v]
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"FUNDING+DELTA+KILL CONVERGENCE: "
+                f"funding={funding_rate:.6f} (LONG membayar), "
+                f"delta_exposure={delta_exposure:.3f} ({delta_exposure*100:.0f}% LONG crowded), "
+                f"kill=SHORT (Greeks committed), "
+                f"long_liq={long_liq:.2f}% (target dump reachable), "
+                f"phase=BAIT (gerakan sekarang palsu), "
+                f"real_vol={real_ratio:.3f} ({real_ratio*100:.1f}% dari normal = HFT control penuh). "
+                f"6/6 kondisi SHORT terpenuhi. "
+                f"Cancel semua LONG signal. Force SHORT."
+            ),
+            "priority": -26950
+        }
+
+
+class PreKillSweepDirectionFix:
+    """
+    🔥 PRIORITY -26800: PRE-KILL SWEEP DIRECTION FIX
+    
+    Bug saat ini: PRE-KILL SWEEP logic selalu arahkan ke LONG
+    ketika short_liq dekat, meskipun kill_direction = SHORT.
+    
+    Padahal PRE-KILL SWEEP yang benar:
+    - Jika kill_direction = LONG → harga naik dulu sweep short_liq → LONG
+    - Jika kill_direction = SHORT → harga TURUN dulu sweep long_liq → SHORT
+    
+    VELVETUSDT case:
+    - short_liq = 1.11% (dekat)
+    - long_liq = 2.14% (lebih jauh tapi lebih valuable)
+    - kill_direction = SHORT
+    - delta_crowded = LONG
+    
+    Sistem bilang: "short_liq dekat → naik dulu (LONG)"
+    Kenyataan: "kill = SHORT → turun untuk sweep long_liq"
+    
+    Fix: cek kill_direction sebelum menentukan arah PRE-KILL SWEEP
+    """
+    @staticmethod
+    def get_correct_pre_kill_direction(short_liq: float, long_liq: float,
+                                        kill_direction: str, delta_crowded: str,
+                                        delta_exposure: float, funding_rate: float) -> dict:
+        
+        if funding_rate is None:
+            funding_rate = 0.0
+        
+        # Jika kill_direction = SHORT dan delta_crowded = LONG
+        # → yang akan mati adalah LONG traders
+        # → harga akan turun untuk sweep long_liq
+        # → PRE-KILL bias harus SHORT
+        if (kill_direction == "SHORT" and 
+            delta_crowded == "LONG" and
+            delta_exposure > 0.7):
+            
+            return {
+                "correct_direction": "SHORT",
+                "sweep_target": long_liq,
+                "reason": (
+                    f"PRE-KILL DIRECTION CORRECTED: "
+                    f"kill={kill_direction}, delta=LONG ({delta_exposure:.2f}), "
+                    f"target sweep = long_liq={long_liq:.2f}% (TURUN). "
+                    f"Bukan short_liq={short_liq:.2f}% (naik). "
+                    f"LONG yang akan mati, bukan SHORT."
+                )
+            }
+        
+        # Jika kill_direction = LONG dan delta_crowded = SHORT
+        # → yang akan mati adalah SHORT traders
+        # → harga akan naik untuk sweep short_liq
+        # → PRE-KILL bias harus LONG (ini yang benar)
+        if (kill_direction == "LONG" and
+            delta_crowded == "SHORT" and
+            delta_exposure > 0.7):
+            
+            return {
+                "correct_direction": "LONG",
+                "sweep_target": short_liq,
+                "reason": (
+                    f"PRE-KILL DIRECTION CONFIRMED: "
+                    f"kill={kill_direction}, delta=SHORT ({delta_exposure:.2f}), "
+                    f"target sweep = short_liq={short_liq:.2f}% (NAIK). Benar."
+                )
+            }
+        
+        return {"correct_direction": None, "reason": "Ambiguous"}
+
+
 class NoSellerNoBuyerOverride:
     """
     🔥 PRIORITY -20000: Jika down_energy == 0 → TIDAK ADA SELLER → LONG.
@@ -1197,7 +1425,19 @@ class NoSellerNoBuyerOverride:
                ofi_bias: str = "NEUTRAL",
                ofi_strength: float = 0.0,
                rsi6: float = 50.0,
-               rsi6_5m: float = 50.0) -> dict:
+               rsi6_5m: float = 50.0,
+               # ===== REAL VOLUME GATE (LECTURER SARAN LOGIC) =====
+               latest_volume: float = 0,
+               volume_ma10: float = 1) -> dict:
+        
+        # ========== REAL VOLUME GATE (LECTURER SARAN LOGIC) ==========
+        # Jika volume ultra kering (<15% MA10), down_energy = 0 bukan berarti "tidak ada seller"
+        # melainkan "tidak ada siapapun yang trading" — HFT bisa gerakkan harga dengan biaya murah
+        if volume_ma10 > 0 and down_energy < 0.01:
+            real_ratio = latest_volume / volume_ma10
+            if real_ratio < 0.15 and funding_rate > 0:
+                # Volume terlalu kering untuk percaya no-seller signal
+                return {"override": False}
         
         # ========== GUARD: OFI SHORT kuat + harga turun = BLOCK LONG override ==========
         if down_energy < 0.01:
@@ -15381,6 +15621,53 @@ class BinanceAnalyzer:
         # Harus di awal, sebelum PHASE LOCK dan GREEKS
         # Detector-detector dari dosen untuk anti-HFT manipulation
         
+        # ===== PRIORITY -27000: ULTRA LOW VOLUME AGG SPOOFING (TERTINGGI BARU) =====
+        # Kasus VELVETUSDT: volume ultra-kering (5.9% MA10), agg=1.00 spoofed, crowded LONG → dump
+        ultra_low_vol = UltraLowVolumeAggSpoofingGuard.detect(
+            latest_volume=result.get("latest_volume", 0),
+            volume_ma10=result.get("volume_ma10", 1),
+            agg=agg_val,
+            funding_rate=funding_rate_val,
+            kill_direction=result.get("greeks_kill_direction", ""),
+            delta_crowded=result.get("greeks_delta_crowded", ""),
+            delta_exposure=result.get("greeks_delta_exposure", 0),
+            long_liq=long_liq,
+            short_liq=short_liq,
+            market_phase=result.get("market_phase", "UNKNOWN"),
+            rsi6=rsi6_val,
+            rsi6_5m=rsi6_5m_val,
+            down_energy=down_energy_val
+        )
+        if ultra_low_vol["override"]:
+            result["bias"] = ultra_low_vol["bias"]
+            result["reason"] = f"[ULTRA LOW VOL AGG SPOOF] {ultra_low_vol['reason']}"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = ultra_low_vol["priority"]
+            result["entry_allowed"] = True
+            return result
+        
+        # ===== PRIORITY -26950: FUNDING+DELTA+KILL CONVERGENCE =====
+        # 6 kondisi fundamental SHORT: funding+, delta>0.8, kill=SHORT, long_liq<5%, BAIT, vol<0.2x
+        fund_delta_kill = FundingPositiveDeltaExposureHighShortKill.detect(
+            funding_rate=funding_rate_val,
+            delta_exposure=result.get("greeks_delta_exposure", 0),
+            kill_direction=result.get("greeks_kill_direction", ""),
+            long_liq=long_liq,
+            market_phase=result.get("market_phase", "UNKNOWN"),
+            latest_volume=result.get("latest_volume", 0),
+            volume_ma10=result.get("volume_ma10", 1),
+            agg=agg_val,
+            down_energy=down_energy_val,
+            rsi6=rsi6_val
+        )
+        if fund_delta_kill["override"]:
+            result["bias"] = fund_delta_kill["bias"]
+            result["reason"] = f"[FUND DELTA KILL] {fund_delta_kill['reason']}"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = fund_delta_kill["priority"]
+            result["entry_allowed"] = True
+            return result
+        
         # ===== PRIORITY -26900: LIQUIDITY RATIO MAX PAIN V2 (HIGHEST ABSOLUTE) =====
         # Kasus BASEDUSDT: long_liq >> short_liq dengan ratio ekstrem + crowded LONG
         liq_ratio_v2 = LiquidityRatioMaxPainV2.detect(
@@ -15584,7 +15871,10 @@ class BinanceAnalyzer:
             ofi_bias=result.get("ofi_bias", "NEUTRAL"),
             ofi_strength=result.get("ofi_strength", 0.0),
             rsi6=rsi6_val,           # 🔥 LECTURER FIX: tambah rsi6
-            rsi6_5m=rsi6_5m_val      # 🔥 LECTURER FIX: tambah rsi6_5m
+            rsi6_5m=rsi6_5m_val,     # 🔥 LECTURER FIX: tambah rsi6_5m
+            # ===== REAL VOLUME GATE (LECTURER SARAN LOGIC) =====
+            latest_volume=result.get("latest_volume", 0),
+            volume_ma10=result.get("volume_ma10", 1)
         )
         if no_seller_buyer["override"]:
             result["bias"] = no_seller_buyer["bias"]
