@@ -813,7 +813,9 @@ class NoSellerNoBuyerOverride:
                funding_rate: float = 0.0,
                # ===== NEW PARAMETERS =====
                ofi_bias: str = "NEUTRAL",
-               ofi_strength: float = 0.0) -> dict:
+               ofi_strength: float = 0.0,
+               rsi6: float = 50.0,
+               rsi6_5m: float = 50.0) -> dict:
         
         # ========== GUARD: OFI SHORT kuat + harga turun = BLOCK LONG override ==========
         if down_energy < 0.01:
@@ -846,6 +848,13 @@ class NoSellerNoBuyerOverride:
                 volume_ratio < 0.7 and
                 greeks_kill_direction == "LONG" and
                 funding_rate < -0.0003):
+                return {"override": False}
+        
+        # 🔥 LECTURER FIX: GUARD untuk exhausted squeeze - short liq sudah terlewati
+        # Jika short_liq sudah tersapu dan kondisi overbought dengan volume rendah, jangan paksa LONG
+        if down_energy < 0.01:
+            if (short_liq < 2.0 and change_5m > short_liq * 1.2 and
+                (rsi6 > 85 or rsi6_5m > 85) and volume_ratio < 0.6):
                 return {"override": False}
         
         # KASUS down_energy == 0 (tidak ada seller)
@@ -1019,9 +1028,16 @@ class VacuumContinuationOverride:
     def detect(down_energy: float, up_energy: float,
                agg: float, change_5m: float,
                obv_trend: str = "NEUTRAL",
-               long_liq: float = 99.0) -> dict:
+               long_liq: float = 99.0,
+               short_liq: float = 99.0,
+               rsi6_5m: float = 50.0,
+               volume_ratio: float = 1.0) -> dict:
         # Tidak ada seller + agg tinggi + harga naik (atau flat) → continuation LONG
         if down_energy < 0.01 and agg > 0.7 and change_5m > -1.0:
+            # 🔥 LECTURER FIX: GUARD untuk exhausted squeeze - short liq sudah terlewati
+            if (short_liq < 2.0 and change_5m > short_liq * 1.2 and
+                rsi6_5m > 85 and volume_ratio < 0.6):
+                return {"override": False}
             # GUARD: Jika OBV negatif ekstrem dan long_liq dekat, jangan paksa LONG
             if obv_trend in ("NEGATIVE_EXTREME", "NEGATIVE") and long_liq < 2.0:
                 return {"override": False}
@@ -1033,6 +1049,10 @@ class VacuumContinuationOverride:
             }
         # Tidak ada buyer + agg rendah + harga turun → continuation SHORT
         if up_energy < 0.01 and agg < 0.3 and change_5m < 1.0:
+            # 🔥 LECTURER FIX: GUARD untuk exhausted squeeze - long liq sudah terlewati
+            if (long_liq < 2.0 and change_5m < -long_liq * 1.2 and
+                rsi6_5m < 15 and volume_ratio < 0.6):
+                return {"override": False}
             return {
                 "override": True,
                 "bias": "SHORT",
@@ -13084,7 +13104,11 @@ class ExhaustedSqueezePostSweep:
         rsi_extreme = rsi6 > 90 or rsi6_5m > 85
         
         # OBV tidak confirm (pump palsu, tidak ada akumulasi nyata)
-        obv_not_confirm = obv_trend not in ("POSITIVE_EXTREME",)
+        # 🔥 LECTURER FIX: Jika volume sangat rendah (<0.5x), OBV positif ekstrem adalah stale
+        obv_not_confirm = (
+            obv_trend not in ("POSITIVE_EXTREME",) or
+            (obv_trend == "POSITIVE_EXTREME" and volume_ratio < 0.5)
+        )
         
         # Volume rendah (tidak ada buyer baru yang masuk)
         low_volume = volume_ratio < 0.9
@@ -15034,7 +15058,9 @@ class BinanceAnalyzer:
             funding_rate=result.get("funding_rate", 0.0),                    # ← dari result
             # ===== NEW PARAMETERS =====
             ofi_bias=result.get("ofi_bias", "NEUTRAL"),
-            ofi_strength=result.get("ofi_strength", 0.0)
+            ofi_strength=result.get("ofi_strength", 0.0),
+            rsi6=rsi6_val,           # 🔥 LECTURER FIX: tambah rsi6
+            rsi6_5m=rsi6_5m_val      # 🔥 LECTURER FIX: tambah rsi6_5m
         )
         if no_seller_buyer["override"]:
             result["bias"] = no_seller_buyer["bias"]
@@ -15089,7 +15115,10 @@ class BinanceAnalyzer:
             agg=agg_val,
             change_5m=change_5m_val,
             obv_trend=obv_trend,      # tambah
-            long_liq=long_liq         # tambah
+            long_liq=long_liq,         # tambah
+            short_liq=short_liq,      # 🔥 LECTURER FIX: tambah short_liq
+            rsi6_5m=rsi6_5m_val,      # 🔥 LECTURER FIX: tambah rsi6_5m
+            volume_ratio=volume_ratio  # 🔥 LECTURER FIX: tambah volume_ratio
         )
         if vacuum["override"]:
             result["bias"] = vacuum["bias"]
