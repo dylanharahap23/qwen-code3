@@ -800,6 +800,8 @@ class NoSellerNoBuyerOverride:
     
     🛡️ KILL PHASE GUARD: Jangan paksa LONG/SHORT jika bertentangan dengan Greeks dan liquidity proximity.
        - Jika KILL phase + greeks_kill_direction jelas + liq lebih dekat mendukung Greeks + funding crowded → override NoSeller/NoBuyer
+       
+    🛡️ NEW: BLOCK NoSeller/NoBuyer jika bertentangan dengan Greeks kill direction dan BAIT phase.
     """
     @staticmethod
     def detect(down_energy: float, up_energy: float,
@@ -809,6 +811,24 @@ class NoSellerNoBuyerOverride:
                gamma_executing: bool,
                greeks_kill_direction: str = "",
                funding_rate: float = 0.0) -> dict:
+        
+        # ========== NEW GUARD: Jangan override jika Greeks kill direction bertentangan ==========
+        # Kondisi: BAIT phase + volume rendah + funding positif (crowded long) + kill_direction SHORT
+        # maka NO SELLER override ke LONG adalah jebakan. Kita block override.
+        if down_energy < 0.01:
+            if (market_phase == "BAIT" and
+                volume_ratio < 0.7 and
+                greeks_kill_direction == "SHORT" and
+                funding_rate > 0.0003):
+                # Jangan paksa LONG, biarkan Greeks atau detector lain yang menentukan
+                return {"override": False}
+        
+        if up_energy < 0.01:
+            if (market_phase == "BAIT" and
+                volume_ratio < 0.7 and
+                greeks_kill_direction == "LONG" and
+                funding_rate < -0.0003):
+                return {"override": False}
         
         # KASUS down_energy == 0 (tidak ada seller)
         if down_energy < 0.01:
