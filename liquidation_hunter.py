@@ -916,6 +916,70 @@ class NoSellerNoBuyerOverride:
         return {"override": False}
 
 
+class LiquidityRegimeSwitcher:
+    """
+    🔥 LIQUIDITY REGIME SWITCHING - Priority -19950
+    Membedakan regime:
+    - DISTRIBUTION TRAP (SHORT): long_liq dekat + OBV negatif ekstrem + volume kering + funding positif
+    - DIP THEN RIP (LONG): long_liq dekat + OBV tidak negatif + buy pressure
+    - SHORT SQUEEZE (LONG): short_liq dekat + OBV tidak negatif + funding negatif
+    """
+    @staticmethod
+    def detect(long_liq: float, short_liq: float,
+               obv_trend: str, obv_value: float,
+               agg: float, up_energy: float, down_energy: float,
+               funding_rate: float, volume_ratio: float,
+               rsi6: float, rsi6_5m: float,
+               market_phase: str) -> dict:
+        
+        if funding_rate is None:
+            funding_rate = 0.0
+        
+        # ===== REGIME 1: DISTRIBUTION TRAP (SHORT) =====
+        if (long_liq < 2.0 and long_liq < short_liq and
+            obv_trend in ("NEGATIVE_EXTREME", "NEGATIVE") and
+            obv_value < -20_000_000 and
+            volume_ratio < 0.6 and
+            agg > 0.7 and
+            funding_rate > 0.0003 and
+            rsi6_5m < 60 and
+            down_energy < 0.1):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"REGIME: DISTRIBUTION TRAP. long_liq={long_liq:.2f}%, OBV={obv_trend}, volume kering, funding positif → HFT dump, SHORT",
+                "priority": -19950
+            }
+        
+        # ===== REGIME 2: DIP THEN RIP (LONG) =====
+        if (long_liq < 2.0 and long_liq < short_liq and
+            obv_trend not in ("NEGATIVE_EXTREME", "NEGATIVE") and
+            agg > 0.7 and up_energy > 0.1 and down_energy < 0.01 and
+            (funding_rate > 0.0002 or rsi6_5m > 40) and
+            rsi6 > 10):  # threshold rendah untuk mencakup ONUSDT (RSI=12.6)
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": f"REGIME: DIP THEN RIP. long_liq={long_liq:.2f}%, OBV tidak bearish, buy pressure → HFT sweep lalu pump, LONG",
+                "priority": -19950
+            }
+        
+        # ===== REGIME 3: SHORT SQUEEZE (LONG) =====
+        if (short_liq < 2.0 and short_liq < long_liq and
+            obv_trend not in ("NEGATIVE_EXTREME", "NEGATIVE") and
+            agg > 0.7 and up_energy > 0.1 and
+            funding_rate < -0.0003 and
+            rsi6_5m < 75):
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": f"REGIME: SHORT SQUEEZE. short_liq={short_liq:.2f}%, funding negatif, buy pressure → LONG",
+                "priority": -19950
+            }
+        
+        return {"override": False}
+
+
 class ExhaustionReversalOverride:
     """
     🔥 PRIORITY -19900: Deteksi exhaustion dump/pump tanpa volume.
@@ -948,12 +1012,19 @@ class VacuumContinuationOverride:
     """
     🔥 PRIORITY -19800: Jika tidak ada seller tapi agg bullish → continuation LONG.
        Jika tidak ada buyer tapi agg bearish → continuation SHORT.
+       
+    🛡️ GUARD: Jangan override jika OBV negatif ekstrem dan long_liq dekat (Distribution Trap pattern)
     """
     @staticmethod
     def detect(down_energy: float, up_energy: float,
-               agg: float, change_5m: float) -> dict:
+               agg: float, change_5m: float,
+               obv_trend: str = "NEUTRAL",
+               long_liq: float = 99.0) -> dict:
         # Tidak ada seller + agg tinggi + harga naik (atau flat) → continuation LONG
         if down_energy < 0.01 and agg > 0.7 and change_5m > -1.0:
+            # GUARD: Jika OBV negatif ekstrem dan long_liq dekat, jangan paksa LONG
+            if obv_trend in ("NEGATIVE_EXTREME", "NEGATIVE") and long_liq < 2.0:
+                return {"override": False}
             return {
                 "override": True,
                 "bias": "LONG",
@@ -14988,12 +15059,37 @@ class BinanceAnalyzer:
             result["entry_allowed"] = True
             return result
         
+        # ===== PRIORITY -19950: LIQUIDITY REGIME SWITCHING =====
+        regime_switch = LiquidityRegimeSwitcher.detect(
+            long_liq=long_liq,
+            short_liq=short_liq,
+            obv_trend=obv_trend,
+            obv_value=obv_value,
+            agg=agg_val,
+            up_energy=up_energy_val,
+            down_energy=down_energy_val,
+            funding_rate=funding_rate_val,
+            volume_ratio=volume_ratio,
+            rsi6=rsi6_val,
+            rsi6_5m=rsi6_5m_val,
+            market_phase=market_phase
+        )
+        if regime_switch["override"]:
+            result["bias"] = regime_switch["bias"]
+            result["reason"] = f"[REGIME SWITCH] {regime_switch['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = regime_switch["priority"]
+            result["entry_allowed"] = True
+            return result
+        
         # 0.3 Vacuum Continuation Override (PRIORITY -19800)
         vacuum = VacuumContinuationOverride.detect(
             down_energy=down_energy_val,
             up_energy=up_energy_val,
             agg=agg_val,
-            change_5m=change_5m_val
+            change_5m=change_5m_val,
+            obv_trend=obv_trend,      # tambah
+            long_liq=long_liq         # tambah
         )
         if vacuum["override"]:
             result["bias"] = vacuum["bias"]
