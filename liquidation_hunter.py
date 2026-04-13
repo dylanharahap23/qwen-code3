@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-🔥 BINANCE LIQUIDATION HUNTER - ULTIMATE EDITION v9 (LECTURER'S SARAN LOGIC)
+🔥 BINANCE LIQUIDATION HUNTER - ULTIMATE EDITION v10 (LECTURER'S SARAN LOGIC + FAKE SQUEEZE BAIT TRAP)
 🎯 Integrated: Liquidity Magnet Continuation, OFI Absorption Squeeze, Velocity Decay Reversal
 🎯 Priority Ladder: MasterSqueezeRule (-1100) > LiquidityMagnet (-1000) > OFIAbsorption (-950) > VelocityDecay (-900) > EmptyBook (-850)
 🎯 Golden Rule: LONG UNTIL SHORT LIQ SWEPT / SHORT UNTIL LONG LIQ SWEPT
 🎯 Market Phase Detector: PREP (no trade) | BAIT (caution) | KILL (trade ok)
 🎯 Greeks Final Screener: Theta (Prep) | Vega (Bait) | Delta+Gamma (Kill) — 7% Rule
+🎯 NEW: FakeSqueezeBaitTrap (-20050): Deteksi jebakan short squeeze palsu di BAIT phase (VELVETUSDT pattern)
 """
 
 import requests
@@ -1168,6 +1169,61 @@ class StochJOverflowShortLiqMicroSweepGuard:
             ),
             "priority": -26600
         }
+
+
+class FakeSqueezeBaitTrap:
+    """
+    🔥 PRIORITY -20050: Deteksi jebakan short squeeze palsu di BAIT phase.
+    
+    Pola VELVETUSDT:
+    - BAIT phase
+    - short_liq < 1.5% (umpan)
+    - down_energy = 0 (bid kosong)
+    - agg > 0.85 (100% micro-buy trades – spoofed)
+    - funding_rate > 0.0001 (crowded LONG → korban)
+    - greeks_kill_direction == "SHORT"
+    - greeks_who_dies_first in ("BOTH_POSSIBLE", "") → arah belum fix
+    - volume_ratio < 1.2 (tidak perlu super rendah)
+    - change_5m < 2.0% (belum pump besar)
+    
+    Output: FORCE SHORT, blokir semua LONG.
+    """
+    @staticmethod
+    def detect(market_phase: str, short_liq: float, long_liq: float,
+               down_energy: float, agg: float, funding_rate: float,
+               greeks_kill_direction: str, greeks_who_dies_first: str,
+               volume_ratio: float, change_5m: float) -> dict:
+        
+        if funding_rate is None:
+            return {"override": False}
+        
+        # Kondisi utama
+        if (market_phase == "BAIT" and
+            short_liq < 1.5 and
+            short_liq < long_liq and
+            down_energy < 0.01 and
+            agg > 0.85 and
+            funding_rate > 0.0001 and
+            greeks_kill_direction == "SHORT" and
+            greeks_who_dies_first in ("BOTH_POSSIBLE", "", "UNCLEAR") and
+            volume_ratio < 1.2 and
+            abs(change_5m) < 2.0):
+            
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"FAKE SQUEEZE BAIT TRAP (VELVET pattern): "
+                    f"BAIT phase, short_liq={short_liq:.2f}% umpan, "
+                    f"down_energy=0, agg={agg:.2f} (spoofed buys), "
+                    f"funding={funding_rate:.5f} crowded LONG, "
+                    f"Greeks kill=SHORT, who_dies={greeks_who_dies_first} → "
+                    f"HFT akan dump untuk likuidasi LONG, bukan squeeze. "
+                    f"Force SHORT, block NoSellerNoBuyerOverride."
+                ),
+                "priority": -20050
+            }
+        return {"override": False}
 
 
 class NoSellerNoBuyerOverride:
@@ -15567,6 +15623,28 @@ class BinanceAnalyzer:
             result["entry_allowed"] = True
             return result
         
+        # ===== PRIORITY -20050: FAKE SQUEEZE BAIT TRAP (VELVET pattern) =====
+        # Deteksi jebakan short squeeze palsu di BAIT phase
+        fake_squeeze_bait = FakeSqueezeBaitTrap.detect(
+            market_phase=market_phase,
+            short_liq=short_liq,
+            long_liq=long_liq,
+            down_energy=down_energy_val,
+            agg=agg_val,
+            funding_rate=funding_rate_val,
+            greeks_kill_direction=result.get("greeks_kill_direction", ""),
+            greeks_who_dies_first=result.get("greeks_who_dies_first", ""),
+            volume_ratio=volume_ratio,
+            change_5m=change_5m_val
+        )
+        if fake_squeeze_bait["override"]:
+            result["bias"] = fake_squeeze_bait["bias"]
+            result["reason"] = f"[FAKE SQUEEZE BAIT] {fake_squeeze_bait['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = fake_squeeze_bait["priority"]
+            result["entry_allowed"] = True
+            return result
+        
         # 0.1 No Seller / No Buyer Override (PRIORITY -20000)
         no_seller_buyer = NoSellerNoBuyerOverride.detect(
             down_energy=down_energy_val,
@@ -20351,6 +20429,18 @@ class BinanceAnalyzer:
                     
                     elif volume_ratio < 0.6 and (rsi6 < 20 or rsi6 > 80):
                         final_reason += f" | Low cap but extreme RSI6 ({rsi6:.1f}) → skip liquidity override"
+                    
+                    # 🔥 LECTURER FIX: Fake Squeeze Bait Trap Guard untuk Low Cap Mode
+                    # Jika market_phase == BAIT + short_liq dekat + down_energy=0 + agg tinggi + funding positif + Greeks SHORT
+                    # maka JANGAN paksa LONG meskipun short_liq lebih dekat
+                    elif (market_phase == "BAIT" and
+                          liq["short_dist"] < 1.5 and
+                          down_energy < 0.01 and
+                          hft_6pct.get("agg", 0) > 0.85 and
+                          funding_crowded_long and
+                          kill_direction == "SHORT"):
+                        final_reason += f" | Low cap GUARD: fake squeeze bait detected (BAIT phase, short_liq={liq['short_dist']:.2f}%, down_energy=0, agg spoofed, funding positive, Greeks SHORT) → skip liquidity override"
+                        # Jangan ubah final_bias, biarkan detector lain yang menentukan
                     
                     else:
                         if liq["short_dist"] < liq["long_dist"]:
