@@ -669,6 +669,221 @@ class CrowdedLongRSI5mExtremeOverboughtTrap:
             "priority": -26500
         }
 
+# ========== LECTURER'S SARAN: ARIAUSDT PATTERN DETECTORS (HIGHEST PRIORITY) ==========
+# PRIORITY -27800 to -27550: Must be BEFORE PhantomVacuumTrap (-25000) and NoSellerNoBuyerOverride (-20000)
+# These detect the exact ARIAUSDT manipulation pattern: manufactured vacuum + crowded LONG + HFT SHORT consensus
+
+class OBVNegativeAlgoHFTConsensusShortGuard:
+    """
+    ARIAUSDT EXACT PATTERN — PRIORITY -27800 (TERTINGGI ABSOLUT BARU):
+    
+    OBV NEGATIVE_EXTREME + algo_type=SHORT + hft_6pct=SHORT + down_energy=0
+    + delta_exposure > 0.75 + long_liq < short_liq
+    
+    Ini adalah "manufactured vacuum" — HFT hapus semua bid untuk pancing
+    NO SELLER rule, padahal semua orang sudah LONG dan distribusi aktif.
+    
+    DOWN_ENERGY=0 di sini BUKAN berarti tidak ada seller.
+    Artinya HFT sudah TARIK semua bid dari order book secara sengaja.
+    
+    Bukti: algo_type DAN hft_6pct keduanya SHORT (mereka yang paling
+    dekat dengan data — jika keduanya SHORT, percayai mereka, bukan OBV/energy).
+    """
+    @staticmethod
+    def detect(obv_trend: str, obv_value: float,
+               algo_type_bias: str, hft_6pct_bias: str,
+               down_energy: float, delta_exposure: float,
+               long_liq: float, short_liq: float,
+               volume_ratio: float, funding_rate: float) -> dict:
+        
+        if funding_rate is None:
+            funding_rate = 0.0
+        
+        # OBV harus negatif (distribusi aktif)
+        if obv_trend not in ("NEGATIVE_EXTREME", "NEGATIVE"):
+            return {"override": False}
+        
+        # Algo dan HFT keduanya harus SHORT (mereka tidak bisa dimanipulasi)
+        if algo_type_bias != "SHORT" or hft_6pct_bias != "SHORT":
+            return {"override": False}
+        
+        # down_energy = 0 = manufactured vacuum (bukan genuine)
+        if down_energy >= 0.1:
+            return {"override": False}
+        
+        # delta_exposure tinggi = mayoritas posisi sudah LONG
+        if delta_exposure < 0.70:
+            return {"override": False}
+        
+        # long_liq harus lebih dekat dari short_liq
+        if long_liq >= short_liq:
+            return {"override": False}
+        
+        # long_liq harus dalam range terjangkau
+        if long_liq > 5.0:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"OBV NEGATIVE + ALGO+HFT CONSENSUS SHORT + MANUFACTURED VACUUM: "
+                f"OBV={obv_trend} ({obv_value:,.0f}) distribusi aktif, "
+                f"algo={algo_type_bias} + hft={hft_6pct_bias} (keduanya SHORT), "
+                f"down_energy={down_energy:.3f} (HFT tarik bid = fake vacuum), "
+                f"delta_exposure={delta_exposure:.3f} ({delta_exposure*100:.0f}% posisi LONG akan diliquidasi), "
+                f"long_liq={long_liq:.2f}% < short_liq={short_liq:.2f}% → "
+                f"HFT manufactured 'no seller' untuk pancing LONG masuk. "
+                f"Force SHORT, cancel NO SELLER override."
+            ),
+            "priority": -27800,
+            "cancel_no_seller_override": True
+        }
+
+
+class FundingNegativeButCrowdedLongContradiction:
+    """
+    ARIAUSDT SECOND INSIGHT: funding negatif (-0.018) tapi delta_exposure 0.81
+    
+    Ini kontradiksi matematis yang sinyal kuat distribusi:
+    - Funding negatif = harusnya crowded SHORT
+    - Tapi delta_exposure 0.81 = 81% posisi LONG
+    
+    Artinya: funding negatif ini adalah LAGGING indicator dari
+    kondisi beberapa jam lalu. Saat ini kondisi sudah berubah —
+    semua orang balik ke LONG, dan HFT akan dump mereka.
+    
+    Konfirmasi: OBV negatif + algo SHORT + hft SHORT
+    """
+    @staticmethod
+    def detect(funding_rate: float, delta_exposure: float,
+               obv_trend: str, algo_type_bias: str,
+               hft_6pct_bias: str, long_liq: float,
+               short_liq: float) -> dict:
+        
+        if funding_rate is None:
+            return {"override": False}
+        
+        # Funding harus negatif (harusnya crowded short)
+        if funding_rate >= -0.005:
+            return {"override": False}
+        
+        # Tapi delta exposure tinggi (kenyataannya crowded LONG)
+        if delta_exposure < 0.70:
+            return {"override": False}
+        
+        # Kontradiksi ini harus dikonfirmasi oleh OBV + algo + hft
+        confirmations = sum([
+            obv_trend in ("NEGATIVE_EXTREME", "NEGATIVE"),
+            algo_type_bias == "SHORT",
+            hft_6pct_bias == "SHORT",
+            long_liq < short_liq,
+        ])
+        
+        if confirmations < 3:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"FUNDING-DELTA CONTRADICTION: "
+                f"funding={funding_rate:.5f} (negatif = harusnya crowded short) "
+                f"TAPI delta_exposure={delta_exposure:.3f} ({delta_exposure*100:.0f}% posisi LONG). "
+                f"Funding adalah lagging indicator — kondisi sudah berubah. "
+                f"OBV={obv_trend}, algo={algo_type_bias}, hft={hft_6pct_bias} konfirmasi SHORT. "
+                f"long_liq={long_liq:.2f}% lebih dekat. Force SHORT."
+            ),
+            "priority": -27750
+        }
+
+
+class AlgoHFTBothShortNoSellerVeto:
+    """
+    Jika algo_type DAN hft_6pct keduanya SHORT, dan OBV negatif,
+    maka NO SELLER rule (down_energy=0 → LONG) adalah jebakan.
+    
+    Veto: kembalikan ke SHORT bukan NEUTRAL.
+    Priority: -27600
+    """
+    @staticmethod
+    def detect(algo_type_bias: str, hft_6pct_bias: str,
+               obv_trend: str, down_energy: float,
+               long_liq: float, short_liq: float) -> dict:
+        
+        if algo_type_bias != "SHORT" or hft_6pct_bias != "SHORT":
+            return {"override": False}
+        
+        if down_energy >= 0.1:
+            return {"override": False}
+        
+        if obv_trend not in ("NEGATIVE_EXTREME", "NEGATIVE"):
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"ALGO+HFT BOTH SHORT NO SELLER VETO: "
+                f"algo={algo_type_bias} + hft={hft_6pct_bias} keduanya SHORT, "
+                f"OBV={obv_trend}, down_energy={down_energy:.3f} (manufactured vacuum). "
+                f"NO SELLER rule dibatalkan. Force SHORT."
+            ),
+            "priority": -27600
+        }
+
+
+class DeltaExposureLongLiqProximityShort:
+    """
+    Ketika delta_exposure tinggi (>0.75) DAN long_liq < short_liq,
+    tidak peduli sinyal lain — ini adalah setup dump klasik.
+    
+    81% posisi LONG + long_liq lebih dekat = Binance PASTI dump
+    untuk menyapu semua long stop.
+    
+    Guard: hanya fire jika ada konfirmasi dari OBV atau algo/hft.
+    """
+    @staticmethod
+    def detect(delta_exposure: float, long_liq: float,
+               short_liq: float, obv_trend: str,
+               algo_type_bias: str, hft_6pct_bias: str,
+               volume_ratio: float, change_5m: float) -> dict:
+        
+        if delta_exposure < 0.75:
+            return {"override": False}
+        
+        if long_liq >= short_liq:
+            return {"override": False}
+        
+        if long_liq > 4.0:
+            return {"override": False}
+        
+        # Butuh minimal 2 konfirmasi
+        confirmations = sum([
+            obv_trend in ("NEGATIVE_EXTREME", "NEGATIVE"),
+            algo_type_bias == "SHORT",
+            hft_6pct_bias == "SHORT",
+            volume_ratio < 0.85,
+        ])
+        
+        if confirmations < 2:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"DELTA EXPOSURE LONG LIQ PROXIMITY SHORT: "
+                f"delta_exposure={delta_exposure:.3f} ({delta_exposure*100:.0f}% posisi LONG), "
+                f"long_liq={long_liq:.2f}% < short_liq={short_liq:.2f}% → "
+                f"Binance akan dump untuk sweep long stop. "
+                f"OBV={obv_trend}, algo={algo_type_bias}, hft={hft_6pct_bias}. "
+                f"confirmations={confirmations}/4. Force SHORT."
+            ),
+            "priority": -27550
+        }
+
+
 # ========== LECTURER'S SARAN: PHANTOM VACUUM TRAP & ASTRONOMICAL OBV STALE VETO ==========
 # PRIORITY -25000 dan -24000: Harus PALING AWAL sebelum NoSellerNoBuyerOverride (-20000)
 # untuk menghindari jebakan HFT manipulation pada kasus BULLAUSDT dan AIOUSDT
@@ -2135,7 +2350,19 @@ class NoSellerNoBuyerOverride:
                rsi6_5m: float = 50.0,
                # ===== REAL VOLUME GATE (LECTURER SARAN LOGIC) =====
                latest_volume: float = 0,
-               volume_ma10: float = 1) -> dict:
+               volume_ma10: float = 1,
+               # ===== ARIAUSDT GUARD PARAMETERS (LECTURER SARAN) =====
+               algo_type_bias: str = "NEUTRAL",   # ← BARU
+               hft_6pct_bias: str = "NEUTRAL",    # ← BARU
+               obv_trend: str = "NEUTRAL") -> dict:  # ← BARU
+        
+        # ========== ARIAUSDT GUARD: algo+hft both SHORT + OBV negatif = manufactured vacuum ==========
+        # Jika algo DAN hft keduanya SHORT, dan OBV negatif, maka down_energy=0 adalah jebakan
+        if down_energy < 0.01:
+            if (algo_type_bias == "SHORT" and 
+                hft_6pct_bias == "SHORT" and
+                obv_trend in ("NEGATIVE_EXTREME", "NEGATIVE")):
+                return {"override": False}  # Jangan paksa LONG
         
         # ========== REAL VOLUME GATE (LECTURER SARAN LOGIC) ==========
         # Jika volume ultra kering (<15% MA10), down_energy = 0 bukan berarti "tidak ada seller"
@@ -17069,6 +17296,82 @@ class BinanceAnalyzer:
             result["entry_allowed"] = True
             return result
 
+        # ===== PRIORITY -27800: OBV NEG + ALGO+HFT CONSENSUS SHORT (ARIAUSDT EXACT PATTERN) =====
+        # This is the HIGHEST priority detector - must fire before PhantomVacuumTrap (-25000)
+        obv_algo_hft = OBVNegativeAlgoHFTConsensusShortGuard.detect(
+            obv_trend=obv_trend,
+            obv_value=result.get("obv_value", 0),
+            algo_type_bias=result.get("algo_type_bias", "NEUTRAL"),
+            hft_6pct_bias=result.get("hft_6pct_bias", "NEUTRAL"),
+            down_energy=down_energy_val,
+            delta_exposure=result.get("greeks_delta_exposure", 0),
+            long_liq=long_liq,
+            short_liq=short_liq,
+            volume_ratio=volume_ratio,
+            funding_rate=funding_rate_val
+        )
+        if obv_algo_hft["override"]:
+            result["bias"] = obv_algo_hft["bias"]
+            result["reason"] = f"[OBV+ALGO+HFT SHORT] {obv_algo_hft['reason']}"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = obv_algo_hft["priority"]
+            result["entry_allowed"] = True
+            return result
+        
+        # ===== PRIORITY -27750: FUNDING-DELTA CONTRADICTION =====
+        funding_delta_contra = FundingNegativeButCrowdedLongContradiction.detect(
+            funding_rate=funding_rate_val,
+            delta_exposure=result.get("greeks_delta_exposure", 0),
+            obv_trend=obv_trend,
+            algo_type_bias=result.get("algo_type_bias", "NEUTRAL"),
+            hft_6pct_bias=result.get("hft_6pct_bias", "NEUTRAL"),
+            long_liq=long_liq,
+            short_liq=short_liq
+        )
+        if funding_delta_contra["override"]:
+            result["bias"] = funding_delta_contra["bias"]
+            result["reason"] = f"[FUNDING-DELTA CONTRA] {funding_delta_contra['reason']}"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = funding_delta_contra["priority"]
+            result["entry_allowed"] = True
+            return result
+        
+        # ===== PRIORITY -27600: ALGO+HFT BOTH SHORT NO SELLER VETO =====
+        algo_hft_veto = AlgoHFTBothShortNoSellerVeto.detect(
+            algo_type_bias=result.get("algo_type_bias", "NEUTRAL"),
+            hft_6pct_bias=result.get("hft_6pct_bias", "NEUTRAL"),
+            obv_trend=obv_trend,
+            down_energy=down_energy_val,
+            long_liq=long_liq,
+            short_liq=short_liq
+        )
+        if algo_hft_veto["override"]:
+            result["bias"] = algo_hft_veto["bias"]
+            result["reason"] = f"[ALGO+HFT VETO] {algo_hft_veto['reason']}"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = algo_hft_veto["priority"]
+            result["entry_allowed"] = True
+            return result
+        
+        # ===== PRIORITY -27550: DELTA EXPOSURE LONG LIQ PROXIMITY SHORT =====
+        delta_liq_short = DeltaExposureLongLiqProximityShort.detect(
+            delta_exposure=result.get("greeks_delta_exposure", 0),
+            long_liq=long_liq,
+            short_liq=short_liq,
+            obv_trend=obv_trend,
+            algo_type_bias=result.get("algo_type_bias", "NEUTRAL"),
+            hft_6pct_bias=result.get("hft_6pct_bias", "NEUTRAL"),
+            volume_ratio=volume_ratio,
+            change_5m=change_5m_val
+        )
+        if delta_liq_short["override"]:
+            result["bias"] = delta_liq_short["bias"]
+            result["reason"] = f"[DELTA LIQ SHORT] {delta_liq_short['reason']}"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = delta_liq_short["priority"]
+            result["entry_allowed"] = True
+            return result
+        
         # ===== PRIORITY -26000: LIQUIDITY EXTREME FALSE POSITIVE GUARD (HIGHEST ABSOLUTE) =====
         # Harus PERTAMA karena membatalkan _liquidity_extreme_override
         liq_extreme_direction = "LONG" if result.get("_liquidity_extreme_override") and result.get("bias") == "LONG" else \
@@ -17223,7 +17526,11 @@ class BinanceAnalyzer:
             rsi6_5m=rsi6_5m_val,     # 🔥 LECTURER FIX: tambah rsi6_5m
             # ===== REAL VOLUME GATE (LECTURER SARAN LOGIC) =====
             latest_volume=result.get("latest_volume", 0),
-            volume_ma10=result.get("volume_ma10", 1)
+            volume_ma10=result.get("volume_ma10", 1),
+            # ===== ARIAUSDT GUARD PARAMETERS (LECTURER SARAN) =====
+            algo_type_bias=result.get("algo_type_bias", "NEUTRAL"),
+            hft_6pct_bias=result.get("hft_6pct_bias", "NEUTRAL"),
+            obv_trend=obv_trend
         )
         if no_seller_buyer["override"]:
             result["bias"] = no_seller_buyer["bias"]
