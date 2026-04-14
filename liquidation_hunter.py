@@ -2286,6 +2286,25 @@ class LiquidityRegimeSwitcher:
         return {"override": False}
 
 
+class FallingKnifeExhaustionGuard:
+    """
+    🔥 PRIORITY -19950: Mencegah reversal LONG pada exhaustion dump palsu.
+    """
+    @staticmethod
+    def detect(change_5m: float, volume_ratio: float, down_energy: float,
+               up_energy: float, long_liq: float, rsi6: float, agg: float) -> dict:
+        if (change_5m < -8.0 and volume_ratio < 0.7 and down_energy < 0.01
+            and up_energy < 0.2 and long_liq > 10.0 and rsi6 > 15
+            and agg < 0.6):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"FALLING KNIFE EXHAUSTION GUARD: price dropped {change_5m:.1f}% with low volume, no sellers, but no real buyers (up_energy={up_energy:.2f}), long_liq={long_liq:.1f}% far, RSI={rsi6:.1f} not extreme capitulation → dump continues, force SHORT",
+                "priority": -19950
+            }
+        return {"override": False}
+
+
 class ExhaustionReversalOverride:
     """
     🔥 PRIORITY -19900: Deteksi exhaustion dump/pump tanpa volume.
@@ -17239,6 +17258,24 @@ class BinanceAnalyzer:
             result["reason"] = f"[CAPITULATION DUMP] {cap_dump['reason']} | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = cap_dump["priority"]
+            return result
+        
+        # ===== PRIORITY -19950: FALLING KNIFE EXHAUSTION GUARD =====
+        falling_knife_guard = FallingKnifeExhaustionGuard.detect(
+            change_5m=change_5m_val,
+            volume_ratio=volume_ratio,
+            down_energy=down_energy_val,
+            up_energy=up_energy_val,
+            long_liq=long_liq,
+            rsi6=rsi6_val,
+            agg=agg_val
+        )
+        if falling_knife_guard["override"]:
+            result["bias"] = falling_knife_guard["bias"]
+            result["reason"] = f"[FALLING KNIFE GUARD] {falling_knife_guard['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = falling_knife_guard["priority"]
+            result["entry_allowed"] = True
             return result
         
         # 0.2 Exhaustion Reversal Override (PRIORITY -19900)
