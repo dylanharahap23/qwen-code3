@@ -2098,6 +2098,351 @@ class DipThenRipSweep:
         return {"override": False}
 
 
+class AggSpoofDumpGuardValidator:
+    """
+    AggSpoofingActiveDumpGuard sering salah ketika:
+    1. who_dies_first = BOTH_POSSIBLE (arah belum committed)
+    2. up_energy tinggi (> 1.0) — ada buyer nyata
+    3. rsi6_5m sangat rendah (< 20) — kapitulasi, bukan distribusi
+    4. Data race: display_agg != json_agg gap > 0.20
+    
+    Jika salah satu kondisi ini ada, BLOCK AGG SPOOF DUMP
+    dan kembalikan ke sinyal kapitulasi bounce.
+    
+    Priority: -27100 (lebih tinggi dari AGG SPOOF DUMP -10018.95)
+    """
+    @staticmethod
+    def should_block_agg_spoof_dump(
+        who_dies_first: str,
+        up_energy: float,
+        rsi6_5m: float,
+        display_agg: float,
+        json_agg: float,
+        long_liq: float,
+        short_liq: float,
+        change_5m: float
+    ) -> dict:
+        
+        reasons = []
+        block = False
+        
+        # Kondisi 1: who_dies belum committed
+        if who_dies_first == "BOTH_POSSIBLE":
+            reasons.append(
+                f"who_dies=BOTH_POSSIBLE (arah belum committed)"
+            )
+            block = True
+        
+        # Kondisi 2: up_energy tinggi = buyer nyata ada
+        if up_energy > 1.5:
+            reasons.append(
+                f"up_energy={up_energy:.2f} > 1.5 (buyer nyata, bukan micro-injection)"
+            )
+            block = True
+        
+        # Kondisi 3: RSI5m kapitulasi absolut
+        if rsi6_5m < 20:
+            reasons.append(
+                f"rsi6_5m={rsi6_5m:.1f} < 20 (kapitulasi absolut — bounce imminent)"
+            )
+            block = True
+        
+        # Kondisi 4: Data race detected
+        if abs(display_agg - json_agg) > 0.20:
+            reasons.append(
+                f"data_race: display_agg={display_agg:.2f} vs json_agg={json_agg:.2f} "
+                f"(gap={abs(display_agg-json_agg):.2f} > 0.20)"
+            )
+            block = True
+        
+        # Kondisi 5: long_liq jauh lebih dekat dari short_liq
+        # = target bounce/sweep ada, bukan dump
+        if long_liq < short_liq * 0.4 and change_5m < 0:
+            reasons.append(
+                f"long_liq={long_liq:.2f}% << short_liq={short_liq:.2f}% "
+                f"(long dekat = akan di-sweep lalu bounce)"
+            )
+            block = True
+        
+        if block:
+            return {
+                "block": True,
+                "suggested_bias": "LONG",
+                "reason": (
+                    f"AGG SPOOF DUMP BLOCKED: "
+                    + " | ".join(reasons)
+                    + f" → Kembalikan ke kapitulasi bounce signal."
+                )
+            }
+        
+        return {"block": False}
+
+
+class CapitulationBounceAbsoluteOverride:
+    """
+    Kondisi PALING KUAT untuk LONG yang sering diabaikan sistem:
+    
+    RSI5m < 20 + long_liq dekat + up_energy tinggi + down_energy = 0
+    = Kapitulasi absolut + buyer sudah masuk + target sweep ada
+    
+    Ini harus override HAMPIR SEMUA sinyal SHORT karena:
+    - RSI5m < 20 terjadi sangat jarang (< 5% dari waktu)
+    - Ketika terjadi, probability bounce > 85%
+    - Binance SELALU sweep long_liq dulu sebelum keputusan arah
+    
+    EXCEPTION (jangan LONG):
+    - OBV negatif ekstrem DAN real_volume_ratio > 0.8 (genuine distribution aktif)
+    - funding_rate > 0.002 (crowded LONG sangat ekstrem)
+    - delta_exposure > 0.95 (hampir semua posisi LONG = cascade imminent)
+    
+    Priority: -27050 (tepat di bawah UltraLowVolumeAggSpoofing -27000)
+    """
+    @staticmethod
+    def detect(
+        rsi6_5m: float,
+        long_liq: float,
+        short_liq: float,
+        up_energy: float,
+        down_energy: float,
+        change_5m: float,
+        funding_rate: float,
+        delta_exposure: float,
+        obv_trend: str,
+        latest_volume: float,
+        volume_ma10: float,
+        who_dies_first: str,
+        exchange_safe_direction: str
+    ) -> dict:
+        
+        if funding_rate is None:
+            funding_rate = 0.0
+        
+        # RSI5m harus kapitulasi
+        if rsi6_5m >= 20:
+            return {"override": False}
+        
+        # long_liq harus dekat (target sweep)
+        if long_liq >= 3.0:
+            return {"override": False}
+        
+        # long_liq lebih dekat dari short_liq
+        if long_liq >= short_liq:
+            return {"override": False}
+        
+        # Harus ada buyer (up_energy > 0)
+        if up_energy <= 0.3:
+            return {"override": False}
+        
+        # Tidak ada seller aktif
+        if down_energy >= 0.5:
+            return {"override": False}
+        
+        # Harga sedang turun (setup bounce)
+        if change_5m >= 0:
+            return {"override": False}
+        
+        # ===== EXCEPTIONS — jangan LONG =====
+        
+        # Exception 1: Funding ekstrem + delta exposure hampir sempurna
+        if funding_rate > 0.002 and delta_exposure > 0.93:
+            return {"override": False}
+        
+        # Exception 2: Volume genuinely tinggi + OBV negatif
+        # (distribusi nyata, bukan lagging)
+        if volume_ma10 > 0:
+            real_ratio = latest_volume / volume_ma10
+            genuine_distribution = (
+                obv_trend == "NEGATIVE_EXTREME" and
+                real_ratio > 0.8
+            )
+            if genuine_distribution:
+                return {"override": False}
+        
+        # Exception 3: who_dies = LONG_TRADERS sudah confirmed
+        # (bukan BOTH_POSSIBLE)
+        if who_dies_first == "LONG_TRADERS" and funding_rate > 0.001:
+            return {"override": False}
+        
+        # Hitung confidence score
+        score = 0
+        score_reasons = []
+        
+        if rsi6_5m < 15:
+            score += 2
+            score_reasons.append(f"RSI5m={rsi6_5m:.1f} (extreme capitulation)")
+        else:
+            score += 1
+            score_reasons.append(f"RSI5m={rsi6_5m:.1f} (capitulation)")
+        
+        if long_liq < 1.5:
+            score += 2
+            score_reasons.append(f"long_liq={long_liq:.2f}% (ultra close)")
+        else:
+            score += 1
+            score_reasons.append(f"long_liq={long_liq:.2f}% (close)")
+        
+        if up_energy > 2.0:
+            score += 2
+            score_reasons.append(f"up_energy={up_energy:.2f} (strong buyers)")
+        elif up_energy > 1.0:
+            score += 1
+            score_reasons.append(f"up_energy={up_energy:.2f} (moderate buyers)")
+        
+        if exchange_safe_direction == "LONG":
+            score += 1
+            score_reasons.append("exchange_safe=LONG (exchange confirms)")
+        
+        if who_dies_first == "BOTH_POSSIBLE":
+            score += 1
+            score_reasons.append("who_dies=BOTH (not committed SHORT)")
+        
+        # Butuh score >= 4
+        if score < 4:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "LONG",
+            "reason": (
+                f"CAPITULATION BOUNCE ABSOLUTE: "
+                f"RSI5m={rsi6_5m:.1f} (<20, extreme capitulation), "
+                f"long_liq={long_liq:.2f}% (sweep target dekat), "
+                f"up_energy={up_energy:.2f} (buyer aktif masuk), "
+                f"down_energy={down_energy:.2f} (no sellers), "
+                f"change={change_5m:.1f}% (setup bounce). "
+                f"exchange_safe={exchange_safe_direction}. "
+                f"Score {score}: {' | '.join(score_reasons)}. "
+                f"Override AGG SPOOF DUMP dan sinyal SHORT lainnya. Force LONG."
+            ),
+            "priority": -27050
+        }
+
+
+class ExchangeSafeDirectionRespector:
+    """
+    exchange_safe_direction adalah output dari ExchangeRiskScore
+    yang menghitung dari perspektif Binance survival.
+    
+    Ketika exchange_safe_direction = LONG tapi bias = SHORT,
+    sistem sedang bertarung melawan Binance sendiri.
+    
+    Kondisi untuk respect exchange_safe_direction:
+    - exchange_safe_direction tidak NEUTRAL
+    - exchange_risk_score >= 4 (risiko signifikan)
+    - Bias saat ini berlawanan
+    - who_dies_first = BOTH_POSSIBLE (belum committed)
+    - rsi6_5m ekstrem (< 20 atau > 85)
+    
+    Priority: -27080
+    """
+    @staticmethod
+    def detect(
+        exchange_safe_direction: str,
+        exchange_risk_score: int,
+        current_bias: str,
+        who_dies_first: str,
+        rsi6_5m: float,
+        up_energy: float,
+        down_energy: float,
+        long_liq: float,
+        short_liq: float
+    ) -> dict:
+        
+        if exchange_safe_direction == "NEUTRAL":
+            return {"override": False}
+        
+        if exchange_risk_score < 4:
+            return {"override": False}
+        
+        # Bias harus berlawanan dengan exchange recommendation
+        if current_bias == exchange_safe_direction:
+            return {"override": False}
+        
+        if who_dies_first not in ("BOTH_POSSIBLE", "UNCLEAR", ""):
+            return {"override": False}
+        
+        # RSI harus ekstrem
+        rsi_extreme = rsi6_5m < 20 or rsi6_5m > 85
+        if not rsi_extreme:
+            return {"override": False}
+        
+        # Energy harus konsisten dengan exchange direction
+        if exchange_safe_direction == "LONG":
+            energy_ok = up_energy > down_energy and up_energy > 0.5
+            liq_ok = long_liq < short_liq
+        else:
+            energy_ok = down_energy > up_energy and down_energy > 0.5
+            liq_ok = short_liq < long_liq
+        
+        if not (energy_ok or liq_ok):
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": exchange_safe_direction,
+            "reason": (
+                f"EXCHANGE SAFE DIRECTION RESPECTED: "
+                f"exchange_safe={exchange_safe_direction} "
+                f"(risk_score={exchange_risk_score}/10), "
+                f"current_bias={current_bias} (berlawanan = berbahaya), "
+                f"who_dies={who_dies_first} (belum committed), "
+                f"rsi6_5m={rsi6_5m:.1f} (extreme). "
+                f"Jangan bertarung melawan Binance's own risk engine."
+            ),
+            "priority": -27080
+        }
+
+
+class OBVLaggingCapitulationGuard:
+    """
+    OBV NEGATIVE_EXTREME sering digunakan untuk blokir bounce.
+    Tapi ketika RSI5m < 20, OBV negatif itu hampir selalu LAGGING.
+    
+    Kenapa?
+    - OBV dibangun dari volume historis (bisa berasal dari 1-2 jam lalu)
+    - Ketika RSI5m < 20, harga sudah turun sangat jauh
+    - Pada titik ini, seller sudah exhausted
+    - OBV masih negatif karena mencerminkan sell-off yang SUDAH TERJADI
+    - Bukan prediksi sell-off yang AKAN terjadi
+    
+    Rule: Jika RSI5m < 20 DAN up_energy > down_energy DAN long_liq dekat,
+    OBV NEGATIVE_EXTREME tidak boleh blokir LONG signal.
+    
+    Priority: digunakan sebagai modifier, bukan standalone override
+    """
+    @staticmethod
+    def is_obv_lagging_at_capitulation(
+        rsi6_5m: float,
+        up_energy: float,
+        down_energy: float,
+        long_liq: float,
+        obv_trend: str,
+        change_5m: float
+    ) -> bool:
+        """Returns True jika OBV negatif kemungkinan besar lagging."""
+        
+        if obv_trend not in ("NEGATIVE_EXTREME", "NEGATIVE"):
+            return False
+        
+        # RSI5m harus kapitulasi
+        if rsi6_5m >= 20:
+            return False
+        
+        # Buyer harus lebih kuat dari seller
+        if up_energy <= down_energy:
+            return False
+        
+        # long_liq harus dekat (ada target bounce)
+        if long_liq >= 3.0:
+            return False
+        
+        # Harga harus turun (kapitulasi setup)
+        if change_5m >= 0:
+            return False
+        
+        return True
+
+
 class AggSpoofingActiveDumpGuard:
     """
     AINUSDT PATTERN: agg=0.98 (98% buy trades) TAPI price turun -2.9%
@@ -2133,9 +2478,30 @@ class AggSpoofingActiveDumpGuard:
                greeks_kill_direction: str, greeks_who_dies_first: str,
                long_liq: float, short_liq: float,
                volume_ratio: float, up_energy: float,
-               rsi6_5m: float) -> dict:
+               rsi6_5m: float,
+               # NEW: Parameters for lecturer's guard logic
+               exchange_safe_direction: str = "NEUTRAL",
+               exchange_risk_score: int = 0,
+               display_agg: float = None) -> dict:
         
         if funding_rate is None:
+            return {"override": False}
+        
+        # ===== LECTURER'S GUARDS - TAMBAHKAN DI AWAL =====
+        # Guard 1: who_dies belum committed = jangan force SHORT
+        if greeks_who_dies_first == "BOTH_POSSIBLE":
+            return {"override": False}
+        
+        # Guard 2: up_energy tinggi = buyer nyata, bukan micro-injection
+        if up_energy > 1.5:
+            return {"override": False}
+        
+        # Guard 3: RSI5m kapitulasi = bounce lebih mungkin dari dump
+        if rsi6_5m < 20:
+            return {"override": False}
+        
+        # Guard 4: exchange_safe = LONG = jangan SHORT
+        if exchange_safe_direction == "LONG" and rsi6_5m < 25:
             return {"override": False}
         
         # Core contradiction: agg sangat tinggi tapi harga turun
@@ -16075,8 +16441,78 @@ class BinanceAnalyzer:
             result["priority_level"] = funding_long_trap["priority"]
             return result
         
+        # ===== PRIORITY -27100: AGG SPOOF DUMP VALIDATOR (BLOCKER) =====
+        # Harus dipanggil SEBELUM AGG SPOOF DUMP bisa trigger
+        # Validator ini akan memblokir AggSpoofingActiveDumpGuard jika kondisi tertentu terpenuhi
+        agg_spoof_validator = AggSpoofDumpGuardValidator.should_block_agg_spoof_dump(
+            who_dies_first=result.get("greeks_who_dies_first", ""),
+            up_energy=up_energy_val,
+            rsi6_5m=rsi6_5m_val,
+            display_agg=agg_val,  # Display value (bisa berbeda dari JSON)
+            json_agg=result.get("agg", agg_val),  # JSON ground truth
+            long_liq=long_liq,
+            short_liq=short_liq,
+            change_5m=change_5m_val
+        )
+        
+        # Simpan flag untuk skip AGG SPOOF DUMP nanti jika diblokir
+        _agg_spoof_blocked = agg_spoof_validator.get("block", False)
+        _agg_spoof_block_reason = agg_spoof_validator.get("reason", "")
+        
+        if _agg_spoof_blocked:
+            # Log blocking reason untuk debugging
+            result["_agg_spoof_blocked"] = True
+            result["_agg_spoof_block_reason"] = _agg_spoof_block_reason
+        
+        # ===== PRIORITY -27080: EXCHANGE SAFE DIRECTION RESPECTOR =====
+        # Ketika exchange_safe_direction = LONG tapi bias = SHORT, sistem sedang bertarung melawan Binance
+        exchange_safe_resp = ExchangeSafeDirectionRespector.detect(
+            exchange_safe_direction=result.get("exchange_safe_direction", "NEUTRAL"),
+            exchange_risk_score=result.get("exchange_risk_score", 0),
+            current_bias=result.get("bias", "NEUTRAL"),
+            who_dies_first=result.get("greeks_who_dies_first", ""),
+            rsi6_5m=rsi6_5m_val,
+            up_energy=up_energy_val,
+            down_energy=down_energy_val,
+            long_liq=long_liq,
+            short_liq=short_liq
+        )
+        if exchange_safe_resp["override"]:
+            result["bias"] = exchange_safe_resp["bias"]
+            result["reason"] = f"[EXCHANGE SAFE RESP] {exchange_safe_resp['reason']}"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = exchange_safe_resp["priority"]
+            result["entry_allowed"] = True
+            return result
+        
+        # ===== PRIORITY -27050: CAPITULATION BOUNCE ABSOLUTE =====
+        # Kondisi PALING KUAT untuk LONG: RSI5m < 20 + long_liq dekat + up_energy tinggi
+        cap_bounce_abs = CapitulationBounceAbsoluteOverride.detect(
+            rsi6_5m=rsi6_5m_val,
+            long_liq=long_liq,
+            short_liq=short_liq,
+            up_energy=up_energy_val,
+            down_energy=down_energy_val,
+            change_5m=change_5m_val,
+            funding_rate=funding_rate_val,
+            delta_exposure=result.get("greeks_delta_exposure", 0),
+            obv_trend=obv_trend,
+            latest_volume=result.get("latest_volume", 0),
+            volume_ma10=result.get("volume_ma10", 1),
+            who_dies_first=result.get("greeks_who_dies_first", ""),
+            exchange_safe_direction=result.get("exchange_safe_direction", "NEUTRAL")
+        )
+        if cap_bounce_abs["override"]:
+            result["bias"] = cap_bounce_abs["bias"]
+            result["reason"] = f"[CAP BOUNCE ABS] {cap_bounce_abs['reason']}"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = cap_bounce_abs["priority"]
+            result["entry_allowed"] = True
+            return result
+        
         # ===== PRIORITY -10018.95: AGG SPOOFING ACTIVE DUMP GUARD =====
         # Harus paling awal karena ini pattern paling licik HFT
+        # NOTE: Sudah di-guard oleh AggSpoofDumpGuardValidator di atas (-27100)
         agg_spoof_dump = AggSpoofingActiveDumpGuard.detect(
             agg=agg_val,
             change_5m=change_5m_val,
@@ -16091,7 +16527,11 @@ class BinanceAnalyzer:
             short_liq=short_liq,
             volume_ratio=volume_ratio,
             up_energy=up_energy_val,
-            rsi6_5m=rsi6_5m_val
+            rsi6_5m=rsi6_5m_val,
+            # NEW: Parameters for lecturer's guard logic
+            exchange_safe_direction=result.get("exchange_safe_direction", "NEUTRAL"),
+            exchange_risk_score=result.get("exchange_risk_score", 0),
+            display_agg=agg_val
         )
         if agg_spoof_dump["override"]:
             result["bias"] = agg_spoof_dump["bias"]
