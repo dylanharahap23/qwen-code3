@@ -881,8 +881,124 @@ class CapitulationDumpLongLiqClose:
 
 # ================================================================================
 # LECTURER'S SARAN LOGIC: BASEDUSDT & AIOUSDT FIXES
-# Priority ladder: -26900 to -26600 (highest absolute, before NoSeller/NoBuyer)
+# Priority ladder: -27050 to -26600 (highest absolute, before NoSeller/NoBuyer)
 # ================================================================================
+
+class MicroShortSweepFirstOverride:
+    """
+    🔥 PRIORITY -27050 (TERTINGGI - di atas LiquidityRatioMaxPainV2 -26900)
+    
+    Kasus AKEUSDT: short_liq < 0.5% (micro) + long_liq >> short_liq (ratio > 20x)
+    + RSI6 = 100 + funding positif + Greeks kill SHORT
+    → HFT akan SWEEP short liq dulu (pump) sebelum dump ke long liq.
+    Force LONG sebagai first move.
+    """
+    @staticmethod
+    def detect(short_liq: float, long_liq: float,
+               rsi6: float, funding_rate: float,
+               kill_direction: str, who_dies_first: str,
+               agg: float, up_energy: float, down_energy: float) -> dict:
+        
+        if funding_rate is None:
+            return {"override": False}
+        
+        # Kondisi micro short liq
+        if short_liq >= 0.5:
+            return {"override": False}
+        
+        # Rasio ekstrem
+        if long_liq <= short_liq * 20:
+            return {"override": False}
+        
+        # RSI6 harus overbought ekstrem (99+)
+        if rsi6 < 99:
+            return {"override": False}
+        
+        # Funding positif (crowded long)
+        if funding_rate <= 0.0002:
+            return {"override": False}
+        
+        # Greeks kill SHORT, who_dies LONG_TRADERS
+        if kill_direction != "SHORT" or who_dies_first != "LONG_TRADERS":
+            return {"override": False}
+        
+        # Tidak ada seller nyata (optional, memperkuat)
+        no_seller = down_energy < 0.01
+        
+        return {
+            "override": True,
+            "bias": "LONG",
+            "cancel_liquidity_extreme_override": True,
+            "reason": (
+                f"MICRO SHORT SWEEP FIRST: short_liq={short_liq:.2f}% (micro), "
+                f"long_liq={long_liq:.2f}% (ratio {long_liq/short_liq:.1f}x), "
+                f"RSI6={rsi6:.1f} extreme, funding={funding_rate:.5f} (crowded long), "
+                f"Greeks kill={kill_direction}, who_dies={who_dies_first}. "
+                f"HFT akan SWEEP short liq dulu (PUMP) sebelum dump ke long liq. "
+                f"Force LONG sebagai first move. Override LiquidityRatioMaxPainV2."
+            ),
+            "priority": -27050
+        }
+
+
+class GammaExtremeOverrideNoSellerBlock:
+    """
+    🔥 PRIORITY -20001 (lebih tinggi dari NoSellerNoBuyerOverride -20000)
+    
+    Jika Greeks gamma intensity = EXTREME dan kill_direction konsisten dengan liquidity,
+    maka blokir NoSellerNoBuyerOverride yang memaksa arah berlawanan.
+    """
+    @staticmethod
+    def should_block_no_seller(gamma_intensity: str, kill_direction: str,
+                                short_liq: float, long_liq: float,
+                                gamma_executing: bool, kill_speed: float) -> bool:
+        if gamma_intensity != "EXTREME":
+            return False
+        if kill_direction not in ("LONG", "SHORT"):
+            return False
+        # Cek konsistensi dengan liquidity proximity
+        if kill_direction == "SHORT" and long_liq < short_liq:
+            return True
+        if kill_direction == "LONG" and short_liq < long_liq:
+            return True
+        # Atau gamma sudah executing dengan speed tinggi
+        if gamma_executing and kill_speed > 5.0:
+            return True
+        return False
+    
+    @staticmethod
+    def detect(gamma_intensity: str, kill_direction: str,
+               short_liq: float, long_liq: float,
+               gamma_executing: bool, kill_speed: float,
+               down_energy: float, up_energy: float) -> dict:
+        
+        if not GammaExtremeOverrideNoSellerBlock.should_block_no_seller(
+            gamma_intensity, kill_direction, short_liq, long_liq,
+            gamma_executing, kill_speed
+        ):
+            return {"override": False}
+        
+        # Tentukan bias yang benar
+        correct_bias = kill_direction
+        
+        # Jika no seller/ buyer akan override, blokir dan paksa arah Greeks
+        if (down_energy < 0.01 and correct_bias == "SHORT") or \
+           (up_energy < 0.01 and correct_bias == "LONG"):
+            return {
+                "override": True,
+                "bias": correct_bias,
+                "reason": (
+                    f"GAMMA EXTREME BLOCKS NO SELLER/BUYER: "
+                    f"gamma_intensity={gamma_intensity}, kill={kill_direction}, "
+                    f"liq consistent (short={short_liq:.2f}%, long={long_liq:.2f}%), "
+                    f"executing={gamma_executing}, speed={kill_speed:.1f}. "
+                    f"NoSeller/NoBuyer override dibatalkan. Force {correct_bias}."
+                ),
+                "priority": -20001
+            }
+        
+        return {"override": False}
+
 
 class LiquidityRatioMaxPainV2:
     """
@@ -3609,7 +3725,7 @@ def _greeks_absolute_score(
             "final_bias":   kill_direction,
             "override":     True,
             "confidence":   "ABSOLUTE",
-            "priority":     -9999,
+            "priority":     -21000,   # LECTURER FIX: was -9999, now higher priority
             "score_reason": (
                 f"GREEKS GAMMA EXTREME: kill speed {kill_speed:.1f}/10, "
                 f"{who_dies_first} sedang dieksekusi. "
@@ -15987,6 +16103,25 @@ class BinanceAnalyzer:
         # Harus di awal, sebelum PHASE LOCK dan GREEKS
         # Detector-detector dari dosen untuk anti-HFT manipulation
         
+        # ===== PRIORITY -27050: MICRO SHORT SWEEP FIRST (TERTINGGI BARU) =====
+        # Kasus AKEUSDT: short_liq < 0.5% (micro) + long_liq >> short_liq (ratio > 20x)
+        # + RSI6 = 100 + funding positif + Greeks kill SHORT
+        # → HFT akan SWEEP short liq dulu (pump) sebelum dump ke long liq.
+        micro_sweep = MicroShortSweepFirstOverride.detect(
+            short_liq=short_liq, long_liq=long_liq,
+            rsi6=rsi6_val, funding_rate=funding_rate_val,
+            kill_direction=result.get("greeks_kill_direction", ""),
+            who_dies_first=result.get("greeks_who_dies_first", ""),
+            agg=agg_val, up_energy=up_energy_val, down_energy=down_energy_val
+        )
+        if micro_sweep["override"]:
+            result["bias"] = micro_sweep["bias"]
+            result["reason"] = f"[MICRO SWEEP FIRST] {micro_sweep['reason']}"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = micro_sweep["priority"]
+            result["_liquidity_extreme_override"] = False
+            return result
+        
         # ===== PRIORITY -27000: ULTRA LOW VOLUME AGG SPOOFING (TERTINGGI BARU) =====
         # Kasus VELVETUSDT: volume ultra-kering (5.9% MA10), agg=1.00 spoofed, crowded LONG → dump
         ultra_low_vol = UltraLowVolumeAggSpoofingGuard.detect(
@@ -16218,6 +16353,26 @@ class BinanceAnalyzer:
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = astro_obv["priority"]
             result["entry_allowed"] = True
+            return result
+        
+        # 0.1 No Seller / No Buyer Override (PRIORITY -20000)
+        
+        # ===== PRIORITY -20001: GAMMA EXTREME BLOCKS NO SELLER =====
+        # Jika Greeks gamma intensity = EXTREME dan kill_direction konsisten dengan liquidity,
+        # maka blokir NoSellerNoBuyerOverride yang memaksa arah berlawanan.
+        gamma_block = GammaExtremeOverrideNoSellerBlock.detect(
+            gamma_intensity=result.get("greeks_gamma_intensity", "LOW"),
+            kill_direction=result.get("greeks_kill_direction", ""),
+            short_liq=short_liq, long_liq=long_liq,
+            gamma_executing=result.get("greeks_gamma_executing", False),
+            kill_speed=result.get("greeks_kill_speed", 0.0),
+            down_energy=down_energy_val, up_energy=up_energy_val
+        )
+        if gamma_block["override"]:
+            result["bias"] = gamma_block["bias"]
+            result["reason"] = f"[GAMMA BLOCKS NO SELLER] {gamma_block['reason']}"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = gamma_block["priority"]
             return result
         
         # 0.1 No Seller / No Buyer Override (PRIORITY -20000)
