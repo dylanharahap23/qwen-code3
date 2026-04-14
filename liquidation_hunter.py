@@ -788,6 +788,51 @@ class AstronomicalOBVStaleVeto:
         return {"override": False}
 
 
+class LowVolumeOverboughtFakeSqueezeGuard:
+    """
+    🔥 PRIORITY -1117 (LEBIH TINGGI dari LowVolumeOverboughtFakeSqueeze -1116)
+    
+    MEMBLOKIR LowVolumeOverboughtFakeSqueeze jika:
+    - Greeks kill_direction SEARAH dengan harga (momentum genuine)
+    - gamma_executing = True (eksekusi sedang berlangsung)
+    - who_dies_first sudah jelas (bukan BOTH_POSSIBLE)
+    - short_liq masih dekat (<2%) = squeeze masih aktif
+    
+    Kasus COAIUSDT: pump 6%, RSI5m 87, volume 0.45x → TAPI 
+    kill_direction=LONG, gamma_executing=True, who_dies=SHORT_TRADERS
+    → ini adalah SHORT SQUEEZE GENUINE, BUKAN fake pump.
+    """
+    @staticmethod
+    def detect(rsi6_5m: float, volume_ratio: float, change_5m: float,
+               short_liq: float, agg: float, down_energy: float,
+               kill_direction: str, gamma_executing: bool,
+               who_dies_first: str, funding_rate: float = 0.0) -> dict:
+        
+        # Kondisi yang memicu LowVolumeOverboughtFakeSqueeze
+        if not (change_5m > 2.0 and volume_ratio < 0.6 and 
+                rsi6_5m > 85 and short_liq < 10.0 and 
+                agg < 0.8 and down_energy < 0.1):
+            return {"override": False}
+        
+        # Guard: jika Greeks konfirmasi squeeze genuine
+        if (kill_direction == "LONG" and gamma_executing and 
+            who_dies_first == "SHORT_TRADERS" and short_liq < 2.0):
+            return {
+                "override": True,
+                "bias": "LONG",  # balikkan ke LONG
+                "block_fake_squeeze": True,
+                "reason": (
+                    f"FAKE SQUEEZE GUARD: LowVolumeOverboughtFakeSqueeze DIBLOKIR. "
+                    f"Greeks konfirmasi squeeze genuine: kill={kill_direction}, "
+                    f"gamma_executing={gamma_executing}, who_dies={who_dies_first}, "
+                    f"short_liq={short_liq:.2f}%. Force LONG."
+                ),
+                "priority": -1117
+            }
+        
+        return {"override": False}
+
+
 class LowVolumeOverboughtFakeSqueeze:
     """
     🔥 PRIORITY -20020: Deteksi pump palsu volume rendah + overbought
@@ -16425,6 +16470,26 @@ class BinanceAnalyzer:
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = capitulation_squeeze["priority"]
             result["entry_allowed"] = True
+            return result
+        
+        # ===== PRIORITY -1117: FAKE SQUEEZE GUARD (blokir false positive) =====
+        fake_squeeze_guard = LowVolumeOverboughtFakeSqueezeGuard.detect(
+            rsi6_5m=rsi6_5m_val,
+            volume_ratio=volume_ratio,
+            change_5m=change_5m_val,
+            short_liq=short_liq,
+            agg=agg_val,
+            down_energy=down_energy_val,
+            kill_direction=result.get("greeks_kill_direction", ""),
+            gamma_executing=result.get("greeks_gamma_executing", False),
+            who_dies_first=result.get("greeks_who_dies_first", ""),
+            funding_rate=funding_rate_val
+        )
+        if fake_squeeze_guard["override"]:
+            result["bias"] = fake_squeeze_guard["bias"]
+            result["reason"] = f"[FAKE SQUEEZE GUARD] {fake_squeeze_guard['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = fake_squeeze_guard["priority"]
             return result
         
         # ===== PRIORITY -20020: LOW VOLUME OVERBOUGHT FAKE SQUEEZE =====
