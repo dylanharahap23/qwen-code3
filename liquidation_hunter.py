@@ -1980,6 +1980,394 @@ class MaximumCrowdingAbsoluteBlock:
         }
 
 
+class MaximumCrowdingLongLiqCloserShort:
+    """
+    🔥 PRIORITY -27900 (TERTINGGI BARU - LECTURER SARAN LOGIC):
+    
+    AKEUSDT EXACT PATTERN — PRIORITY -27900 (TERTINGGI BARU):
+    
+    delta_exposure > 0.88 + long_liq < short_liq + greeks_kill=SHORT
+    + who_dies=LONG_TRADERS + stoch_J > 100 + funding positif
+    
+    Ini adalah "maximum crowding short liq bait":
+    93% posisi sudah LONG, long_liq lebih dekat, Greeks sudah committed SHORT.
+    short_liq yang "dekat" (0.71%) adalah umpan — HFT tidak akan sweep itu,
+    mereka langsung dump ke long_liq (1.82%) karena itulah target real.
+    
+    Perbedaan kritis dari ReverseSqueezeBait yang ada:
+    - ReverseSqueeze butuh long_liq > short_liq * 3 (ratio besar)
+    - Detector ini fire bahkan dengan ratio kecil (1.82/0.71 = 2.5x)
+    KARENA delta_exposure sudah > 0.88 (extreme crowding sebagai konfirmasi utama)
+    """
+    @staticmethod
+    def detect(
+        delta_exposure: float,
+        long_liq: float,
+        short_liq: float,
+        greeks_kill_direction: str,
+        who_dies_first: str,
+        stoch_j: float,
+        funding_rate: float,
+        volume_ratio: float,
+        rsi6: float,
+        greeks_delta_crowded: str
+    ) -> dict:
+        
+        if funding_rate is None:
+            funding_rate = 0.0
+        
+        # delta_exposure harus extreme (>88% posisi LONG)
+        if delta_exposure < 0.88:
+            return {"override": False}
+        
+        # long_liq harus LEBIH DEKAT dari short_liq
+        if long_liq >= short_liq:
+            return {"override": False}
+        
+        # long_liq harus dalam range yang bisa dicapai
+        if long_liq > 4.0:
+            return {"override": False}
+        
+        # Greeks harus sudah committed SHORT
+        if greeks_kill_direction != "SHORT":
+            return {"override": False}
+        
+        # who_dies harus LONG_TRADERS (sudah confirmed)
+        if who_dies_first not in ("LONG_TRADERS", "BOTH_POSSIBLE"):
+            return {"override": False}
+        
+        # delta_crowded harus LONG
+        if greeks_delta_crowded != "LONG":
+            return {"override": False}
+        
+        # Funding harus positif (crowded LONG)
+        if funding_rate <= 0.0001:
+            return {"override": False}
+        
+        # Minimal 2 dari 3 konfirmasi tambahan
+        extra = sum([
+            stoch_j > 95,          # stochastic maximal/overflow
+            rsi6 > 65,             # overbought
+            volume_ratio < 0.6,    # volume kering
+        ])
+        
+        if extra < 2:
+            return {"override": False}
+        
+        ratio = long_liq / short_liq if short_liq > 0 else 0
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "cancel_pre_kill_sweep": True,
+            "cancel_liquidity_extreme_override": True,
+            "reason": (
+                f"MAXIMUM CROWDING LONG LIQ CLOSER SHORT: "
+                f"delta_exposure={delta_exposure:.3f} ({delta_exposure*100:.0f}% posisi LONG, extreme crowding), "
+                f"long_liq={long_liq:.2f}% LEBIH DEKAT dari short_liq={short_liq:.2f}% "
+                f"(ratio {ratio:.1f}x, short_liq adalah UMPAN bukan target), "
+                f"greeks_kill={greeks_kill_direction}, who_dies={who_dies_first}, "
+                f"funding={funding_rate:.5f} (crowded LONG), stoch_J={stoch_j:.1f}, "
+                f"volume={volume_ratio:.2f}x. "
+                f"HFT tidak akan sweep short_liq — langsung dump ke long_liq. "
+                f"Force SHORT. Cancel pre-kill sweep dan liquidity extreme override."
+            ),
+            "priority": -27900
+        }
+
+
+class StochJOverflowMaxCrowdingDump:
+    """
+    🔥 PRIORITY -27850 (LECTURER SARAN LOGIC):
+    
+    AKEUSDT stoch_J = 110.5 diinterpretasikan sebagai "micro-sweep LONG"
+    padahal delta_exposure = 0.929 menunjukkan extreme crowding.
+    
+    Rule: ketika stoch_J overflow (>100) DAN delta_exposure > 0.88
+    DAN long_liq < short_liq → ini adalah blow-off top extreme crowding,
+    BUKAN micro-sweep signal. Force SHORT.
+    
+    Ini harus dijalankan SEBELUM StochJOverflowShortLiqMicroSweepGuard.
+    """
+    @staticmethod
+    def detect(
+        stoch_j: float,
+        delta_exposure: float,
+        long_liq: float,
+        short_liq: float,
+        greeks_kill_direction: str,
+        funding_rate: float,
+        who_dies_first: str
+    ) -> dict:
+        
+        if funding_rate is None:
+            funding_rate = 0.0
+        
+        if stoch_j <= 100:
+            return {"override": False}
+        
+        if delta_exposure < 0.88:
+            return {"override": False}
+        
+        if long_liq >= short_liq:
+            return {"override": False}
+        
+        if greeks_kill_direction != "SHORT":
+            return {"override": False}
+        
+        if funding_rate <= 0.0001:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "cancel_stoch_micro_sweep": True,
+            "reason": (
+                f"STOCH J OVERFLOW MAX CROWDING DUMP: "
+                f"stoch_J={stoch_j:.1f} (>100 overflow) tapi "
+                f"delta_exposure={delta_exposure:.3f} (extreme crowding LONG), "
+                f"long_liq={long_liq:.2f}% lebih dekat dari short_liq={short_liq:.2f}%, "
+                f"greeks_kill=SHORT, funding={funding_rate:.5f} (crowded LONG) → "
+                f"Ini BUKAN micro-sweep. Ini adalah blow-off top dengan extreme crowding. "
+                f"Force SHORT. Block StochJOverflowShortLiqMicroSweepGuard."
+            ),
+            "priority": -27850
+        }
+
+
+class ExtremeDropAggOFIContradictionShort:
+    """
+    🔥 PRIORITY -27950 (TERTINGGI ABSOLUT SEMUA - LECTURER SARAN LOGIC):
+    
+    ENJUSDT EXACT PATTERN — PRIORITY -27950 (TERTINGGI ABSOLUT SEMUA):
+    
+    change_5m < -7% (extreme drop) + agg < 0.50 (mayoritas SELL)
+    + ofi_bias = SHORT + long_liq < short_liq + long_liq < 3%
+    
+    Ini adalah "extreme drop continuation disguised as bounce":
+    - Harga sudah jatuh 9% → sistem pikir ini capitulation bottom
+    - RSI=2.6, funding negatif, OBV positif → semua bilang LONG
+    - TAPI agg=0.43 (57% trades masih SELL real-time) → distribusi masih berlangsung
+    - TAPI ofi_bias=SHORT → order flow masih bearish
+    - TAPI long_liq lebih dekat → long stop akan disweep duluan
+    
+    Prinsip: ketika harga jatuh drastis DAN agg masih SELL dominant
+    (< 0.50) DAN OFI SHORT → ini BUKAN capitulation.
+    Ini adalah continued distribution. Dump belum selesai.
+    
+    Mengapa OBV positif tidak relevan di sini:
+    OBV dibangun dari data historis. Harga baru jatuh 9% dalam 5 menit.
+    OBV belum bisa mencerminkan distribusi yang baru saja terjadi.
+    agg=0.43 adalah real-time ground truth — lebih akurat dari OBV.
+    """
+    @staticmethod
+    def detect(
+        change_5m: float,
+        agg: float,
+        ofi_bias: str,
+        ofi_strength: float,
+        long_liq: float,
+        short_liq: float,
+        funding_rate: float,
+        obv_trend: str,
+        up_energy: float,
+        volume_ratio: float,
+        rsi6: float,
+        who_dies_first: str,
+        greeks_liq_7pct: str
+    ) -> dict:
+        
+        if funding_rate is None:
+            funding_rate = 0.0
+        
+        # Extreme drop (lebih dari 7%)
+        if change_5m > -7.0:
+            return {"override": False}
+        
+        # agg harus di bawah 0.50 (SELL dominant, meskipun ada OBV positif)
+        if agg >= 0.50:
+            return {"override": False}
+        
+        # OFI harus SHORT
+        if ofi_bias != "SHORT":
+            return {"override": False}
+        
+        # long_liq harus lebih dekat dari short_liq
+        if long_liq >= short_liq:
+            return {"override": False}
+        
+        # long_liq harus dalam range yang bisa dicapai
+        if long_liq > 4.0:
+            return {"override": False}
+        
+        # Konfirmasi tambahan: minimal 2 dari 4
+        confirmations = sum([
+            greeks_liq_7pct in ("LONG_TRADERS_DIE", "BOTH"),
+            volume_ratio < 0.70,       # volume tidak mendukung bounce
+            who_dies_first in ("LONG_TRADERS", "BOTH_POSSIBLE"),
+            funding_rate > -0.005,     # funding tidak extreme (bukan genuine short squeeze)
+        ])
+        
+        if confirmations < 2:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "cancel_capitulation_bounce": True,
+            "cancel_exhaustion_drop_reversal": True,
+            "reason": (
+                f"EXTREME DROP AGG OFI CONTRADICTION SHORT: "
+                f"change_5m={change_5m:.1f}% (extreme drop) tapi "
+                f"agg={agg:.2f} ({(1-agg)*100:.0f}% trades SELL real-time) + "
+                f"ofi_bias={ofi_bias} (strength={ofi_strength:.2f}) → "
+                f"ini BUKAN capitulation bounce. Distribusi masih berlangsung. "
+                f"long_liq={long_liq:.2f}% < short_liq={short_liq:.2f}% (long akan disapu duluan). "
+                f"OBV {obv_trend} adalah STALE — tidak mencerminkan drop 9% barusan. "
+                f"agg=real-time ground truth > OBV. "
+                f"greeks_liq_7pct={greeks_liq_7pct}. "
+                f"Force SHORT. Cancel semua bounce detectors."
+            ),
+            "priority": -27950
+        }
+
+
+class OBVPositiveAggSellExtremeDropVeto:
+    """
+    🔥 PRIORITY -27920 (LECTURER SARAN LOGIC):
+    
+    ENJUSDT specific: OBV POSITIVE_EXTREME + agg=0.43 + change_5m=-9%
+    
+    OBV positif dibangun dari transaksi historis. Ketika harga baru jatuh 9%
+    dalam 5 menit, OBV BELUM mencerminkan kondisi ini karena:
+    - OBV dihitung dari semua volume sejak awal
+    - Volume dump 9% ini mungkin baru 1 candle
+    - Satu candle tidak cukup untuk membalikkan OBV dari positif ke negatif
+    
+    agg=0.43 adalah realitas saat ini: 57% transaksi adalah SELL.
+    Ketika drop terjadi DAN agg masih SELL → distribusi masih berlanjut.
+    
+    Rule: OBV positif + agg < 0.50 + change_5m < -6% = OBV pasti stale.
+    """
+    @staticmethod
+    def detect(
+        obv_trend: str,
+        obv_value: float,
+        agg: float,
+        change_5m: float,
+        ofi_bias: str,
+        long_liq: float,
+        short_liq: float,
+        funding_rate: float
+    ) -> dict:
+        
+        if funding_rate is None:
+            funding_rate = 0.0
+        
+        # OBV harus positif (inilah yang menipu sistem)
+        if obv_trend not in ("POSITIVE_EXTREME", "POSITIVE"):
+            return {"override": False}
+        
+        # agg harus SELL dominant
+        if agg >= 0.50:
+            return {"override": False}
+        
+        # Harus ada extreme drop yang terjadi baru-baru ini
+        if change_5m > -6.0:
+            return {"override": False}
+        
+        # OFI harus SHORT (konfirmasi real-time bearish)
+        if ofi_bias != "SHORT":
+            return {"override": False}
+        
+        # long_liq harus lebih dekat (target dump ada)
+        if long_liq >= short_liq:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"OBV POSITIVE AGG SELL EXTREME DROP VETO: "
+                f"OBV={obv_trend} ({obv_value:,.0f}) positif TAPI ini STALE. "
+                f"change_5m={change_5m:.1f}% (extreme drop baru terjadi) → "
+                f"OBV belum mencerminkan distribusi baru ini. "
+                f"agg={agg:.2f} ({(1-agg)*100:.0f}% SELL real-time) + "
+                f"ofi={ofi_bias} → distribusi masih berlanjut. "
+                f"long_liq={long_liq:.2f}% lebih dekat. "
+                f"Trust agg over OBV. Force SHORT."
+            ),
+            "priority": -27920
+        }
+
+
+class ExchangeRiskHighButAggSellOFIShortVeto:
+    """
+    🔥 PRIORITY -27880 (LECTURER SARAN LOGIC):
+    
+    ENJUSDT: exchange_risk_score=7 + exchange_safe=LONG,
+    tapi agg=0.43 (SELL) + ofi=SHORT.
+    
+    exchange_safe_direction dihitung dari: funding, liq_ratio, exchange_risk_score.
+    Ini adalah model teoritis. agg adalah GROUND TRUTH transaksi nyata.
+    
+    Ketika exchange_safe=LONG tapi agg < 0.50 + ofi SHORT + extreme drop:
+    Percayai agg. Exchange risk model salah baca situasi.
+    
+    Spesifik untuk: extreme drop + agg sell + ofi short.
+    """
+    @staticmethod
+    def detect(
+        exchange_safe_direction: str,
+        exchange_risk_score: int,
+        agg: float,
+        ofi_bias: str,
+        ofi_strength: float,
+        change_5m: float,
+        long_liq: float,
+        short_liq: float
+    ) -> dict:
+        
+        # Exchange harus recommend LONG
+        if exchange_safe_direction != "LONG":
+            return {"override": False}
+        
+        # Exchange risk harus tinggi (yang membuatnya dipakai sebagai override)
+        if exchange_risk_score < 5:
+            return {"override": False}
+        
+        # agg harus SELL dominant (ground truth bertentangan)
+        if agg >= 0.50:
+            return {"override": False}
+        
+        # OFI harus SHORT
+        if ofi_bias != "SHORT" or ofi_strength < 0.4:
+            return {"override": False}
+        
+        # Harus ada significant drop
+        if change_5m > -5.0:
+            return {"override": False}
+        
+        # long_liq harus lebih dekat
+        if long_liq >= short_liq:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"EXCHANGE RISK SAFE DIRECTION VETO BY AGG+OFI: "
+                f"exchange_safe=LONG (score={exchange_risk_score}) tapi "
+                f"agg={agg:.2f} ({(1-agg)*100:.0f}% SELL real-time) + "
+                f"ofi={ofi_bias} ({ofi_strength:.2f}) → "
+                f"agg adalah ground truth yang lebih akurat dari exchange risk model. "
+                f"change_5m={change_5m:.1f}% drop + long_liq={long_liq:.2f}% dekat. "
+                f"Force SHORT. Veto ExchangeRiskScoreHardBlock."
+            ),
+            "priority": -27880
+        }
+
+
 class ExchangeRiskScoreHardBlock:
     """
     🔥 PRIORITY -27200:
