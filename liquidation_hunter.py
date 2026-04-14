@@ -1103,6 +1103,56 @@ class LiquidityRatioMaxPainV2:
         }
 
 
+class UltraShortLiqGammaExtremeSqueezeGuard:
+    """
+    🔥 PRIORITY -27060 (TERTINGGI - di atas PostMicroSweepDump -26850)
+    
+    Kasus COAIUSDT: short_liq < 0.5% (ultra close) + gamma EXTREME + kill_direction LONG
+    + who_dies_first = SHORT_TRADERS + funding negatif/positif? (bisa netral)
+    → HFT sedang dalam squeeze aktif, BUKAN micro-sweep selesai.
+    Force LONG, blokir PostMicroSweepDump dan PhantomBidWallAggVeto.
+    """
+    @staticmethod
+    def detect(short_liq: float, long_liq: float,
+               gamma_intensity: str, kill_direction: str,
+               who_dies_first: str, gamma_executing: bool,
+               kill_speed: float, change_5m: float,
+               rsi6: float, volume_ratio: float) -> dict:
+        
+        if short_liq >= 0.5:
+            return {"override": False}
+        
+        if gamma_intensity != "EXTREME":
+            return {"override": False}
+        
+        if kill_direction != "LONG":
+            return {"override": False}
+        
+        if who_dies_first != "SHORT_TRADERS":
+            return {"override": False}
+        
+        # Konfirmasi: harga sudah naik (squeeze sedang berjalan)
+        if change_5m <= 0:
+            return {"override": False}
+        
+        # Konfirmasi: short_liq lebih dekat dari long_liq
+        if short_liq >= long_liq:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "LONG",
+            "reason": (
+                f"ULTRA SHORT LIQ GAMMA EXTREME SQUEEZE: short_liq={short_liq:.2f}% (<0.5%), "
+                f"gamma={gamma_intensity}, kill={kill_direction}, who_dies={who_dies_first}, "
+                f"kill_speed={kill_speed:.1f}, change={change_5m:.1f}% → "
+                f"Ini SQUEEZE AKTIF, BUKAN micro-sweep selesai. "
+                f"Blokir PostMicroSweepDump dan PhantomBidWallVeto. Force LONG."
+            ),
+            "priority": -27060
+        }
+
+
 class PostMicroSweepDumpDetector:
     """
     🔥 PRIORITY -26850: POST MICRO-SWEEP DUMP
@@ -1557,6 +1607,67 @@ class PreKillSweepDirectionFix:
             }
         
         return {"correct_direction": None, "reason": "Ambiguous"}
+
+
+class BaitPhaseKillDirectionGuard:
+    """
+    🔥 PRIORITY -20002 (LEBIH TINGGI dari NoSellerNoBuyerOverride -20000)
+    
+    Kasus MYXUSDT: market_phase = BAIT, who_dies_first = BOTH_POSSIBLE,
+    vega_active = True, volume_ratio < 0.7, dan liquidity tidak konsisten
+    → JANGAN ikuti kill_direction, biarkan Vega fade yang menentukan.
+    """
+    @staticmethod
+    def detect(market_phase: str, who_dies_first: str,
+               vega_active: bool, volume_ratio: float,
+               kill_direction: str, short_liq: float, long_liq: float,
+               agg: float, ofi_bias: str) -> dict:
+        
+        if market_phase != "BAIT":
+            return {"override": False}
+        
+        if who_dies_first not in ("BOTH_POSSIBLE", "UNCLEAR", ""):
+            return {"override": False}
+        
+        if not vega_active:
+            return {"override": False}
+        
+        if volume_ratio >= 0.7:
+            return {"override": False}
+        
+        # Cek apakah kill_direction konsisten dengan liquidity proximity
+        kill_consistent_with_liq = (
+            (kill_direction == "LONG" and short_liq < long_liq) or
+            (kill_direction == "SHORT" and long_liq < short_liq)
+        )
+        
+        # Jika kill_direction konsisten dengan liq, mungkin masih bisa diikuti?
+        # Tapi karena who_dies masih ambiguous, lebih aman block.
+        # Kecuali ada konfirmasi kuat dari agg/OFI.
+        agg_confirms_kill = (
+            (kill_direction == "LONG" and agg > 0.6) or
+            (kill_direction == "SHORT" and agg < 0.4)
+        )
+        
+        # Jika agg sudah mengkonfirmasi kill_direction, maka boleh ikuti
+        if agg_confirms_kill:
+            return {"override": False}
+        
+        # Jika tidak ada konfirmasi, block ikut kill_direction
+        # Tapi jangan paksa bias tertentu, biarkan sistem lain menentukan
+        return {
+            "override": True,
+            "bias": "NEUTRAL",  # netralkan, biarkan Vega fade atau detector lain
+            "block_kill_follow": True,
+            "reason": (
+                f"BAIT PHASE KILL DIRECTION GUARD: market_phase=BAIT, "
+                f"who_dies={who_dies_first} (belum committed), vega_active={vega_active}, "
+                f"volume={volume_ratio:.2f}x, kill={kill_direction} "
+                f"tidak dikonfirmasi agg (agg={agg:.2f}). "
+                f"JANGAN ikuti kill_direction. Biarkan Vega fade yang menentukan."
+            ),
+            "priority": -20002
+        }
 
 
 class NoSellerNoBuyerOverride:
@@ -16285,6 +16396,29 @@ class BinanceAnalyzer:
             result["entry_allowed"] = True
             return result
         
+        # ===== PRIORITY -27060: ULTRA SHORT LIQ GAMMA EXTREME SQUEEZE GUARD =====
+        # Kasus COAIUSDT: short_liq < 0.5% (ultra close) + gamma EXTREME + kill_direction LONG
+        # + who_dies_first = SHORT_TRADERS → HFT sedang dalam squeeze aktif, BUKAN micro-sweep selesai.
+        # Force LONG, blokir PostMicroSweepDump dan PhantomBidWallAggVeto.
+        ultra_short_gamma = UltraShortLiqGammaExtremeSqueezeGuard.detect(
+            short_liq=short_liq,
+            long_liq=long_liq,
+            gamma_intensity=result.get("greeks_gamma_intensity", "LOW"),
+            kill_direction=result.get("greeks_kill_direction", ""),
+            who_dies_first=result.get("greeks_who_dies_first", ""),
+            gamma_executing=result.get("greeks_gamma_executing", False),
+            kill_speed=result.get("greeks_kill_speed", 0.0),
+            change_5m=change_5m_val,
+            rsi6=rsi6_val,
+            volume_ratio=volume_ratio
+        )
+        if ultra_short_gamma["override"]:
+            result["bias"] = ultra_short_gamma["bias"]
+            result["reason"] = f"[ULTRA SHORT GAMMA SQUEEZE] {ultra_short_gamma['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = ultra_short_gamma["priority"]
+            return result
+        
         # ===== PRIORITY -26850: POST MICRO-SWEEP DUMP =====
         # Deteksi setelah short_liq micro-sweep selesai, dump ke long_liq imminent
         post_micro = PostMicroSweepDumpDetector.detect(
@@ -16451,6 +16585,32 @@ class BinanceAnalyzer:
             return result
         
         # 0.1 No Seller / No Buyer Override (PRIORITY -20000)
+        
+        # ===== PRIORITY -20002: BAIT PHASE KILL DIRECTION GUARD =====
+        # Kasus MYXUSDT: market_phase = BAIT, who_dies_first = BOTH_POSSIBLE,
+        # vega_active = True, volume_ratio < 0.7 → JANGAN ikuti kill_direction,
+        # biarkan Vega fade yang menentukan. Blokir Greeks override jika ada.
+        bait_kill_guard = BaitPhaseKillDirectionGuard.detect(
+            market_phase=result.get("market_phase", "UNKNOWN"),
+            who_dies_first=result.get("greeks_who_dies_first", ""),
+            vega_active=result.get("greeks_vega_active", False),
+            volume_ratio=volume_ratio,
+            kill_direction=result.get("greeks_kill_direction", ""),
+            short_liq=short_liq,
+            long_liq=long_liq,
+            agg=agg_val,
+            ofi_bias=result.get("ofi_bias", "NEUTRAL")
+        )
+        if bait_kill_guard["override"]:
+            # Hanya blokir override dari Greeks, jangan ubah bias jika sudah ada dari detector lain
+            # Tapi jika bias berasal dari Greeks override, netralkan
+            if result.get("greeks_override") and result.get("bias") in ("LONG", "SHORT"):
+                result["bias"] = "NEUTRAL"
+                result["reason"] = f"[BAIT KILL GUARD] {bait_kill_guard['reason']} | " + result.get("reason", "")
+                result["confidence"] = "HIGH"
+                result["greeks_override"] = False
+                result["priority_level"] = bait_kill_guard["priority"]
+                # Jangan return dulu, biarkan detector lain (seperti Vega fade) bekerja
         
         # ===== PRIORITY -20001: GAMMA EXTREME BLOCKS NO SELLER =====
         # Jika Greeks gamma intensity = EXTREME dan kill_direction konsisten dengan liquidity,
