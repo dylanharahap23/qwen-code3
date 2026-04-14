@@ -2073,6 +2073,38 @@ class BaitPhaseKillDirectionGuard:
         }
 
 
+class AskWallDominanceOverride:
+    """
+    PRIORITY -20010 (lebih tinggi dari NO SELLER -20000)
+    
+    🔥 LECTURER SARAN LOGIC: Ask Wall Dominance meskipun down_energy = 0
+    
+    Dari data PLAYUSDT:
+    · long_liq = 0.92% (sangat dekat → seharusnya bounce)
+    · down_energy = 0 (tidak ada seller di bid → seharusnya naik)
+    · up_energy = 0.23 (ada buyer)
+    · ask_slope / bid_slope ≈ 1.47x (sell wall lebih tebal)
+    · Harga tetap turun karena ask wall menyerap semua buy pressure.
+    
+    Detector ini memaksa SHORT ketika ask wall dominan meskipun down_energy=0 dan long_liq dekat.
+    """
+    @staticmethod
+    def detect(long_liq: float, ask_slope: float, bid_slope: float,
+               down_energy: float, up_energy: float, change_5m: float) -> dict:
+        if bid_slope <= 0:
+            return {"override": False}
+        ratio = ask_slope / bid_slope
+        if (long_liq < 1.5 and ratio > 1.3 and down_energy < 0.01
+            and up_energy > 0 and change_5m < 0):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"ASK WALL DOMINANCE: long_liq={long_liq:.2f}% close, down_energy=0 tapi ask/bid={ratio:.2f}x → sell wall absorbs buys, price continues down",
+                "priority": -20010
+            }
+        return {"override": False}
+
+
 class NoSellerNoBuyerOverride:
     """
     🔥 PRIORITY -20000: Jika down_energy == 0 → TIDAK ADA SELLER → LONG.
@@ -17151,6 +17183,24 @@ class BinanceAnalyzer:
             result["reason"] = f"[GAMMA BLOCKS NO SELLER] {gamma_block['reason']}"
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = gamma_block["priority"]
+            return result
+        
+        # ===== PRIORITY -20010: ASK WALL DOMINANCE OVERRIDE =====
+        # 🔥 LECTURER SARAN LOGIC: Ask Wall Dominance meskipun down_energy = 0
+        # Dari data PLAYUSDT: long_liq dekat, down_energy=0, tapi ask/bid ratio > 1.3 → SHORT
+        ask_wall = AskWallDominanceOverride.detect(
+            long_liq=long_liq,
+            ask_slope=result.get("ask_slope", 0),
+            bid_slope=result.get("bid_slope", 1),
+            down_energy=down_energy_val,
+            up_energy=up_energy_val,
+            change_5m=change_5m_val
+        )
+        if ask_wall["override"]:
+            result["bias"] = ask_wall["bias"]
+            result["reason"] = f"[ASK WALL] {ask_wall['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = ask_wall["priority"]
             return result
         
         # 0.1 No Seller / No Buyer Override (PRIORITY -20000)

@@ -8,12 +8,15 @@ __pycache__/
 # Logs and temp files
 *.log
 *.tmp
-*.swp
 
 # Environment
 .env
 .env.local
 *.env.*
+
+# Editors
+.vscode/
+.idea/
 
 # Dependencies
 .venv/
@@ -24,14 +27,6 @@ node_modules/
 dist/
 build/
 target/
-
-# Editors
-.vscode/
-.idea/
-
-# OS
-.DS_Store
-Thumbs.db
 
 # Coverage
 .coverage
