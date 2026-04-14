@@ -4903,6 +4903,56 @@ class StaleOBVDistributionGuard:
         }
 
 
+class PhantomBidWallSqueezeGuard:
+    """
+    🔥 PRIORITY -10018.4 (LEBIH TINGGI dari PhantomBidWallAggVeto -10018.3)
+    
+    MEMBLOKIR PhantomBidWallAggVeto jika kondisi squeeze genuine:
+    - short_liq < 0.5% (ultra close)
+    - gamma_intensity == "EXTREME"
+    - kill_direction == "LONG"
+    - who_dies_first == "SHORT_TRADERS"
+    - kill_speed > 5.0
+    - change_5m > 3.0 (sudah pump signifikan)
+    
+    Kasus COAIUSDT: short_liq=0.3%, gamma EXTREME, kill=LONG, who_dies=SHORT, kill_speed=10
+    → PhantomBidWallAggVeto harus diblokir, force LONG.
+    """
+    @staticmethod
+    def detect(short_liq: float, gamma_intensity: str, kill_direction: str,
+               who_dies_first: str, kill_speed: float, change_5m: float,
+               up_energy: float, agg: float, ofi_bias: str) -> dict:
+        
+        # Kondisi squeeze genuine
+        squeeze_genuine = (
+            short_liq < 0.5 and
+            gamma_intensity == "EXTREME" and
+            kill_direction == "LONG" and
+            who_dies_first == "SHORT_TRADERS" and
+            kill_speed > 5.0 and
+            change_5m > 3.0
+        )
+        
+        if not squeeze_genuine:
+            return {"override": False}
+        
+        # Jika ada PhantomBidWallAggVeto akan trigger, kita override ke LONG
+        # (tanpa perlu menunggu detector lain)
+        return {
+            "override": True,
+            "bias": "LONG",
+            "reason": (
+                f"PHANTOM BID WALL SQUEEZE GUARD: "
+                f"short_liq={short_liq:.2f}% ultra close, "
+                f"gamma {gamma_intensity}, kill={kill_direction}, "
+                f"who_dies={who_dies_first}, kill_speed={kill_speed:.1f}, "
+                f"change={change_5m:.1f}% → squeeze genuine. "
+                f"Blokir PhantomBidWallAggVeto. Force LONG."
+            ),
+            "priority": -10018.4
+        }
+
+
 class PhantomBidWallAggVeto:
     """
     🔥 AIOTUSDT FIX: up_energy > 0 tapi agg < 0.35 = bid wall adalah SPOOFED
@@ -17306,6 +17356,25 @@ class BinanceAnalyzer:
             result["reason"] = f"[STALE OBV GUARD] {stale_obv['reason']} | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = stale_obv["priority"]
+            return result
+
+        # ===== PRIORITY -10018.4: PHANTOM BID WALL SQUEEZE GUARD =====
+        phantom_squeeze_guard = PhantomBidWallSqueezeGuard.detect(
+            short_liq=short_liq,
+            gamma_intensity=result.get("greeks_gamma_intensity", "LOW"),
+            kill_direction=result.get("greeks_kill_direction", ""),
+            who_dies_first=result.get("greeks_who_dies_first", ""),
+            kill_speed=result.get("greeks_kill_speed", 0.0),
+            change_5m=change_5m_val,
+            up_energy=up_energy_val,
+            agg=agg_val,
+            ofi_bias=ofi_bias
+        )
+        if phantom_squeeze_guard["override"]:
+            result["bias"] = phantom_squeeze_guard["bias"]
+            result["reason"] = f"[PHANTOM SQUEEZE GUARD] {phantom_squeeze_guard['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = phantom_squeeze_guard["priority"]
             return result
 
         # ===== PRIORITY -10018.3: PHANTOM BID WALL AGG VETO =====
