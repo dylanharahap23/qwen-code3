@@ -2076,6 +2076,163 @@ class MaximumCrowdingLongLiqCloserShort:
         }
 
 
+class DipThenRipAggConfirm:
+    """
+    🔥 PRIORITY -28000 (TERTINGGI ABSOLUT BARU - LECTURER SARAN LOGIC):
+    
+    DUSDT CASE: long_liq dekat + agg=1.00 + down_energy=0 + ofi LONG + change_5m negatif kecil
+    = HFT turunkan harga sedikit untuk sweep long stop, lalu PUMP.
+    
+    BUKAN dump karena:
+    - 100% trades adalah BUY (agg=1.00)
+    - Tidak ada seller sama sekali (down_energy=0)
+    - Order flow LONG (ofi LONG kuat)
+    - long_liq sangat dekat (<1.5%) adalah TARGET SWEEP, BUKAN target dump
+    
+    Kondisi:
+    - agg > 0.90
+    - down_energy < 0.01
+    - ofi_bias == "LONG" and ofi_strength > 0.7
+    - long_liq < 1.5
+    - change_5m < 0 (harga turun sedikit, dalam proses sweep)
+    - (opsional) short_liq > long_liq * 1.5 (ada target pump setelah sweep)
+    
+    Priority: -28000 (LEBIH TINGGI dari MaximumCrowdingLongLiqCloserShort -27900)
+    Bias: LONG
+    """
+    @staticmethod
+    def detect(agg: float, down_energy: float,
+               ofi_bias: str, ofi_strength: float,
+               long_liq: float, short_liq: float,
+               change_5m: float, up_energy: float,
+               funding_rate: float = 0.0) -> dict:
+        
+        # Kondisi utama
+        agg_perfect = agg > 0.90
+        no_seller = down_energy < 0.01
+        ofi_bullish = ofi_bias == "LONG" and ofi_strength > 0.7
+        long_liq_close = long_liq < 1.5
+        price_dipping = change_5m < 0
+        
+        # Konfirmasi tambahan (tidak wajib, tapi memperkuat)
+        has_buyer = up_energy > 0.1
+        short_liq_further = short_liq > long_liq * 1.5 if long_liq > 0 else False
+        funding_not_crowded_long = funding_rate is None or funding_rate < 0.003
+        
+        # Minimal 4 dari 5 kondisi utama harus terpenuhi
+        core_conditions = [
+            agg_perfect,
+            no_seller,
+            ofi_bullish,
+            long_liq_close,
+            price_dipping
+        ]
+        core_score = sum(core_conditions)
+        
+        if core_score >= 4:
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": (
+                    f"DIP THEN RIP AGG CONFIRM: agg={agg:.2f} (100% buy), "
+                    f"down_energy={down_energy:.3f} (no sellers), "
+                    f"OFI {ofi_bias} {ofi_strength:.2f}, "
+                    f"long_liq={long_liq:.2f}% (sweep target), "
+                    f"price dip {change_5m:.1f}% → "
+                    f"HFT sedang turun untuk sweep long stop, "
+                    f"setelah itu PUMP. Force LONG."
+                ),
+                "priority": -28000
+            }
+        
+        return {"override": False}
+
+
+class RSI5mExtremeTrendOverride:
+    """
+    🔥 PRIORITY -27950 (TERTINGGI KEDUA - LECTURER SARAN LOGIC):
+    
+    INUSDT CASE: RSI 5m > 85 (overbought ekstrem) meskipun harga turun sedikit
+    = trend 5m masih bearish, reversal ke bawah belum selesai.
+    
+    Sistem sering salah membaca "no seller" (down_energy=0) sebagai sinyal LONG,
+    padahal ketika RSI 5m sangat overbought (>85) dan harga baru mulai turun,
+    arah sebenarnya adalah SHORT (lanjutan dump).
+    
+    Kondisi:
+    - rsi6_5m > 85 (overbought ekstrem di 5m)
+    - change_5m < 0 (harga sedang turun, meski sedikit)
+    - market_phase == "BAIT" (gerakan ini palsu, akan lanjut)
+    - volume_ratio < 0.8 (volume rendah = tidak ada conviction)
+    - (opsional) down_energy == 0 (tidak ada seller = ini justru jebakan)
+    
+    Mirror untuk oversold ekstrem:
+    - rsi6_5m < 15
+    - change_5m > 0
+    - market_phase == "BAIT"
+    - volume_ratio < 0.8
+    → force LONG
+    
+    Priority: -27950 (LEBIH RENDAH dari DipThenRipAggConfirm -28000, TAPI lebih tinggi dari MaximumCrowdingLongLiqCloserShort -27900)
+    """
+    @staticmethod
+    def detect(rsi6_5m: float, change_5m: float,
+               market_phase: str, volume_ratio: float,
+               down_energy: float, up_energy: float,
+               agg: float = 0.5, ofi_bias: str = "NEUTRAL") -> dict:
+        
+        # CASE A: Overbought ekstrem di 5m + harga turun = lanjut SHORT
+        if (rsi6_5m > 85 and
+            change_5m < 0 and
+            market_phase == "BAIT" and
+            volume_ratio < 0.8):
+            
+            # Konfirmasi tambahan: down_energy=0 justru mengkonfirmasi ini jebakan
+            # (HFT hapus seller untuk ilusi support)
+            no_seller_trap = down_energy < 0.01
+            
+            # Jangan override jika agg sangat bullish (>0.85) dan ofi LONG
+            agg_strong_bullish = agg > 0.85 and ofi_bias == "LONG"
+            
+            if not agg_strong_bullish:
+                return {
+                    "override": True,
+                    "bias": "SHORT",
+                    "reason": (
+                        f"RSI5m EXTREME OVERBOUGHT TREND OVERRIDE: "
+                        f"RSI5m={rsi6_5m:.1f} (>85), price down {change_5m:.1f}%, "
+                        f"market_phase={market_phase}, volume={volume_ratio:.2f}x, "
+                        f"down_energy={down_energy:.3f} ({'no sellers = trap' if no_seller_trap else 'sellers present'}) → "
+                        f"trend 5m masih bearish, lanjut SHORT."
+                    ),
+                    "priority": -27950
+                }
+        
+        # CASE B: Oversold ekstrem di 5m + harga naik = lanjut LONG
+        if (rsi6_5m < 15 and
+            change_5m > 0 and
+            market_phase == "BAIT" and
+            volume_ratio < 0.8):
+            
+            no_buyer_trap = up_energy < 0.01
+            agg_strong_bearish = agg < 0.15 and ofi_bias == "SHORT"
+            
+            if not agg_strong_bearish:
+                return {
+                    "override": True,
+                    "bias": "LONG",
+                    "reason": (
+                        f"RSI5m EXTREME OVERSOLD TREND OVERRIDE: "
+                        f"RSI5m={rsi6_5m:.1f} (<15), price up {change_5m:.1f}%, "
+                        f"market_phase={market_phase}, volume={volume_ratio:.2f}x → "
+                        f"trend 5m masih bullish, lanjut LONG."
+                    ),
+                    "priority": -27950
+                }
+        
+        return {"override": False}
+
+
 class StochJOverflowMaxCrowdingDump:
     """
     🔥 PRIORITY -27850 (LECTURER SARAN LOGIC):
@@ -17377,6 +17534,49 @@ class BinanceAnalyzer:
         # ========== LAYER 0: ENERGY & EXHAUSTION OVERRIDE (PRIORITAS TERTINGGI) ==========
         # Harus di awal, sebelum PHASE LOCK dan GREEKS
         # Detector-detector dari dosen untuk anti-HFT manipulation
+        
+        # ===== PRIORITY -28000: DIP THEN RIP AGG CONFIRM (TERTINGGI ABSOLUT BARU) =====
+        # DUSDT CASE: long_liq dekat + agg=1.00 + down_energy=0 + ofi LONG + change_5m negatif kecil
+        # = HFT turunkan harga sedikit untuk sweep long stop, lalu PUMP.
+        dip_rip = DipThenRipAggConfirm.detect(
+            agg=result.get("agg", 0.5),
+            down_energy=down_energy_val,
+            ofi_bias=ofi_bias,
+            ofi_strength=ofi_strength,
+            long_liq=long_liq,
+            short_liq=short_liq,
+            change_5m=change_5m_val,
+            up_energy=up_energy_val,
+            funding_rate=funding_rate_val
+        )
+        if dip_rip["override"]:
+            result["bias"] = dip_rip["bias"]
+            result["reason"] = f"[DIP THEN RIP] {dip_rip['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = dip_rip["priority"]
+            result["entry_allowed"] = True
+            return result
+        
+        # ===== PRIORITY -27950: RSI5m EXTREME TREND OVERRIDE (TERTINGGI KEDUA) =====
+        # INUSDT CASE: RSI 5m > 85 (overbought ekstrem) meskipun harga turun sedikit
+        # = trend 5m masih bearish, reversal ke bawah belum selesai.
+        rsi5m_override = RSI5mExtremeTrendOverride.detect(
+            rsi6_5m=rsi6_5m_val,
+            change_5m=change_5m_val,
+            market_phase=market_phase,
+            volume_ratio=volume_ratio,
+            down_energy=down_energy_val,
+            up_energy=up_energy_val,
+            agg=result.get("agg", 0.5),
+            ofi_bias=ofi_bias
+        )
+        if rsi5m_override["override"]:
+            result["bias"] = rsi5m_override["bias"]
+            result["reason"] = f"[RSI5m TREND] {rsi5m_override['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = rsi5m_override["priority"]
+            result["entry_allowed"] = True
+            return result
         
         # ===== PRIORITY -27500: MAXIMUM CROWDING ABSOLUTE BLOCK (TERTINGGI ABSOLUT BARU) =====
         # Kasus AIAUSDT, TRADOORUSDT, XNYUSDT: semua gagal karena tidak ada detector ini
