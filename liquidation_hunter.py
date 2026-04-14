@@ -1831,6 +1831,43 @@ class ExchangeRiskScoreHardBlock:
         }
 
 
+class ExtremeShortLiqNoSellerSqueezeGuard:
+    """
+    🔥 PRIORITY -27400 (HIGHER THAN REVERSE SQUEEZE BAIT):
+    When short_liq is ultra close (<0.6%) AND there are no sellers (down_energy=0)
+    AND there is buying pressure (up_energy>0), the market will sweep that tiny
+    short liquidity first, regardless of long_liq size or funding.
+    Overrides ReverseSqueezeBaitDetector and forces LONG.
+    """
+    @staticmethod
+    def detect(
+        short_liq: float,
+        down_energy: float,
+        up_energy: float,
+        change_5m: float,
+        agg: float = 0.5
+    ) -> dict:
+        if (short_liq < 0.6 and
+            down_energy < 0.01 and
+            up_energy > 0.0 and
+            change_5m > -0.5):   # not in free fall
+            # Optional: avoid firing when agg is extremely bearish (<0.3)
+            if agg < 0.3:
+                return {"override": False}
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": (
+                    f"EXTREME SHORT LIQ NO SELLER SQUEEZE: short_liq={short_liq:.2f}% "
+                    f"ultra close, down_energy={down_energy:.3f} (zero sellers), "
+                    f"up_energy={up_energy:.2f} >0, change_5m={change_5m:.2f}% → "
+                    f"HFT will sweep the tiny short stop FIRST. Override reverse bait. Force LONG."
+                ),
+                "priority": -27400
+            }
+        return {"override": False}
+
+
 class ReverseSqueezeBaitDetector:
     """
     🔥 PRIORITY -27300:
@@ -1865,11 +1902,17 @@ class ReverseSqueezeBaitDetector:
         delta_crowded: str,
         kill_direction: str,
         rsi6: float,
-        volume_ratio: float
+        volume_ratio: float,
+        down_energy: float = 0.0  # NEW parameter for early exit check
     ) -> dict:
         
         if funding_rate is None:
             funding_rate = 0.0
+        
+        # 🔥 OPTIONAL ENHANCEMENT: Early exit if short_liq is extremely close and no sellers
+        # This prevents reverse-bait logic from firing when market is clearly set for immediate short squeeze
+        if short_liq < 0.6 and down_energy < 0.01:
+            return {"override": False}
         
         # Core: short_liq dekat tapi long_liq jauh lebih besar
         if long_liq <= short_liq * 3:
@@ -16689,6 +16732,26 @@ class BinanceAnalyzer:
             result["entry_allowed"] = True
             return result
         
+        # ===== PRIORITY -27400: EXTREME SHORT LIQ NO SELLER SQUEEZE GUARD =====
+        # When short_liq is ultra close (<0.6%) AND there are no sellers (down_energy=0)
+        # AND there is buying pressure (up_energy>0), the market will sweep that tiny
+        # short liquidity first, regardless of long_liq size or funding.
+        # Overrides ReverseSqueezeBaitDetector and forces LONG.
+        extreme_short_guard = ExtremeShortLiqNoSellerSqueezeGuard.detect(
+            short_liq=short_liq,
+            down_energy=down_energy_val,
+            up_energy=up_energy_val,
+            change_5m=change_5m_val,
+            agg=agg_val
+        )
+        if extreme_short_guard["override"]:
+            result["bias"] = extreme_short_guard["bias"]
+            result["reason"] = f"[EXTREME SHORT LIQ SQUEEZE] {extreme_short_guard['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = extreme_short_guard["priority"]
+            result["entry_allowed"] = True
+            return result
+        
         # ===== PRIORITY -27300: REVERSE SQUEEZE BAIT DETECTOR =====
         # Pola paling licik Binance: short_liq dekat sebagai umpan, long_liq jauh lebih besar sebagai target
         reverse_bait = ReverseSqueezeBaitDetector.detect(
@@ -16700,7 +16763,8 @@ class BinanceAnalyzer:
             delta_crowded=result.get("greeks_delta_crowded", ""),
             kill_direction=result.get("greeks_kill_direction", ""),
             rsi6=rsi6_val,
-            volume_ratio=volume_ratio
+            volume_ratio=volume_ratio,
+            down_energy=down_energy_val  # NEW: for early exit check
         )
         if reverse_bait["override"]:
             result["bias"] = reverse_bait["bias"]
