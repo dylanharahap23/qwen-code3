@@ -3005,6 +3005,76 @@ class TrueShortSqueezeValidator:
         return {"is_genuine": None, "override": False}
 
 
+class AdversarialRotationDetector:
+    """
+    🔥 PRIORITY: Modifier (bukan override):
+    
+    Binance Adversarial Adaptation Pattern:
+    
+    Ketika sistem belajar pola A → Binance rotate ke pola B yang bertolak belakang.
+    
+    Pattern yang terdeteksi:
+    - Setelah banyak SHORT signal → Binance munculkan short_liq dekat + bounce
+    - Setelah banyak LONG signal → Binance munculkan long_liq dekat + dump
+    
+    Solusi: Track "consecutive same direction" signals dan apply discount
+    jika terlalu banyak signal arah yang sama dalam waktu singkat.
+    
+    Priority: Modifier (bukan override), reduces confidence.
+    """
+    _signal_history: Dict[str, List[Tuple[float, str]]] = {}
+
+    @classmethod
+    def record_signal(cls, symbol: str, bias: str):
+        """Catat bias output akhir (LONG/SHORT) dengan timestamp."""
+        now = time.time()
+        if symbol not in cls._signal_history:
+            cls._signal_history[symbol] = []
+        cls._signal_history[symbol].append((now, bias))
+        # Hanya simpan 30 menit terakhir
+        cls._signal_history[symbol] = [
+            (t, b) for t, b in cls._signal_history[symbol] if now - t <= 1800
+        ]
+
+    @classmethod
+    def get_rotation_risk(cls, symbol: str, current_bias: str) -> Dict:
+        """
+        Return risk level and discount multiplier (0..1).
+        High risk = 80%+ same direction in last 15 minutes → discount 0.3
+        Medium risk = 65%+ same direction → discount 0.15
+        """
+        history = cls._signal_history.get(symbol, [])
+        if len(history) < 4:   # butuh minimal 4 sinyal untuk analisis
+            return {"risk": "LOW", "consecutive": 0, "discount": 0}
+
+        now = time.time()
+        # hanya 15 menit terakhir
+        recent = [(t, b) for t, b in history if now - t <= 900]
+        if not recent:
+            return {"risk": "LOW", "consecutive": 0, "discount": 0}
+
+        same_dir = sum(1 for _, b in recent if b == current_bias)
+        total = len(recent)
+        same_pct = same_dir / total
+
+        if same_pct >= 0.8 and total >= 5:
+            return {
+                "risk": "HIGH",
+                "consecutive": same_dir,
+                "total": total,
+                "discount": 0.3,
+                "reason": f"Adversarial rotation risk: {same_dir}/{total} signals = {current_bias} dalam 15 menit → Binance mungkin rotate"
+            }
+        elif same_pct >= 0.65 and total >= 4:
+            return {
+                "risk": "MEDIUM",
+                "consecutive": same_dir,
+                "discount": 0.15,
+                "reason": f"Moderate rotation risk: {same_pct:.0%} same direction"
+            }
+        return {"risk": "LOW", "consecutive": same_dir, "discount": 0}
+
+
 class ReverseSqueezeBaitDetector:
     """
     🔥 PRIORITY -27300:
@@ -24220,7 +24290,37 @@ class BinanceAnalyzer:
                 result["reason"] += f" | {age_data['reason']}"
                 if result.get("confidence") == "ABSOLUTE":
                     result["confidence"] = "HIGH"
+            
+            # ===== ADVERSARIAL ROTATION DETECTOR =====
+            # Rekam bias akhir untuk simbol ini sebelum stability filters
+            if final_bias in ("LONG", "SHORT"):
+                AdversarialRotationDetector.record_signal(self.symbol, final_bias)
+            
             result = self._apply_stability_filters(result, phase_result, {})
+            
+            # ===== APPLY ADVERSARIAL ROTATION DISCOUNT =====
+            # Hitung rotation risk setelah stability filters (karena bias bisa berubah)
+            final_bias_after = result.get("bias", "NEUTRAL")
+            if final_bias_after in ("LONG", "SHORT"):
+                rotation = AdversarialRotationDetector.get_rotation_risk(self.symbol, final_bias_after)
+                result["rotation_risk"] = rotation["risk"]
+                result["rotation_consecutive"] = rotation.get("consecutive", 0)
+
+                if rotation["risk"] == "HIGH":
+                    # Turunkan confidence (jika ABSOLUTE → HIGH)
+                    if result.get("confidence") == "ABSOLUTE":
+                        result["confidence"] = "HIGH"
+                    # Tambahkan penjelasan ke reason
+                    result["reason"] += f" | ⚠️ ADVERSARIAL ROTATION: {rotation.get('reason', '')}"
+                    # Kurangi position multiplier
+                    result["position_multiplier"] = result.get("position_multiplier", 1.0) * (1 - rotation["discount"])
+                    # Pastikan tidak kurang dari 0.2
+                    result["position_multiplier"] = max(0.2, result["position_multiplier"])
+                elif rotation["risk"] == "MEDIUM":
+                    # hanya kurangi sedikit
+                    result["position_multiplier"] = result.get("position_multiplier", 1.0) * (1 - rotation["discount"])
+                    result["position_multiplier"] = max(0.3, result["position_multiplier"])
+                    result["reason"] += f" | Rotation risk: {rotation.get('reason', '')}"
 
             return result
 
@@ -24316,7 +24416,10 @@ class BinanceAnalyzer:
             "bid_slope": 0.0,
             "ask_slope": 0.0,
             "predicted_price": 0.0,
-            "position_multiplier": 1.0
+            "position_multiplier": 1.0,
+            # Adversarial Rotation fields (akan diisi oleh analyze() jika ada data)
+            "rotation_risk": None,
+            "rotation_consecutive": 0
         }
 
         return result
@@ -24341,7 +24444,10 @@ class BinanceAnalyzer:
             "funding_rate": None, "latency_ms": self.last_latency,
             "latest_volume": 0, "volume_ma10": 0, "floating_pnl": 0.0,
             "rsi6_5m": 0, "bid_slope": 0.0, "ask_slope": 0.0, "predicted_price": 0.0,
-            "position_multiplier": 1.0
+            "position_multiplier": 1.0,
+            # Adversarial Rotation fields (not applicable for latency result)
+            "rotation_risk": None,
+            "rotation_consecutive": 0
         }
         return result
 
@@ -24453,6 +24559,14 @@ class OutputFormatter:
 
         if result.get('funding_rate') is not None:
             print(f"💰 Funding Rate: {result['funding_rate']:.6f}")
+
+        # 🔥 ADVERSARIAL ROTATION DETECTOR OUTPUT
+        if result.get('rotation_risk'):
+            rotation_icon = "🚨 HIGH" if result['rotation_risk'] == "HIGH" else "⚠️ MEDIUM" if result['rotation_risk'] == "MEDIUM" else "✅ LOW"
+            print(f"\n🔄 ADVERSARIAL ROTATION RISK: {rotation_icon}")
+            print(f"   └─ Consecutive same direction: {result.get('rotation_consecutive', 0)}")
+            if result.get('rotation_risk') in ('HIGH', 'MEDIUM'):
+                print(f"   └─ Position multiplier reduced due to rotation risk")
 
         print("\n" + "="*80)
 
