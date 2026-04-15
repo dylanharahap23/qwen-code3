@@ -3081,6 +3081,60 @@ class BaitNoSellerTrapOverride:
         return {"override": False}
 
 
+class BidWallSpoofOverboughtTrap:
+    """
+    🔥 PRIORITY -20015 (LEBIH TINGGI dari NoSellerNoBuyerOverride -20000)
+    
+    Mendeteksi bid wall spoofing di kondisi overbought:
+    - bid_slope > ask_slope * 1.5 (bid wall lebih tebal)
+    - up_energy < 0.1 (tidak ada buy pressure nyata)
+    - agg > 0.7 (trades BUY mayoritas - tapi ini spoof micro-trades)
+    - volume_ratio < 0.6 (volume ultra rendah)
+    - rsi6 > 75 (overbought)
+    - short_liq < 3.0 (target dekat - umpan)
+    - change_5m > 1.0 (harga sudah naik)
+    
+    Ini adalah HFT memasang bid wall untuk ilusi support, menggunakan micro-trades
+    untuk membuat agg tinggi, menarik pembeli retail, lalu dump.
+    """
+    @staticmethod
+    def detect(bid_slope: float, ask_slope: float,
+               up_energy: float, agg: float,
+               volume_ratio: float, rsi6: float,
+               short_liq: float, change_5m: float,
+               down_energy: float) -> dict:
+        
+        if bid_slope <= 0 or ask_slope <= 0:
+            return {"override": False}
+        
+        bid_ask_ratio = bid_slope / ask_slope
+        
+        # Core conditions
+        if (bid_ask_ratio > 1.5 and           # bid wall lebih tebal
+            up_energy < 0.1 and               # tidak ada buy pressure nyata
+            agg > 0.7 and                     # trades BUY tinggi (spoofed)
+            volume_ratio < 0.6 and            # volume ultra rendah
+            rsi6 > 75 and                     # overbought
+            short_liq < 3.0 and               # short liq dekat (umpan)
+            change_5m > 1.0 and               # harga sudah naik
+            down_energy < 0.1):               # tidak ada seller (ilusi)
+            
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"BID WALL SPOOF OVERBOUGHT TRAP: bid_slope={bid_slope:.0f} > ask_slope={ask_slope:.0f} "
+                    f"(ratio {bid_ask_ratio:.1f}x) → support ilusi, up_energy={up_energy:.2f} (no real buyers), "
+                    f"agg={agg:.2f} ({(agg*100):.0f}% BUY micro-trades), volume={volume_ratio:.2f}x kering, "
+                    f"RSI6={rsi6:.1f} overbought, short_liq={short_liq:.2f}% umpan. "
+                    f"HFT pasang bid wall untuk pancing LONG, akan dump. Force SHORT."
+                ),
+                "priority": -20015
+            }
+        
+        return {"override": False}
+
+
 class NoSellerNoBuyerOverride:
     """
     🔥 PRIORITY -20000: Jika down_energy == 0 → TIDAK ADA SELLER → LONG.
@@ -18623,6 +18677,26 @@ class BinanceAnalyzer:
             result["reason"] = f"[BAIT NO SELLER TRAP] {bait_trap['reason']} | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = bait_trap["priority"]
+            result["entry_allowed"] = True
+            return result
+        
+        # ===== PRIORITY -20015: BID WALL SPOOF OVERBOUGHT TRAP =====
+        bid_spoof = BidWallSpoofOverboughtTrap.detect(
+            bid_slope=result.get("bid_slope", 0),
+            ask_slope=result.get("ask_slope", 0),
+            up_energy=up_energy_val,
+            agg=agg_val,
+            volume_ratio=volume_ratio,
+            rsi6=rsi6_val,
+            short_liq=short_liq,
+            change_5m=change_5m_val,
+            down_energy=down_energy_val
+        )
+        if bid_spoof["override"]:
+            result["bias"] = bid_spoof["bias"]
+            result["reason"] = f"[BID WALL SPOOF] {bid_spoof['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = bid_spoof["priority"]
             result["entry_allowed"] = True
             return result
         
