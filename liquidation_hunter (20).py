@@ -2183,6 +2183,58 @@ class ExchangeGreeksTripleAlignment:
         }
 
 
+class ExchangeRiskTripleAlignmentVeto:
+    """
+    PRIORITY -27860 (antara TripleAlignment -27850 dan OBVNeg -27800):
+    
+    Triple Alignment bisa salah ketika:
+    - exchange_risk_score >= 7 (Binance sendiri rate HIGH RISK)
+    - long_liq ultra dekat (< 0.8%) = cascade target, bukan sweep
+    - volume sangat kering (< 0.55x) = manufactured vacuum
+    
+    ARIAUSDT case: triple_align=LONG tapi exchange_risk=7, 
+    long_liq=0.40%, volume=0.49x → LONG mati
+    """
+    @staticmethod
+    def detect(triple_align_bias: str, exchange_risk_score: int,
+               long_liq: float, short_liq: float,
+               volume_ratio: float, rsi6_5m: float,
+               funding_rate: float) -> dict:
+        
+        if exchange_risk_score < 7:
+            return {"override": False}
+        
+        if triple_align_bias != "LONG":
+            return {"override": False}
+        
+        # Long liq harus ultra dekat (cascade, bukan sweep)
+        if long_liq >= 1.0:
+            return {"override": False}
+        
+        # Volume harus kering (manufactured vacuum)
+        if volume_ratio >= 0.6:
+            return {"override": False}
+        
+        # RSI 5m tidak boleh sangat oversold
+        # (jika < 15, mungkin memang genuine bounce)
+        if rsi6_5m < 15:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"EXCHANGE RISK TRIPLE ALIGNMENT VETO: "
+                f"triple_align=LONG tapi exchange_risk={exchange_risk_score}/10, "
+                f"long_liq={long_liq:.2f}% (cascade target, bukan squeeze), "
+                f"volume={volume_ratio:.2f}x kering → "
+                f"Binance sendiri rate HIGH RISK. Triple Alignment FALSE POSITIVE. "
+                f"Force SHORT."
+            ),
+            "priority": -27860
+        }
+
+
 class MassiveOBVNegativeFundingPositiveDumpGuard:
     """
     PRIORITY -27800:
@@ -2682,6 +2734,71 @@ class RSI5mExtremeTrendOverride:
         return {"override": False}
 
 
+class RSITimeframeDivergenceTrapV2:
+    """
+    PRIORITY -27955 (lebih tinggi dari RSI5mExtremeTrendOverride -27950):
+    
+    BASEDUSDT EXACT PATTERN:
+    RSI 1m < 35 (terlihat oversold = opportunity LONG)
+    RSI 5m > 65 (overbought di timeframe lebih besar = trend turun)
+    Gap > 30 poin = divergence ekstrem = DEAD CAT BOUNCE
+    
+    Sistem ikut RSI 1m → kalah karena trend 5m lebih dominan.
+    
+    Konfirmasi wajib (minimal 2 dari 4):
+    - algo_type_bias == "SHORT" (algo tahu)
+    - volume_ratio < 0.5 (tidak ada momentum nyata)
+    - change_5m < 0 (harga turun = trend konfirmasi)
+    - long_liq < short_liq (ada gravitasi ke bawah)
+    """
+    @staticmethod
+    def detect(rsi6: float, rsi6_5m: float, 
+               algo_type_bias: str, volume_ratio: float,
+               change_5m: float, long_liq: float, 
+               short_liq: float, up_energy: float,
+               down_energy: float) -> dict:
+        
+        rsi_gap = rsi6_5m - rsi6
+        
+        # Gap harus > 30 poin (ekstrem)
+        if rsi_gap < 30:
+            return {"override": False}
+        
+        # 1m harus terlihat oversold (umpan LONG)
+        if rsi6 >= 40:
+            return {"override": False}
+        
+        # 5m harus overbought (trend lebih besar bearish)
+        if rsi6_5m <= 60:
+            return {"override": False}
+        
+        # Konfirmasi (minimal 2 dari 4)
+        confirmations = {
+            "algo_short": algo_type_bias == "SHORT",
+            "volume_dry": volume_ratio < 0.55,
+            "price_falling": change_5m < 0,
+            "long_liq_closer": long_liq < short_liq
+        }
+        
+        conf_count = sum(confirmations.values())
+        if conf_count < 2:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"RSI TIMEFRAME DIVERGENCE TRAP V2: "
+                f"RSI1m={rsi6:.1f} (oversold UMPAN) vs RSI5m={rsi6_5m:.1f} "
+                f"(gap={rsi_gap:.0f}poin, trend 5m masih bearish). "
+                f"Dead cat bounce. algo={algo_type_bias}, "
+                f"volume={volume_ratio:.2f}x. "
+                f"confirmations={conf_count}/4. Force SHORT."
+            ),
+            "priority": -27955
+        }
+
+
 class StochJOverflowMaxCrowdingDump:
     """
     🔥 PRIORITY -27850 (LECTURER SARAN LOGIC):
@@ -2738,6 +2855,78 @@ class StochJOverflowMaxCrowdingDump:
                 f"Force SHORT. Block StochJOverflowShortLiqMicroSweepGuard."
             ),
             "priority": -27850
+        }
+
+
+class SequentialSweepOrderDetector:
+    """
+    PRIORITY -27870 (antara ExchangeRiskVeto -27860 dan TripleAlign -27850):
+    
+    BRUSDT EXACT PATTERN:
+    short_liq = 0.39% (ULTRA DEKAT)
+    long_liq = 3.68% (JAUH)
+    funding = 0.000544 (crowded LONG)
+    kill = SHORT, who_dies = LONG_TRADERS
+    
+    Sistem paksa SHORT karena "crowded LONG + kill=SHORT".
+    TAPI short_liq 0.39% PASTI disapu DULU sebelum dump ke long_liq.
+    
+    Urutan Binance: NAIK dulu (sweep short_liq 0.39%) → BARU TURUN (dump ke long_liq 3.68%)
+    
+    Kondisi untuk "sweep naik dulu":
+    - short_liq < 0.6% (ultra close, hampir pasti disapu)
+    - long_liq > short_liq * 4 (target dump jauh lebih besar)  
+    - funding > 0 (ada crowded long sebagai target akhir)
+    - kill == "SHORT" tapi short_liq LEBIH DEKAT dari long_liq
+    
+    Ini adalah "Two-Step Sweep" yang sering diabaikan sistem.
+    """
+    @staticmethod
+    def detect(short_liq: float, long_liq: float,
+               funding_rate: float, kill_direction: str,
+               change_5m: float, up_energy: float,
+               down_energy: float, agg: float,
+               rsi6: float) -> dict:
+        
+        if funding_rate is None:
+            return {"override": False}
+        
+        # short_liq harus ultra dekat
+        if short_liq >= 0.65:
+            return {"override": False}
+        
+        # long_liq harus jauh lebih besar (target step 2)
+        if long_liq < short_liq * 4:
+            return {"override": False}
+        
+        # Kondisi ini hanya relevan jika kill arahnya bertentangan
+        # kill=SHORT tapi short_liq lebih dekat = step 1 belum selesai
+        if kill_direction != "SHORT":
+            return {"override": False}
+        
+        # RSI tidak boleh terlalu overbought (masih ada ruang naik step 1)
+        if rsi6 > 90:
+            return {"override": False}
+        
+        # Ada buy pressure (step 1 masih berjalan)
+        has_buy = up_energy > 0.1 or agg > 0.5
+        if not has_buy:
+            return {"override": False}
+        
+        ratio = long_liq / short_liq
+        
+        return {
+            "override": True,
+            "bias": "LONG",
+            "reason": (
+                f"SEQUENTIAL SWEEP ORDER: short_liq={short_liq:.2f}% ULTRA DEKAT "
+                f"(step 1 belum selesai), long_liq={long_liq:.2f}% "
+                f"(ratio {ratio:.1f}x, target step 2). "
+                f"kill=SHORT tapi urutan sweep: NAIK dulu → baru turun. "
+                f"funding={funding_rate:.5f}. "
+                f"Force LONG sampai short_liq tersapu."
+            ),
+            "priority": -27870
         }
 
 
@@ -18876,6 +19065,27 @@ class BinanceAnalyzer:
             result["entry_allowed"] = True
             return result
 
+        # ===== PRIORITY -27860: EXCHANGE RISK TRIPLE ALIGNMENT VETO =====
+        # HARUS SETELAH Triple Alignment (-27850) tapi SEBELUM Massive OBV (-27800)
+        # ARIAUSDT FIX: triple_align=LONG tapi exchange_risk=7, long_liq ultra dekat, volume kering
+        # = Triple Alignment FALSE POSITIVE, force SHORT
+        exchange_risk_veto = ExchangeRiskTripleAlignmentVeto.detect(
+            triple_align_bias=triple_align.get("bias", ""),
+            exchange_risk_score=result.get("exchange_risk_score", 0),
+            long_liq=long_liq,
+            short_liq=short_liq,
+            volume_ratio=volume_ratio,
+            rsi6_5m=rsi6_5m_val,
+            funding_rate=funding_rate_val
+        )
+        if exchange_risk_veto["override"]:
+            result["bias"] = exchange_risk_veto["bias"]
+            result["reason"] = f"[EXCHANGE RISK VETO] {exchange_risk_veto['reason']}"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = exchange_risk_veto["priority"]
+            result["entry_allowed"] = True
+            return result
+
         # ===== PRIORITY -27800: MASSIVE OBV NEGATIVE + FUNDING POSITIVE =====
         # Harus SEBELUM NoSellerNoBuyerOverride (-20000) dan setelah Triple Alignment
         # BLESSUSDT FIX: OBV -570M + funding + + BAIT phase → force SHORT, cancel NoSeller
@@ -18983,6 +19193,28 @@ class BinanceAnalyzer:
             result["reason"] = f"[RSI5m TREND] {rsi5m_override['reason']} | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = rsi5m_override["priority"]
+            result["entry_allowed"] = True
+            return result
+        
+        # ===== PRIORITY -27955: RSI TIMEFRAME DIVERGENCE TRAP V2 =====
+        # BASEDUSDT CASE: RSI 1m oversold tapi RSI 5m overbought, gap > 30 poin
+        # = Dead cat bounce, force SHORT
+        rsi_div_trap = RSITimeframeDivergenceTrapV2.detect(
+            rsi6=rsi6_val,
+            rsi6_5m=rsi6_5m_val,
+            algo_type_bias=result.get("algo_type_bias", "NEUTRAL"),
+            volume_ratio=volume_ratio,
+            change_5m=change_5m_val,
+            long_liq=long_liq,
+            short_liq=short_liq,
+            up_energy=up_energy_val,
+            down_energy=down_energy_val
+        )
+        if rsi_div_trap["override"]:
+            result["bias"] = rsi_div_trap["bias"]
+            result["reason"] = f"[RSI DIVERGENCE TRAP] {rsi_div_trap['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = rsi_div_trap["priority"]
             result["entry_allowed"] = True
             return result
         
