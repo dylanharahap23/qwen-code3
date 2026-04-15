@@ -1,10 +1,10 @@
 ```
-# Environment
+# Environment files
 .env
 .env.local
-*.env.*
+.env.*
 
-# Logs and temp files
+# Logs and temporary files
 *.log
 *.tmp
 *.swp
@@ -21,28 +21,25 @@ __pycache__/
 .Python
 *.so
 .coverage
+coverage/
 htmlcov/
-.coverage.*
-.pytest_cache/
-.mypy_cache/
 
-# Dependencies
+# Dependency directories
 venv/
 .venv/
-.env
+env/
+ENV/
+.ENV/
 pip-log.txt
-pip-selfcheck.json
-node_modules/
-.jupyter
-.ipython
-.ipynb_checkpoints
+pipenv.lock
+requirements.txt.bak
 
-# Build artifacts
+# Build and distribution artifacts
 build/
 dist/
 *.egg-info/
-.target/
-target/
+.installed.cfg
+*.egg
 
 # OS generated files
 .DS_Store
@@ -52,5 +49,4 @@ target/
 .Trashes
 ehthumbs.db
 Thumbs.db
-Icon?
 ```
