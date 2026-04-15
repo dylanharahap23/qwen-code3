@@ -890,6 +890,28 @@ class ProximityAggOFIReversal:
         return {"override": False}
 
 
+class AccumulationPhaseGuard:
+    """
+    🔥 PRIORITY -28550: Jika market phase PREP, OBV positif ekstrem, volume rendah,
+    dan up_energy > down_energy, maka ini akumulasi, BUKAN dump.
+    Blokir semua sinyal SHORT.
+    """
+    @staticmethod
+    def detect(market_phase: str, obv_trend: str, volume_ratio: float,
+               up_energy: float, down_energy: float, change_5m: float) -> dict:
+        if market_phase == "PREP":
+            if (obv_trend in ("POSITIVE_EXTREME", "POSITIVE") and 
+                volume_ratio < 0.8 and up_energy > down_energy and 
+                abs(change_5m) < 2.0):
+                return {
+                    "override": True,
+                    "bias": "NEUTRAL",
+                    "reason": f"ACCUMULATION PHASE GUARD: PREP phase + OBV={obv_trend}, volume low, up_energy>down_energy → akumulasi, jangan SHORT",
+                    "priority": -28550
+                }
+        return {"override": False}
+
+
 class DeltaExposureLongLiqProximityShort:
     """
     Ketika delta_exposure tinggi (>0.75) DAN long_liq < short_liq,
@@ -899,12 +921,24 @@ class DeltaExposureLongLiqProximityShort:
     untuk menyapu semua long stop.
     
     Guard: hanya fire jika ada konfirmasi dari OBV atau algo/hft.
+    
+    🔥 LECTURER FIX: Tambah guard untuk PREP phase dan OBV positif ekstrem
     """
     @staticmethod
-    def detect(delta_exposure: float, long_liq: float,
-               short_liq: float, obv_trend: str,
-               algo_type_bias: str, hft_6pct_bias: str,
-               volume_ratio: float, change_5m: float) -> dict:
+    def detect(delta_exposure: float, long_liq: float, short_liq: float,
+               obv_trend: str, algo_type_bias: str, hft_6pct_bias: str,
+               volume_ratio: float, change_5m: float,
+               market_phase: str, up_energy: float, down_energy: float) -> dict:
+        
+        # GUARD: Jangan trigger jika market phase PREP (akumulasi)
+        if market_phase == "PREP":
+            return {"override": False}
+        
+        # GUARD: OBV positif ekstrem + volume rendah + harga flat = akumulasi, bukan dump
+        if (obv_trend in ("POSITIVE_EXTREME", "POSITIVE") and 
+            volume_ratio < 0.7 and abs(change_5m) < 1.0 and 
+            up_energy > down_energy):
+            return {"override": False}
         
         if delta_exposure < 0.75:
             return {"override": False}
@@ -18604,6 +18638,23 @@ class BinanceAnalyzer:
             result["entry_allowed"] = True
             return result
 
+        # ========== PRIORITY -28550: ACCUMULATION PHASE GUARD ==========
+        acc_guard = AccumulationPhaseGuard.detect(
+            market_phase=market_phase,
+            obv_trend=obv_trend,
+            volume_ratio=volume_ratio,
+            up_energy=up_energy_val,
+            down_energy=down_energy_val,
+            change_5m=change_5m_val
+        )
+        if acc_guard["override"]:
+            result["bias"] = acc_guard["bias"]
+            result["reason"] = f"[ACCUMULATION GUARD] {acc_guard['reason']} | " + result.get("reason", "")
+            result["confidence"] = "BLOCK"
+            result["priority_level"] = acc_guard["priority"]
+            result["entry_allowed"] = False
+            return result
+
         # ========== PRIORITY -28500: NET LIQUIDATION VALUE PRIORITY =====
         net_liq = NetLiquidationValuePriority.calculate(
             short_liq=short_liq,
@@ -19358,7 +19409,10 @@ class BinanceAnalyzer:
             algo_type_bias=result.get("algo_type_bias", "NEUTRAL"),
             hft_6pct_bias=result.get("hft_6pct_bias", "NEUTRAL"),
             volume_ratio=volume_ratio,
-            change_5m=change_5m_val
+            change_5m=change_5m_val,
+            market_phase=market_phase,
+            up_energy=up_energy_val,
+            down_energy=down_energy_val
         )
         if delta_liq_short["override"]:
             result["bias"] = delta_liq_short["bias"]
