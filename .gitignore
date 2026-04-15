@@ -4,11 +4,11 @@
 __pycache__/
 *.o
 *.obj
-*.out
-*.exe
-*.dll
 *.so
-*.a
+*.dll
+*.exe
+*.class
+*.out
 
 # Dependencies
 .venv/
@@ -64,8 +64,4 @@ htmlcov/
 *.Z
 *.lz
 *.lzo
-*.tar.gz
-*.tar.bz2
-*.tar.xz
-*.tar.zst
 ```
