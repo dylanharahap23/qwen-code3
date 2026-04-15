@@ -15942,16 +15942,25 @@ class RegimeDurationTracker:
 
 class PostSweepShortSqueezeContinuation:
     """
-    PRIORITY -28600: Setelah short_liq tersapu, jika funding negatif (crowded short)
-    dan OBV positif ekstrem serta RSI masih tinggi, squeeze masih berlanjut.
-    Memaksa LONG, meng-override NetLiquidationValuePriority.
+    🔥 PRIORITY -28600: Setelah short_liq tersapu, jika funding negatif dan OBV positif,
+    squeeze mungkin berlanjut. TAPI JIKA blow-off top (pump >5%, RSI>90, volume kering,
+    exchange_safe=SHORT), maka TIDAK LANJUT.
     """
     @staticmethod
     def detect(short_liq: float, change_5m: float, funding_rate: float,
                obv_trend: str, rsi6: float, volume_ratio: float,
-               up_energy: float, agg: float) -> dict:
+               up_energy: float, agg: float,
+               exchange_safe_direction: str) -> dict:
         if funding_rate is None:
             return {"override": False}
+        
+        # === GUARD BLOW-OFF TOP ===
+        if change_5m > 5.0 and rsi6 > 90 and volume_ratio < 0.6:
+            return {"override": False}  # jangan paksa LONG
+        if exchange_safe_direction == "SHORT" and change_5m > 4.0:
+            return {"override": False}  # exchange sendiri bilang SHORT
+        
+        # === SYARAT ASLI ===
         if change_5m <= short_liq * 0.8:
             return {"override": False}
         if funding_rate >= -0.0003:
@@ -15966,16 +15975,43 @@ class PostSweepShortSqueezeContinuation:
             return {"override": False}
         if agg < 0.2:
             return {"override": False}
+        
         return {
             "override": True,
             "bias": "LONG",
-            "reason": (
-                f"POST-SWEEP SHORT SQUEEZE CONTINUATION: short_liq={short_liq:.2f}% sudah tersapu "
-                f"(change={change_5m:.1f}%), funding={funding_rate:.5f} (crowded short), "
-                f"OBV={obv_trend}, RSI={rsi6:.1f} -> squeeze masih berlanjut, force LONG."
-            ),
+            "reason": (f"POST-SWEEP SHORT SQUEEZE CONTINUATION: short_liq={short_liq:.2f}% sudah tersapu "
+                       f"(change={change_5m:.1f}%), funding={funding_rate:.5f} (crowded short), "
+                       f"OBV={obv_trend}, RSI={rsi6:.1f} → squeeze masih berlanjut, force LONG."),
             "priority": -28600
         }
+
+
+class BlowOffSqueezeReversal:
+    """
+    🔥 PRIORITY -28700 (LEBIH TINGGI DARI POST-SWEEP SQUEEZE):
+    Deteksi blow-off top setelah short squeeze: pump besar, volume kering, RSI ekstrem,
+    exchange_safe_direction SHORT, dan up_energy mulai turun.
+    """
+    @staticmethod
+    def detect(change_5m: float, volume_ratio: float, rsi6: float,
+               up_energy: float, exchange_safe_direction: str,
+               funding_rate: float, short_liq: float) -> dict:
+        if funding_rate is None:
+            return {"override": False}
+        # Syarat blow-off:
+        if (change_5m > 5.0 and volume_ratio < 0.6 and rsi6 > 85
+            and exchange_safe_direction == "SHORT"
+            and up_energy < 3.0  # energi mulai habis
+            and short_liq < 3.0):  # target sudah dilewati
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (f"BLOW-OFF SQUEEZE REVERSAL: pump {change_5m:.1f}% dengan volume {volume_ratio:.2f}x, "
+                           f"RSI={rsi6:.1f} overbought ekstrem, exchange_safe=SHORT, "
+                           f"short_liq={short_liq:.2f}% sudah tersapu → squeeze habis, reversal dump imminent."),
+                "priority": -28700
+            }
+        return {"override": False}
 
 
 class NetLiquidationValuePriority:
@@ -18530,7 +18566,25 @@ class BinanceAnalyzer:
             # Update juga ofi jika perlu (tapi ofi dari result sudah pakai json)
         
         
-        # ========== PRIORITY -28600: POST-SWEEP SHORT SQUEEZE CONTINUATION ==========
+        # ========== PRIORITY -28700: BLOW-OFF SQUEEZE REVERSAL ==========
+        blowoff = BlowOffSqueezeReversal.detect(
+            change_5m=change_5m_val,
+            volume_ratio=volume_ratio,
+            rsi6=rsi6_val,
+            up_energy=up_energy_val,
+            exchange_safe_direction=result.get("exchange_safe_direction", "NEUTRAL"),
+            funding_rate=funding_rate_val,
+            short_liq=short_liq
+        )
+        if blowoff["override"]:
+            result["bias"] = blowoff["bias"]
+            result["reason"] = f"[BLOW-OFF REVERSAL] {blowoff['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = blowoff["priority"]
+            result["entry_allowed"] = True
+            return result
+
+        # ========== PRIORITY -28600: POST-SWEEP SHORT SQUEEZE CONTINUATION (dengan guard) ==========
         post_sweep_squeeze = PostSweepShortSqueezeContinuation.detect(
             short_liq=short_liq,
             change_5m=change_5m_val,
@@ -18539,7 +18593,8 @@ class BinanceAnalyzer:
             rsi6=rsi6_val,
             volume_ratio=volume_ratio,
             up_energy=up_energy_val,
-            agg=agg_val
+            agg=agg_val,
+            exchange_safe_direction=result.get("exchange_safe_direction", "NEUTRAL")
         )
         if post_sweep_squeeze["override"]:
             result["bias"] = post_sweep_squeeze["bias"]
