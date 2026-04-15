@@ -18596,97 +18596,10 @@ class BinanceAnalyzer:
             result["entry_allowed"] = True
             return result
         
-        # ===== PRIORITY -27850: EXCHANGE-GREEKS TRIPLE ALIGNMENT =====
-        # Harus SEBELUM OBVNegativeAlgoHFTConsensus (-27800) dan CrowdedLongOBVNegativeTrap (-28100)
-        # AGTUSDT FIX: Ketika exchange_safe, greeks_kill, who_dies semuanya sepakat → tidak boleh di-override
-        triple_align = ExchangeGreeksTripleAlignment.detect(
-            exchange_safe=result.get("exchange_safe_direction", "NEUTRAL"),
-            greeks_kill=result.get("greeks_kill_direction", ""),
-            who_dies=result.get("greeks_who_dies_first", ""),
-            rsi6_5m=rsi6_5m_val,
-            long_liq=long_liq,
-            short_liq=short_liq,
-            funding_rate=funding_rate_val,
-            volume_ratio=volume_ratio
-        )
-        if triple_align["override"]:
-            result["bias"] = triple_align["bias"]
-            result["reason"] = f"[TRIPLE ALIGN] {triple_align['reason']}"
-            result["confidence"] = "ABSOLUTE"
-            result["priority_level"] = triple_align["priority"]
-            result["entry_allowed"] = True
-            return result
-
-        # ===== PRIORITY -27800: MASSIVE OBV NEGATIVE + FUNDING POSITIVE =====
-        # Harus SEBELUM NoSellerNoBuyerOverride (-20000) dan setelah Triple Alignment
-        # BLESSUSDT FIX: OBV -570M + funding + + BAIT phase → force SHORT, cancel NoSeller
-        massive_obv = MassiveOBVNegativeFundingPositiveDumpGuard.detect(
-            obv_value=result.get("obv_value", 0),
-            obv_trend=result.get("obv_trend", "NEUTRAL"),
-            funding_rate=funding_rate_val,
-            market_phase=result.get("market_phase", "UNKNOWN"),
-            volume_ratio=volume_ratio,
-            agg=agg_val,
-            down_energy=down_energy_val,
-            rsi6_5m=rsi6_5m_val,
-            long_liq=long_liq,
-            short_liq=short_liq
-        )
-        if massive_obv["override"]:
-            result["bias"] = massive_obv["bias"]
-            result["reason"] = f"[MASSIVE OBV DUMP] {massive_obv['reason']}"
-            result["confidence"] = "ABSOLUTE"
-            result["priority_level"] = massive_obv["priority"]
-            result["entry_allowed"] = True
-            return result
-
-        # ========== PRIORITY -28100: CROWDED LONG OBV NEGATIVE TRAP ==========
-        # BLESSUSDT CASE: OBV NEGATIVE_EXTREME + funding positif (crowded long)
-        # + long_liq sangat dekat + agg tinggi (spoof) + down_energy=0
-        # Ini BUKAN dip then rip, melainkan DISTRIBUSI AKTIF.
-        crowded_obv_trap = CrowdedLongOBVNegativeTrap.detect(
-            obv_trend=result.get("obv_trend", "NEUTRAL"),
-            obv_value=result.get("obv_value", 0.0),
-            funding_rate=result.get("funding_rate", 0.0),
-            long_liq=long_liq,
-            agg=agg_val,
-            down_energy=down_energy_val,
-            rsi6_5m=rsi6_5m_val,
-            change_5m=change_5m_val,
-            short_liq=short_liq,
-            rsi6=rsi6_val,
-            up_energy=up_energy_val
-        )
-        if crowded_obv_trap["override"]:
-            result["bias"] = crowded_obv_trap["bias"]
-            result["reason"] = f"[CROWDED OBV TRAP] {crowded_obv_trap['reason']} | " + result.get("reason", "")
-            result["confidence"] = "ABSOLUTE"
-            result["priority_level"] = crowded_obv_trap["priority"]
-            result["entry_allowed"] = True
-            return result
-        
-        # ========== PRIORITY -28050: ULTRA CLOSE SHORT LIQ BUY PRESSURE OVERRIDE ==========
-        ultra_short_buy = UltraCloseShortLiqBuyPressureOverride.detect(
-            short_liq=short_liq,
-            long_liq=long_liq,
-            up_energy=up_energy_val,
-            down_energy=down_energy_val,
-            agg=agg_val,
-            ofi_bias=result.get("ofi_bias", "NEUTRAL"),
-            ofi_strength=result.get("ofi_strength", 0.0),
-            change_5m=change_5m_val
-        )
-        if ultra_short_buy["override"]:
-            result["bias"] = ultra_short_buy["bias"]
-            result["reason"] = f"[ULTRA SHORT LIQ OVERRIDE] {ultra_short_buy['reason']} | " + result.get("reason", "")
-            result["confidence"] = "ABSOLUTE"
-            result["priority_level"] = ultra_short_buy["priority"]
-            result["entry_allowed"] = True
-            return result
-        
         # ===== PRIORITY -28000: DIP THEN RIP AGG CONFIRM (TERTINGGI ABSOLUT BARU) =====
         # DUSDT CASE: long_liq dekat + agg=1.00 + down_energy=0 + ofi LONG + change_5m negatif kecil
         # = HFT turunkan harga sedikit untuk sweep long stop, lalu PUMP.
+        # LECTURER FIX: Pastikan change_5m belum terlalu dalam (> -3%) untuk membedakan cascade vs dip then rip
         dip_rip = DipThenRipAggConfirm.detect(
             agg=result.get("agg", 0.5),
             down_energy=down_energy_val,
@@ -18727,23 +18640,70 @@ class BinanceAnalyzer:
             result["entry_allowed"] = True
             return result
         
-        # ===== PRIORITY -27500: MAXIMUM CROWDING ABSOLUTE BLOCK (TERTINGGI ABSOLUT BARU) =====
-        # Kasus AIAUSDT, TRADOORUSDT, XNYUSDT: semua gagal karena tidak ada detector ini
-        max_crowding = MaximumCrowdingAbsoluteBlock.detect(
+        # ===== PRIORITY -27900: MAXIMUM CROWDING LONG LIQ CLOSER SHORT =====
+        # Delta exposure extreme + long_liq lebih dekat = SHORT (crowded long akan di-liquidate)
+        max_crowding_long = MaximumCrowdingLongLiqCloserShort.detect(
             delta_exposure=result.get("greeks_delta_exposure", 0),
-            funding_rate=funding_rate_val,
-            exchange_risk_score=result.get("exchange_risk_score", 0),
-            kill_direction=result.get("greeks_kill_direction", ""),
-            who_dies_first=result.get("greeks_who_dies_first", ""),
-            short_liq=short_liq,
             long_liq=long_liq,
-            volume_ratio=volume_ratio
+            short_liq=short_liq,
+            greeks_kill_direction=result.get("greeks_kill_direction", ""),
+            who_dies_first=result.get("greeks_who_dies_first", ""),
+            stoch_j=result.get("stoch_j", 50.0),
+            funding_rate=funding_rate_val,
+            volume_ratio=volume_ratio,
+            rsi6=rsi6_val,
+            greeks_delta_crowded=result.get("greeks_delta_crowded", "NEUTRAL")
         )
-        if max_crowding["override"]:
-            result["bias"] = max_crowding["bias"]
-            result["reason"] = f"[MAX CROWDING BLOCK] {max_crowding['reason']}"
+        if max_crowding_long["override"]:
+            result["bias"] = max_crowding_long["bias"]
+            result["reason"] = f"[MAX CROWDING LONG] {max_crowding_long['reason']}"
             result["confidence"] = "ABSOLUTE"
-            result["priority_level"] = max_crowding["priority"]
+            result["priority_level"] = max_crowding_long["priority"]
+            result["entry_allowed"] = True
+            return result
+        
+        # ===== PRIORITY -27880: CROWDED LONG CASCADE DUMP =====
+        # Long liq sangat dekat + harga sudah turun + volume kering + funding positif + tidak ada support kuat
+        # = LANJUT DUMP, BUKAN bounce
+        cascade_dump = CrowdedLongCascadeDump.detect(
+            long_liq=long_liq,
+            change_5m=change_5m_val,
+            volume_ratio=volume_ratio,
+            funding_rate=funding_rate_val,
+            agg=agg_val,
+            down_energy=down_energy_val,
+            ask_slope=result.get("ask_slope", 0),
+            bid_slope=result.get("bid_slope", 1),
+            obv_trend=obv_trend
+        )
+        if cascade_dump["override"]:
+            result["bias"] = cascade_dump["bias"]
+            result["reason"] = f"[CASCADE DUMP] {cascade_dump['reason']}"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = cascade_dump["priority"]
+            result["entry_allowed"] = True
+            return result
+        
+        # ===== PRIORITY -27850: EXCHANGE-GREEKS TRIPLE ALIGNMENT =====
+        # Harus SEBELUM OBVNegativeAlgoHFTConsensus (-27800) dan CrowdedLongOBVNegativeTrap (-28100)
+        # AGTUSDT FIX: Ketika exchange_safe, greeks_kill, who_dies semuanya sepakat → tidak boleh di-override
+        # LECTURER FIX: Jangan override jika market_phase == "BAIT" dan volume_ratio < 0.7
+        triple_align = ExchangeGreeksTripleAlignment.detect(
+            exchange_safe=result.get("exchange_safe_direction", "NEUTRAL"),
+            greeks_kill=result.get("greeks_kill_direction", ""),
+            who_dies=result.get("greeks_who_dies_first", ""),
+            rsi6_5m=rsi6_5m_val,
+            long_liq=long_liq,
+            short_liq=short_liq,
+            funding_rate=funding_rate_val,
+            volume_ratio=volume_ratio,
+            market_phase=market_phase
+        )
+        if triple_align["override"]:
+            result["bias"] = triple_align["bias"]
+            result["reason"] = f"[TRIPLE ALIGN] {triple_align['reason']}"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = triple_align["priority"]
             result["entry_allowed"] = True
             return result
         
