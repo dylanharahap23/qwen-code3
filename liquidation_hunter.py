@@ -96,7 +96,16 @@ def _check_prep_phase(data: dict) -> Optional[PhaseResult]:
       • down_energy  == 0        → tidak ada tekanan jual
       • ofi_bias     == "LONG"   → buyer masuk pelan-pelan
       • 40 < rsi6 < 65           → RSI netral, bukan ekstrem
+    
+    🔥 LECTURER FIX: Jika short_liq sangat dekat dan ada buy pressure, BUKAN PREP
     """
+    # 🔥 LECTURER FIX: Jika short_liq sangat dekat dan ada buy pressure, BUKAN PREP
+    short_liq = data.get("short_liq", 99.0)
+    up_energy = data.get("up_energy", 0.0)
+    down_energy = data.get("down_energy", 0.0)
+    if short_liq < 1.5 and up_energy > 0.3 and down_energy < 0.01:
+        return None  # Biarkan phase lain (BAIT/KILL) yang menentukan
+    
     change_5m = abs(data.get("change_5m", 0.0))
     volume_ratio = data.get("volume_ratio", 1.0)
     down_energy = data.get("down_energy", 0.0)
@@ -1910,6 +1919,42 @@ class PreKillSweepReverseBaitCorrection:
 # 5. LowCapOBVKillAlignmentFilter (modifikasi Low Cap Sniper)
 # 6. StochJMaxCrowdingRealityCheck (patch StochJOverflowMicroSweepGuard)
 # 7. PreKillSweepReverseBaitCorrection (patch PreKillSweepDirectionFix)
+
+class UltraCloseShortLiqBuyPressureOverride:
+    """
+    🔥 PRIORITY -28050 (TERTINGGI ABSOLUT - DI ATAS SEMUA):
+    
+    APRUSDT CASE: short_liq < 1.2% + up_energy > 0.5 + down_energy = 0
+    + (agg > 0.7 ATAU OFI LONG kuat) + short_liq < long_liq
+    
+    Memaksa LONG meskipun market phase PREP/BAIT.
+    """
+    @staticmethod
+    def detect(short_liq: float, long_liq: float,
+               up_energy: float, down_energy: float,
+               agg: float, ofi_bias: str, ofi_strength: float,
+               change_5m: float) -> dict:
+        
+        if (short_liq < 1.2 and
+            up_energy > 0.5 and
+            down_energy < 0.01 and
+            short_liq < long_liq and
+            change_5m > -0.5 and
+            (agg > 0.7 or (ofi_bias == "LONG" and ofi_strength > 0.7))):
+            
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": (
+                    f"ULTRA CLOSE SHORT LIQ BUY PRESSURE OVERRIDE: "
+                    f"short_liq={short_liq:.2f}% (<1.2%), up_energy={up_energy:.2f}, "
+                    f"down_energy={down_energy:.3f}, agg={agg:.2f}, OFI={ofi_bias} {ofi_strength:.2f} → "
+                    f"HFT akumulasi dengan target short liq. Force LONG."
+                ),
+                "priority": -28050
+            }
+        return {"override": False}
+
 
 class MaximumCrowdingAbsoluteBlock:
     """
@@ -17534,6 +17579,25 @@ class BinanceAnalyzer:
         # ========== LAYER 0: ENERGY & EXHAUSTION OVERRIDE (PRIORITAS TERTINGGI) ==========
         # Harus di awal, sebelum PHASE LOCK dan GREEKS
         # Detector-detector dari dosen untuk anti-HFT manipulation
+        
+        # ========== PRIORITY -28050: ULTRA CLOSE SHORT LIQ BUY PRESSURE OVERRIDE ==========
+        ultra_short_buy = UltraCloseShortLiqBuyPressureOverride.detect(
+            short_liq=short_liq,
+            long_liq=long_liq,
+            up_energy=up_energy_val,
+            down_energy=down_energy_val,
+            agg=agg_val,
+            ofi_bias=result.get("ofi_bias", "NEUTRAL"),
+            ofi_strength=result.get("ofi_strength", 0.0),
+            change_5m=change_5m_val
+        )
+        if ultra_short_buy["override"]:
+            result["bias"] = ultra_short_buy["bias"]
+            result["reason"] = f"[ULTRA SHORT LIQ OVERRIDE] {ultra_short_buy['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = ultra_short_buy["priority"]
+            result["entry_allowed"] = True
+            return result
         
         # ===== PRIORITY -28000: DIP THEN RIP AGG CONFIRM (TERTINGGI ABSOLUT BARU) =====
         # DUSDT CASE: long_liq dekat + agg=1.00 + down_energy=0 + ofi LONG + change_5m negatif kecil
