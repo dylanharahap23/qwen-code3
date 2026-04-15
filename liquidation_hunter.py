@@ -842,6 +842,54 @@ class AlgoHFTBothShortNoSellerVeto:
         }
 
 
+class ProximityAggOFIReversal:
+    """
+    🔥 PRIORITY -27600 (LEBIH TINGGI dari DeltaExposureLongLiqProximityShort -27550)
+    
+    MENGOVERRIDE sinyal SHORT ketika:
+    - long_liq dekat (< 3.0%) DAN
+    - agg > 0.70 (mayoritas BUY) DAN  
+    - ofi_bias == "LONG" (order flow bullish) DAN
+    - volume_ratio < 0.7 (volume kering = HFT kontrol) DAN
+    - market_phase == "BAIT" (gerakan palsu)
+    
+    Ini adalah pola "sweep long stop → pump ke short_liq" (dip before rip).
+    """
+    @staticmethod
+    def detect(long_liq: float, short_liq: float,
+               agg: float, ofi_bias: str, ofi_strength: float,
+               volume_ratio: float, market_phase: str,
+               change_5m: float, up_energy: float) -> dict:
+        
+        # Kondisi utama
+        if (long_liq < 3.0 and                    # target dekat
+            agg > 0.70 and                        # mayoritas BUY
+            ofi_bias == "LONG" and                # order flow bullish
+            ofi_strength > 0.5 and                # cukup kuat
+            volume_ratio < 0.7 and                # volume kering
+            market_phase == "BAIT" and            # fase manipulasi
+            change_5m < 0 and                     # harga sedang turun (setup sweep)
+            up_energy > 0.1):                     # ada buyer aktif
+            
+            # Konfirmasi tambahan: short_liq harus lebih besar (target pump setelah sweep)
+            short_liq_much_larger = short_liq > long_liq * 2.0
+            
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": (
+                    f"PROXIMITY AGG-OFI REVERSAL: long_liq={long_liq:.2f}% dekat, "
+                    f"agg={agg:.2f} ({(agg*100):.0f}% BUY), OFI LONG {ofi_strength:.2f}, "
+                    f"volume={volume_ratio:.2f}x kering, BAIT phase → "
+                    f"HFT sedang sweep long stop, setelah itu PUMP ke short_liq={short_liq:.2f}%. "
+                    f"Override SHORT ke LONG."
+                ),
+                "priority": -27600
+            }
+        
+        return {"override": False}
+
+
 class DeltaExposureLongLiqProximityShort:
     """
     Ketika delta_exposure tinggi (>0.75) DAN long_liq < short_liq,
@@ -18325,6 +18373,26 @@ class BinanceAnalyzer:
             result["reason"] = f"[ALGO+HFT VETO] {algo_hft_veto['reason']}"
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = algo_hft_veto["priority"]
+            result["entry_allowed"] = True
+            return result
+        
+        # ===== PRIORITY -27600: PROXIMITY AGG-OFI REVERSAL =====
+        prox_agg_rev = ProximityAggOFIReversal.detect(
+            long_liq=long_liq,
+            short_liq=short_liq,
+            agg=agg_val,
+            ofi_bias=ofi_bias,
+            ofi_strength=ofi_strength,
+            volume_ratio=volume_ratio,
+            market_phase=result.get("market_phase", "UNKNOWN"),
+            change_5m=change_5m_val,
+            up_energy=up_energy_val
+        )
+        if prox_agg_rev["override"]:
+            result["bias"] = prox_agg_rev["bias"]
+            result["reason"] = f"[PROX AGG REV] {prox_agg_rev['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = prox_agg_rev["priority"]
             result["entry_allowed"] = True
             return result
         
