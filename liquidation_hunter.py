@@ -18028,6 +18028,14 @@ class BinanceAnalyzer:
         market_phase = phase_result.phase if phase_result else "UNKNOWN"
         
         
+        # ===== FIX DATA RACE AGG =====
+        json_agg = result.get("agg", agg_val)
+        if abs(json_agg - agg_val) > 0.15:
+            result["reason"] = f"[AGG FIX: display={agg_val:.2f} → json={json_agg:.2f}] " + result.get("reason", "")
+            agg_val = json_agg
+            # Update juga ofi jika perlu (tapi ofi dari result sudah pakai json)
+        
+        
         # ========== PRIORITY -28500: NET LIQUIDATION VALUE PRIORITY =====
         net_liq = NetLiquidationValuePriority.calculate(
             short_liq=short_liq,
