@@ -15288,6 +15288,192 @@ class AggOFIFullBullishContinuation:
         return {"override": False}
 
 
+# ====================== LECTURER'S SARAN - 4 NEW CLASSES ======================
+
+class RegimeDurationTracker:
+    """
+    Track berapa lama setiap regime berlangsung.
+    Binance biasanya rotate setiap 2-6 jam.
+    """
+    _regime_history: Dict[str, List[Tuple[float, str]]] = {}
+    
+    @classmethod
+    def record(cls, symbol: str, bias: str):
+        now = time.time()
+        if symbol not in cls._regime_history:
+            cls._regime_history[symbol] = []
+        cls._regime_history[symbol].append((now, bias))
+        # keep last 8 hours
+        cls._regime_history[symbol] = [
+            (t, b) for t, b in cls._regime_history[symbol] if now - t < 28800
+        ]
+    
+    @classmethod
+    def get_regime_age_minutes(cls, symbol: str, current_bias: str) -> float:
+        history = cls._regime_history.get(symbol, [])
+        if not history:
+            return 0
+        now = time.time()
+        for i in range(len(history) - 1, -1, -1):
+            if history[i][1] != current_bias:
+                start = history[i + 1][0] if i + 1 < len(history) else now
+                return (now - start) / 60
+        return (now - history[0][0]) / 60
+    
+    @classmethod
+    def detect(cls, symbol: str, current_bias: str, 
+               short_liq: float, long_liq: float,
+               volume_ratio: float) -> dict:
+        age_minutes = cls.get_regime_age_minutes(symbol, current_bias)
+        if age_minutes > 240:  # 4 jam
+            return {
+                "warning": True,
+                "age_minutes": age_minutes,
+                "reason": f"REGIME AGE WARNING: {current_bias} sudah {age_minutes:.0f} menit → probability rotation tinggi",
+                "reduce_conviction": True
+            }
+        return {"warning": False, "age_minutes": age_minutes}
+
+
+class NetLiquidationValuePriority:
+    MIN_RATIO_THRESHOLD = 5.0
+    
+    @staticmethod
+    def calculate(short_liq: float, long_liq: float,
+                  change_5m: float, rsi6: float,
+                  volume_ratio: float, funding_rate: float,
+                  delta_exposure: float) -> dict:
+        if short_liq <= 0 or long_liq <= 0:
+            return {"dominant_target": "UNKNOWN", "ratio": 0}
+        ratio = long_liq / short_liq
+        short_liq_swept = change_5m > short_liq * 2.5
+        long_liq_swept = change_5m < -long_liq * 2.5
+        result = {
+            "ratio": round(ratio, 2),
+            "short_liq_swept": short_liq_swept,
+            "long_liq_swept": long_liq_swept,
+            "dominant_target": "LONG",
+            "override": False
+        }
+        # Kasus INUSDT: short_liq kecil & sudah tersapu + long_liq jauh lebih besar
+        if (ratio >= NetLiquidationValuePriority.MIN_RATIO_THRESHOLD and
+            short_liq_swept and rsi6 > 90 and volume_ratio < 0.6):
+            result["dominant_target"] = "SHORT"
+            result["override"] = True
+            result["bias"] = "SHORT"
+            result["reason"] = (f"NET LIQ VALUE PRIORITY: long_liq={long_liq:.2f}% adalah "
+                                f"{ratio:.1f}x lebih besar, short_liq sudah tersapu (change={change_5m:.1f}%), "
+                                f"RSI={rsi6:.1f} overbought, volume kering → DUMP incoming")
+            result["priority"] = -28500
+        # Kasus LABUSDT: long_liq dekat tapi short_liq jauh lebih besar + buy pressure
+        elif (ratio < 0.2 and not long_liq_swept and rsi6 < 30 and volume_ratio < 0.7):
+            result["dominant_target"] = "LONG"
+            result["override"] = True
+            result["bias"] = "LONG"
+            result["reason"] = (f"NET LIQ VALUE PRIORITY: sweep long_liq={long_liq:.2f}% dulu, "
+                                f"lalu pump ke short_liq={short_liq:.2f}% ({1/ratio:.1f}x lebih besar) → DIP before RIP")
+            result["priority"] = -28500
+        return result
+
+
+class AdversarialTimingPattern:
+    _price_history: Dict[str, deque] = {}
+    
+    @classmethod
+    def record_price(cls, symbol: str, price: float, timestamp: float):
+        if symbol not in cls._price_history:
+            cls._price_history[symbol] = deque(maxlen=300)
+        cls._price_history[symbol].append((timestamp, price))
+    
+    @classmethod
+    def detect(cls, symbol: str, current_price: float,
+               change_5m: float, volume_ratio: float,
+               rsi6: float, rsi6_5m: float,
+               ofi_bias: str, agg: float) -> dict:
+        history = cls._price_history.get(symbol, deque())
+        if len(history) < 30:
+            return {"pattern_detected": False}
+        now = time.time()
+        prices_5m = [(t, p) for t, p in history if now - t <= 300]
+        if len(prices_5m) < 10:
+            return {"pattern_detected": False}
+        recent_high = max(p for _, p in prices_5m)
+        recent_low = min(p for _, p in prices_5m)
+        pump_from_low = (current_price - recent_low) / recent_low * 100
+        dump_from_high = (recent_high - current_price) / recent_high * 100
+        
+        # Pump kecil sebelum dump besar
+        if (pump_from_low > 1.5 and pump_from_low < 5.0 and
+            rsi6 > 85 and rsi6_5m < 70 and volume_ratio < 0.6 and ofi_bias == "SHORT"):
+            return {
+                "pattern_detected": True, "pattern_type": "PUMP_BEFORE_DUMP",
+                "override": True, "bias": "SHORT", "priority": -28300,
+                "reason": f"ADVERSARIAL TIMING: pump {pump_from_low:.1f}% dengan divergence, volume kering → akan dump"
+            }
+        # Dump kecil sebelum pump besar
+        if (dump_from_high > 0.5 and dump_from_high < 3.0 and
+            rsi6 < 30 and rsi6_5m > 40 and volume_ratio < 0.6 and ofi_bias == "LONG"):
+            return {
+                "pattern_detected": True, "pattern_type": "DIP_BEFORE_RIP",
+                "override": True, "bias": "LONG", "priority": -28300,
+                "reason": f"ADVERSARIAL TIMING: dip {dump_from_high:.1f}% dengan divergence, akan pump"
+            }
+        return {"pattern_detected": False}
+
+
+class LiquidityRegimeClassifier:
+    @staticmethod
+    def classify(change_5m: float, volume_ratio: float,
+                 agg: float, ofi_bias: str, ofi_strength: float,
+                 short_liq: float, long_liq: float,
+                 rsi6: float, rsi6_5m: float,
+                 down_energy: float, up_energy: float,
+                 funding_rate: float,
+                 latest_volume: float, volume_ma10: float) -> dict:
+        real_vol_ratio = latest_volume / volume_ma10 if volume_ma10 > 0 else 1.0
+        scores = {"ACCUMULATION": 0, "MANIPULATION": 0, "DISTRIBUTION": 0,
+                  "LIQUIDATION_HUNT": 0, "SQUEEZE": 0, "RECOVERY": 0}
+        # MANIPULATION
+        if agg > 0.85 and change_5m < 0: scores["MANIPULATION"] += 3
+        if agg < 0.2 and change_5m > 0: scores["MANIPULATION"] += 3
+        if real_vol_ratio < 0.15 and (agg > 0.9 or agg < 0.1): scores["MANIPULATION"] += 3
+        if (ofi_bias == "SHORT" and change_5m > 1.5) or (ofi_bias == "LONG" and change_5m < -1.5): scores["MANIPULATION"] += 2
+        # LIQUIDATION_HUNT
+        min_liq = min(short_liq, long_liq)
+        if min_liq < 2.0: scores["LIQUIDATION_HUNT"] += 3
+        if min_liq < 1.0: scores["LIQUIDATION_HUNT"] += 3
+        if abs(change_5m) > 2.0 and volume_ratio > 0.7: scores["LIQUIDATION_HUNT"] += 2
+        # SQUEEZE
+        if change_5m > 3.0 and volume_ratio > 0.8 and (rsi6 > 70 or rsi6 < 30): scores["SQUEEZE"] += 4
+        if down_energy < 0.01 and short_liq < 2.0 and change_5m > 0: scores["SQUEEZE"] += 3
+        if up_energy < 0.01 and long_liq < 2.0 and change_5m < 0: scores["SQUEEZE"] += 3
+        # DISTRIBUTION
+        if change_5m < -1.0 and agg > 0.7 and volume_ratio < 0.7: scores["DISTRIBUTION"] += 3
+        if funding_rate is not None and funding_rate > 0.0005 and ofi_bias == "SHORT": scores["DISTRIBUTION"] += 2
+        # ACCUMULATION
+        if abs(change_5m) < 0.5 and volume_ratio < 0.5 and 0.3 < agg < 0.7: scores["ACCUMULATION"] += 4
+        # RECOVERY
+        if (rsi6 < 10 or rsi6 > 90) and abs(change_5m) < 1.0 and down_energy < 0.1: scores["RECOVERY"] += 3
+        
+        dominant = max(scores, key=scores.get)
+        max_score = scores[dominant]
+        regime_risk = {"ACCUMULATION": "HIGH_RISK", "MANIPULATION": "SKIP", "DISTRIBUTION": "MEDIUM_RISK",
+                       "LIQUIDATION_HUNT": "LOW_RISK", "SQUEEZE": "MEDIUM_RISK", "RECOVERY": "HIGH_RISK"}
+        entry_rec = {"ACCUMULATION": "WAIT", "MANIPULATION": "SKIP - DO NOT TRADE",
+                     "DISTRIBUTION": "SHORT with tight SL", "LIQUIDATION_HUNT": "Follow liquidity direction",
+                     "SQUEEZE": "Follow momentum, exit at liq target", "RECOVERY": "Wait for confirmation"}
+        return {
+            "regime": dominant, "scores": scores, "confidence": max_score,
+            "risk_level": regime_risk.get(dominant, "UNKNOWN"),
+            "entry_recommendation": entry_rec.get(dominant, "NEUTRAL"),
+            "skip_entry": dominant == "MANIPULATION",
+            "reason": f"Regime={dominant} (score={max_score}), risk={regime_risk.get(dominant)}"
+        }
+
+
+# ====================== END OF LECTURER'S SARAN CLASSES ======================
+
+
 class OBVLaggingAggContradictionResolver:
     """
     🔥 OBV NEGATIVE_EXTREME tapi agg=1.00 = OBV LAGGING/STALE
@@ -17632,6 +17818,53 @@ class BinanceAnalyzer:
         now = time.time()
         market_phase = phase_result.phase if phase_result else "UNKNOWN"
         
+        
+        # ========== PRIORITY -28500: NET LIQUIDATION VALUE PRIORITY =====
+        net_liq = NetLiquidationValuePriority.calculate(
+            short_liq=short_liq,
+            long_liq=long_liq,
+            change_5m=change_5m_val,
+            rsi6=rsi6_val,
+            volume_ratio=volume_ratio,
+            funding_rate=funding_rate_val,
+            delta_exposure=result.get("greeks_delta_exposure", 0)
+        )
+        if net_liq.get("override"):
+            result["bias"] = net_liq["bias"]
+            result["reason"] = f"[NET LIQ VALUE] {net_liq['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = net_liq["priority"]
+            result["entry_allowed"] = True
+            return result
+
+        # ========== PRIORITY -28300: ADVERSARIAL TIMING PATTERN =====
+        adv = AdversarialTimingPattern.detect(
+            symbol=self.symbol,
+            current_price=result.get("price", 0),
+            change_5m=change_5m_val,
+            volume_ratio=volume_ratio,
+            rsi6=rsi6_val,
+            rsi6_5m=rsi6_5m_val,
+            ofi_bias=result.get("ofi_bias", "NEUTRAL"),
+            agg=agg_val
+        )
+        if adv.get("override"):
+            result["bias"] = adv["bias"]
+            result["reason"] = f"[ADVERSARIAL PATTERN] {adv['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = adv["priority"]
+            result["entry_allowed"] = True
+            return result
+
+        # ========== REGIME BLOCK: SKIP jika MANIPULATION =====
+        if result.get("regime_skip"):
+            result["bias"] = "NEUTRAL"
+            result["confidence"] = "BLOCK"
+            result["entry_allowed"] = False
+            result["reason"] = f"[MANIPULATION REGIME] {result.get('regime_reason', '')} | " + result.get("reason", "")
+            result["priority_level"] = -29000
+            return result
+
         # ========== PREP PHASE HARD BLOCK (LECTURER FIX 2) ==========
         # Jika market phase PREP, netralkan semua sinyal dan langsung return
         if result.get("market_phase") == "PREP":
@@ -20844,6 +21077,9 @@ class BinanceAnalyzer:
             if not price:
                 return None
 
+            # Rekam untuk adversarial pattern
+            AdversarialTimingPattern.record_price(self.symbol, price, time.time())
+
             k1m = self.fetcher.get_klines("1m", 100)
             if not k1m:
                 return None
@@ -23357,6 +23593,28 @@ class BinanceAnalyzer:
             # Simpan flag extreme override ke result sebelum stability filter
             result["_liquidity_extreme_override"] = locals().get('_liquidity_extreme_override', False)
             
+            # Klasifikasi regime
+            regime_data = LiquidityRegimeClassifier.classify(
+                change_5m, volume_ratio, agg, ofi["bias"], ofi["strength"],
+                liq["short_dist"], liq["long_dist"], rsi6, rsi6_5m,
+                down_energy, up_energy, funding_rate or 0,
+                latest_volume, volume_ma10
+            )
+            result["market_regime"] = regime_data["regime"]
+            result["regime_risk"] = regime_data["risk_level"]
+            result["regime_skip"] = regime_data["skip_entry"]
+            result["regime_reason"] = regime_data["reason"]
+
+            # Rekam bias untuk regime duration
+            final_bias = result.get("bias", "NEUTRAL")
+            if final_bias in ("LONG", "SHORT"):
+                RegimeDurationTracker.record(self.symbol, final_bias)
+            age_data = RegimeDurationTracker.detect(self.symbol, final_bias, liq["short_dist"], liq["long_dist"], volume_ratio)
+            result["regime_age_minutes"] = age_data.get("age_minutes", 0)
+            if age_data.get("warning"):
+                result["reason"] += f" | {age_data['reason']}"
+                if result.get("confidence") == "ABSOLUTE":
+                    result["confidence"] = "HIGH"
             result = self._apply_stability_filters(result, phase_result, {})
 
             return result
