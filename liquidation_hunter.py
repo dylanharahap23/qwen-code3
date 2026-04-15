@@ -63,6 +63,12 @@ LAST_BIAS_TIME = 0
 # ================= KILL-ZONE FLIP TRAP DETECTOR =================
 _kill_direction_history: Dict[str, List[Tuple[float, str]]] = {}
 
+# ================= REGIME DURATION TRACKER (LECTURER ADDITION) =================
+_regime_history: Dict[str, List[Tuple[float, str]]] = {}
+
+# ================= ADVERSARIAL TIMING PATTERN TRACKER (LECTURER ADDITION) =================
+_price_history: Dict[str, deque] = {}
+
 # ================= TIME DECAY GLOBAL =================
 LAST_SIGNAL = None
 LAST_SIGNAL_TIME = 0
