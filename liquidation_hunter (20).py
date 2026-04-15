@@ -2019,6 +2019,63 @@ class CapitulationExtremeLongOverride:
         return {"override": False}
 
 
+class CapitulationGammaExecutingBlock:
+    """
+    🔥 PRIORITY -28150 (antara CapitulationExtremeLong -28200 dan CrowdedOBV -28100):
+    
+    Ketika RSI6 < 15 + long_liq < 1.0% + down_energy = 0 + up_energy > 0.3:
+    Ini adalah capitulation bounce setup.
+    
+    Gamma executing = True dalam kondisi ini adalah PALSU karena:
+    - Score gamma hanya dari proximity + kill_aligned + OBV confirm
+    - Tidak ada volume spike nyata (vol_spike < 1.5x)
+    - Kondisi ini justru REVERSAL zone, bukan continuation
+    
+    Block greeks_gamma_executing override jika kondisi capitulation terpenuhi.
+    Priority: -28150 (antara CapExtreme -28200 dan CrowdedOBV -28100)
+    """
+    @staticmethod
+    def detect(rsi6: float, long_liq: float, up_energy: float,
+               down_energy: float, gamma_executing: bool,
+               gamma_exec_score: int, vol_spike: float,
+               kill_direction: str, exchange_safe: str) -> dict:
+        
+        # Hanya relevan jika gamma executing akan override ke SHORT
+        if not gamma_executing or kill_direction != "SHORT":
+            return {"override": False}
+        
+        # Capitulation kondisi
+        capitulation = (rsi6 < 15 and long_liq < 1.0 and 
+                       down_energy < 0.01 and up_energy > 0.3)
+        
+        if not capitulation:
+            return {"override": False}
+        
+        # Gamma score harus RENDAH (tidak ada volume spike nyata)
+        fake_gamma = (gamma_exec_score < 4 and vol_spike < 2.0)
+        
+        # Exchange safe harus konfirmasi LONG
+        exchange_confirms_long = exchange_safe == "LONG"
+        
+        if fake_gamma and exchange_confirms_long:
+            return {
+                "override": True,
+                "bias": "LONG",
+                "block_gamma": True,
+                "reason": (
+                    f"CAPITULATION GAMMA BLOCK: RSI={rsi6:.1f} capitulation, "
+                    f"long_liq={long_liq:.2f}% ultra close, up_energy={up_energy:.2f}, "
+                    f"gamma_exec_score={gamma_exec_score} (<4, FAKE), "
+                    f"vol_spike={vol_spike:.1f}x (<2.0, no real volume), "
+                    f"exchange_safe=LONG → gamma executing adalah PALSU di kondisi "
+                    f"capitulation. Force LONG, blokir PostKillFollow."
+                ),
+                "priority": -28150
+            }
+        
+        return {"override": False}
+
+
 class CrowdedLongOBVNegativeTrap:
     """
     🔥 PRIORITY -28100 (LEBIH TINGGI DARI DIP THEN RIP):
@@ -2855,6 +2912,99 @@ class ExtremeShortLiqNoSellerSqueezeGuard:
         return {"override": False}
 
 
+class TrueShortSqueezeValidator:
+    """
+    🔥 PRIORITY -27450 (antara ExtremeShortLiqNoSeller -27400 dan ReverseSqueezeBait -27300):
+    
+    Memvalidasi apakah kondisi short squeeze adalah GENUINE atau MANUFACTURED BAIT.
+    
+    TRUE SHORT SQUEEZE (semua harus terpenuhi):
+    1. short_liq < 1.5% (target dekat)
+    2. up_energy > 0.3 (buyer aktif)  
+    3. down_energy < 0.01 (zero sellers)
+    4. rsi6_5m < 55 (5m belum overbought = ada room)
+    5. change_5m > 0 (momentum sudah naik)
+    6. who_dies_first ≠ LONG_TRADERS (Greeks tidak konfirmasi LONG mati)
+    
+    MANUFACTURED BAIT (batalkan squeeze, force SHORT):
+    1. short_liq < 1.5% TAPI rsi6_5m > 70 (5m overbought = tidak ada room)
+    2. ATAU funding_rate > 0.001 DAN delta_exposure > 0.88 (terlalu crowded LONG)
+    3. ATAU up_energy < 0.1 DAN agg < 0.5 (tidak ada buyer nyata)
+    """
+    @staticmethod
+    def validate(short_liq: float, long_liq: float,
+                 up_energy: float, down_energy: float,
+                 rsi6_5m: float, change_5m: float,
+                 who_dies_first: str, funding_rate: float,
+                 delta_exposure: float, agg: float,
+                 volume_ratio: float) -> dict:
+        
+        if funding_rate is None:
+            funding_rate = 0.0
+        
+        # Hanya relevan jika short_liq dekat
+        if short_liq >= 2.0:
+            return {"is_genuine": None, "override": False}
+        
+        # === CEK GENUINE SQUEEZE ===
+        genuine_signals = {
+            "short_close": short_liq < 1.5,
+            "buyer_active": up_energy > 0.3,
+            "no_sellers": down_energy < 0.01,
+            "5m_has_room": rsi6_5m < 55,
+            "momentum_up": change_5m > 0,
+            "long_not_dying": who_dies_first not in ("LONG_TRADERS",),
+        }
+        genuine_count = sum(genuine_signals.values())
+        
+        # === CEK MANUFACTURED BAIT ===
+        bait_signals = {
+            "5m_overbought": rsi6_5m > 70,
+            "max_crowding": funding_rate > 0.001 and delta_exposure > 0.88,
+            "no_real_buyer": up_energy < 0.1 and agg < 0.5,
+            "volume_dry_extreme": volume_ratio < 0.3,
+            "long_confirmed_dying": who_dies_first == "LONG_TRADERS",
+        }
+        bait_count = sum(bait_signals.values())
+        
+        # GENUINE: 5+ dari 6 kondisi terpenuhi dan bait < 2
+        if genuine_count >= 5 and bait_count <= 1:
+            return {
+                "is_genuine": True,
+                "override": True,
+                "bias": "LONG",
+                "genuine_score": genuine_count,
+                "bait_score": bait_count,
+                "reason": (
+                    f"TRUE SHORT SQUEEZE VALIDATED: {genuine_count}/6 genuine signals, "
+                    f"{bait_count}/5 bait signals. "
+                    f"short_liq={short_liq:.2f}%, rsi6_5m={rsi6_5m:.1f} (<55), "
+                    f"up_energy={up_energy:.2f}, who_dies={who_dies_first}. "
+                    f"This is GENUINE, not manufactured bait. Force LONG."
+                ),
+                "priority": -27450
+            }
+        
+        # BAIT: 3+ bait signals
+        if bait_count >= 3:
+            return {
+                "is_genuine": False,
+                "override": True,
+                "bias": "SHORT",
+                "genuine_score": genuine_count,
+                "bait_score": bait_count,
+                "reason": (
+                    f"MANUFACTURED SHORT LIQ BAIT: {bait_count}/5 bait signals, "
+                    f"short_liq={short_liq:.2f}% adalah UMPAN. "
+                    f"rsi6_5m={rsi6_5m:.1f}, delta={delta_exposure:.3f}, "
+                    f"funding={funding_rate:.5f}. Force SHORT."
+                ),
+                "priority": -27450
+            }
+        
+        return {"is_genuine": None, "override": False}
+
+
 class ReverseSqueezeBaitDetector:
     """
     🔥 PRIORITY -27300:
@@ -2878,6 +3028,8 @@ class ReverseSqueezeBaitDetector:
     - funding_rate > 0 (tidak ada yang short untuk di-squeeze)
     - exchange_risk_score >= 6
     - OFI bisa LONG (HFT inject buy order untuk mancing)
+    
+    🔥 LECTURER FIX: Tambah guard untuk genuine short squeeze
     """
     @staticmethod
     def detect(
@@ -2890,11 +3042,28 @@ class ReverseSqueezeBaitDetector:
         kill_direction: str,
         rsi6: float,
         volume_ratio: float,
-        down_energy: float = 0.0  # NEW parameter for early exit check
+        down_energy: float = 0.0,
+        # NEW parameters for lecturer fix
+        rsi6_5m: float = 50.0,
+        up_energy: float = 0.0,
+        who_dies_first: str = ""
     ) -> dict:
         
         if funding_rate is None:
             funding_rate = 0.0
+        
+        # 🔥 LECTURER FIX 1: GUARD KRITIS untuk genuine short squeeze
+        # Jika rsi6_5m < 50 DAN up_energy > 0.4 DAN short_liq < 1.5%
+        # = masih ada momentum naik + buyer aktif + target dekat → INI SQUEEZE GENUINE, bukan bait
+        if (short_liq < 1.5 and 
+            rsi6_5m < 50 and 
+            up_energy > 0.4 and 
+            down_energy < 0.01):
+            return {"override": False, "reason": "Genuine short squeeze: rsi6_5m < 50, up_energy active"}
+        
+        # 🔥 LECTURER FIX 2: who_dies_first = BOTH_POSSIBLE + up_energy aktif = arah belum committed
+        if who_dies_first == "BOTH_POSSIBLE" and up_energy > 0.3:
+            return {"override": False, "reason": "Direction not committed: BOTH_POSSIBLE + up_energy active"}
         
         # 🔥 OPTIONAL ENHANCEMENT: Early exit if short_liq is extremely close and no sellers
         # This prevents reverse-bait logic from firing when market is clearly set for immediate short squeeze
@@ -18187,9 +18356,32 @@ class BinanceAnalyzer:
         )
         if cap_extreme["override"]:
             result["bias"] = cap_extreme["bias"]
+            result["_capitulation_override"] = True  # Block PostKillFollow
             result["reason"] = f"[CAP EXTREME] {cap_extreme['reason']} | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = cap_extreme["priority"]
+            result["entry_allowed"] = True
+            return result
+        
+        # ===== PRIORITY -28150: CAPITULATION GAMMA BLOCK =====
+        # Harus SEBELUM PostKillFollow bisa mengoverride Capitulation signal
+        cap_gamma_block = CapitulationGammaExecutingBlock.detect(
+            rsi6=rsi6_val,
+            long_liq=long_liq,
+            up_energy=up_energy_val,
+            down_energy=down_energy_val,
+            gamma_executing=result.get("greeks_gamma_executing", False),
+            gamma_exec_score=result.get("greeks_gamma_exec_score", 0),
+            vol_spike=result.get("greeks_vol_spike", 1.0),  # extract dari signals
+            kill_direction=result.get("greeks_kill_direction", ""),
+            exchange_safe=result.get("exchange_safe_direction", "NEUTRAL")
+        )
+        if cap_gamma_block["override"]:
+            result["bias"] = cap_gamma_block["bias"]
+            result["_capitulation_override"] = True  # Block PostKillFollow
+            result["reason"] = f"[CAP GAMMA BLOCK] {cap_gamma_block['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = cap_gamma_block["priority"]
             result["entry_allowed"] = True
             return result
         
@@ -18320,6 +18512,29 @@ class BinanceAnalyzer:
             result["entry_allowed"] = True
             return result
         
+        # ===== PRIORITY -27450: TRUE SHORT SQUEEZE VALIDATOR =====
+        # Dipanggil SETELAH ExtremeShortLiqNoSeller (-27400) tapi SEBELUM ReverseSqueezeBait (-27300)
+        true_squeeze = TrueShortSqueezeValidator.validate(
+            short_liq=short_liq,
+            long_liq=long_liq,
+            up_energy=up_energy_val,
+            down_energy=down_energy_val,
+            rsi6_5m=rsi6_5m_val,
+            change_5m=change_5m_val,
+            who_dies_first=who_dies_first,
+            funding_rate=funding_rate_val,
+            delta_exposure=result.get("greeks_delta_exposure", 0),
+            agg=agg_val,
+            volume_ratio=volume_ratio
+        )
+        if true_squeeze["override"]:
+            result["bias"] = true_squeeze["bias"]
+            result["reason"] = f"[TRUE SQUEEZE VALIDATOR] {true_squeeze['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = true_squeeze["priority"]
+            result["entry_allowed"] = True
+            return result
+        
         # ===== PRIORITY -27300: REVERSE SQUEEZE BAIT DETECTOR =====
         # Pola paling licik Binance: short_liq dekat sebagai umpan, long_liq jauh lebih besar sebagai target
         reverse_bait = ReverseSqueezeBaitDetector.detect(
@@ -18332,7 +18547,11 @@ class BinanceAnalyzer:
             kill_direction=result.get("greeks_kill_direction", ""),
             rsi6=rsi6_val,
             volume_ratio=volume_ratio,
-            down_energy=down_energy_val  # NEW: for early exit check
+            down_energy=down_energy_val,  # for early exit check
+            # NEW parameters for lecturer fix
+            rsi6_5m=rsi6_5m_val,
+            up_energy=up_energy_val,
+            who_dies_first=who_dies_first
         )
         if reverse_bait["override"]:
             result["bias"] = reverse_bait["bias"]
@@ -23936,8 +24155,14 @@ class BinanceAnalyzer:
             short_liq_val = result.get("short_liq", 99.0)
             kill_dir = result.get("greeks_kill_direction", "")
 
-            # Jika kill sudah mulai (gamma executing), ikuti arah kill
-            if gamma_exec and kill_speed > 0.5 and kill_dir in ("LONG", "SHORT"):
+            # ===== GUARD: CAPITULATION OVERRIDE BLOCKS POST-KILL FOLLOW =====
+            # Jika CapitulationExtremeLong sudah fire (priority -28200), 
+            # PostKillFollow TIDAK BOLEH override balik ke SHORT
+            if result.get("_capitulation_override") or result.get("priority_level", 0) <= -28000:
+                # Sudah ada capitulation signal dengan priority sangat tinggi
+                # Skip PostKillFollow dan PreKillSweep
+                pass
+            elif gamma_exec and kill_speed > 0.5 and kill_dir in ("LONG", "SHORT"):
                 result["bias"] = kill_dir
                 result["reason"] = f"[POST-KILL FOLLOW] kill_direction={kill_dir}, gamma_executing=True → {kill_dir} | " + result.get("reason", "")
                 result["confidence"] = "ABSOLUTE"
