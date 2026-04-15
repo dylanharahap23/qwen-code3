@@ -2076,6 +2076,147 @@ class CapitulationGammaExecutingBlock:
         return {"override": False}
 
 
+class ExchangeGreeksTripleAlignment:
+    """
+    PRIORITY -27850:
+    
+    Ketika TIGA layer semuanya sepakat SEARAH:
+    1. exchange_safe_direction = LONG/SHORT
+    2. greeks_kill_direction = LONG/SHORT (sama)
+    3. greeks_who_dies_first = SHORT_TRADERS (untuk LONG) atau LONG_TRADERS (untuk SHORT)
+    
+    DAN kondisi oversold/overbought ada:
+    - Untuk LONG: rsi6_5m < 30 (oversold) atau long_liq < 1.5% (target dekat)
+    
+    Ini adalah kondisi paling kuat yang bisa ada.
+    Tidak ada detector lain yang boleh override ini.
+    """
+    @staticmethod
+    def detect(exchange_safe: str, greeks_kill: str, who_dies: str,
+               rsi6_5m: float, long_liq: float, short_liq: float,
+               funding_rate: float, volume_ratio: float) -> dict:
+        
+        if funding_rate is None:
+            funding_rate = 0.0
+        
+        # Triple alignment untuk LONG
+        triple_long = (
+            exchange_safe == "LONG" and
+            greeks_kill == "LONG" and
+            who_dies == "SHORT_TRADERS"
+        )
+        
+        # Triple alignment untuk SHORT
+        triple_short = (
+            exchange_safe == "SHORT" and
+            greeks_kill == "SHORT" and
+            who_dies == "LONG_TRADERS"
+        )
+        
+        if not (triple_long or triple_short):
+            return {"override": False}
+        
+        bias = "LONG" if triple_long else "SHORT"
+        
+        # Konfirmasi konteks (minimal 1 dari 3)
+        if triple_long:
+            context_ok = (
+                rsi6_5m < 35 or          # oversold
+                long_liq < 1.5 or         # target dekat
+                volume_ratio < 0.6        # low volume (kontrol HFT)
+            )
+        else:
+            context_ok = (
+                rsi6_5m > 65 or
+                short_liq < 1.5 or
+                volume_ratio < 0.6
+            )
+        
+        if not context_ok:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": bias,
+            "reason": (
+                f"EXCHANGE-GREEKS TRIPLE ALIGNMENT: "
+                f"exchange_safe={exchange_safe}, kill={greeks_kill}, "
+                f"who_dies={who_dies} → semua 3 layer sepakat {bias}. "
+                f"rsi6_5m={rsi6_5m:.1f}, long_liq={long_liq:.2f}%, short_liq={short_liq:.2f}%. "
+                f"Override semua detector yang bertentangan."
+            ),
+            "priority": -27850
+        }
+
+
+class MassiveOBVNegativeFundingPositiveDumpGuard:
+    """
+    PRIORITY -27800:
+    
+    BLESSUSDT EXACT PATTERN:
+    OBV sangat negatif (< -100 juta) + funding positif (crowded LONG)
+    + market BAIT + volume ultra kering
+    
+    OBV -570 juta TIDAK BISA diabaikan oleh down_energy = 0.
+    Down energy = 0 di sini karena HFT sudah menarik semua bid
+    (manufactured vacuum), bukan karena tidak ada seller.
+    
+    Ketika OBV sepenegatif ini + funding positif:
+    Distribusi sudah berlangsung LAMA dan DALAM.
+    Bounce sekecil apapun akan dijual.
+    """
+    @staticmethod
+    def detect(obv_value: float, obv_trend: str,
+               funding_rate: float, market_phase: str,
+               volume_ratio: float, agg: float,
+               down_energy: float, rsi6_5m: float,
+               long_liq: float, short_liq: float) -> dict:
+        
+        if funding_rate is None:
+            funding_rate = 0.0
+        
+        # OBV harus sangat negatif (bukan sekadar negatif)
+        if obv_value > -100_000_000:  # harus < -100 juta
+            return {"override": False}
+        
+        if obv_trend not in ("NEGATIVE_EXTREME", "NEGATIVE"):
+            return {"override": False}
+        
+        # Funding harus positif (crowded LONG = korban tersedia)
+        if funding_rate <= 0.0003:
+            return {"override": False}
+        
+        # Volume harus kering (HFT kontrol)
+        if volume_ratio >= 0.55:
+            return {"override": False}
+        
+        # Minimal 2 dari 4 konfirmasi tambahan
+        extra = sum([
+            market_phase == "BAIT",
+            agg < 0.70,              # bukan genuine bullish
+            down_energy < 0.01,      # manufactured vacuum
+            rsi6_5m < 60,            # 5m tidak overbought (masih ada room turun)
+        ])
+        
+        if extra < 2:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "cancel_no_seller_override": True,
+            "reason": (
+                f"MASSIVE OBV NEGATIVE + FUNDING POSITIVE DUMP: "
+                f"OBV={obv_value:,.0f} ({obv_trend}) = distribusi BESAR berlangsung lama, "
+                f"funding={funding_rate:.6f} (crowded LONG = korban siap), "
+                f"volume={volume_ratio:.2f}x (HFT kontrol penuh). "
+                f"down_energy=0 adalah MANUFACTURED VACUUM, bukan genuine. "
+                f"Cancel NoSeller override. Force SHORT."
+            ),
+            "priority": -27800
+        }
+
+
 class CrowdedLongOBVNegativeTrap:
     """
     🔥 PRIORITY -28100 (LEBIH TINGGI DARI DIP THEN RIP):
@@ -18455,6 +18596,50 @@ class BinanceAnalyzer:
             result["entry_allowed"] = True
             return result
         
+        # ===== PRIORITY -27850: EXCHANGE-GREEKS TRIPLE ALIGNMENT =====
+        # Harus SEBELUM OBVNegativeAlgoHFTConsensus (-27800) dan CrowdedLongOBVNegativeTrap (-28100)
+        # AGTUSDT FIX: Ketika exchange_safe, greeks_kill, who_dies semuanya sepakat → tidak boleh di-override
+        triple_align = ExchangeGreeksTripleAlignment.detect(
+            exchange_safe=result.get("exchange_safe_direction", "NEUTRAL"),
+            greeks_kill=result.get("greeks_kill_direction", ""),
+            who_dies=result.get("greeks_who_dies_first", ""),
+            rsi6_5m=rsi6_5m_val,
+            long_liq=long_liq,
+            short_liq=short_liq,
+            funding_rate=funding_rate_val,
+            volume_ratio=volume_ratio
+        )
+        if triple_align["override"]:
+            result["bias"] = triple_align["bias"]
+            result["reason"] = f"[TRIPLE ALIGN] {triple_align['reason']}"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = triple_align["priority"]
+            result["entry_allowed"] = True
+            return result
+
+        # ===== PRIORITY -27800: MASSIVE OBV NEGATIVE + FUNDING POSITIVE =====
+        # Harus SEBELUM NoSellerNoBuyerOverride (-20000) dan setelah Triple Alignment
+        # BLESSUSDT FIX: OBV -570M + funding + + BAIT phase → force SHORT, cancel NoSeller
+        massive_obv = MassiveOBVNegativeFundingPositiveDumpGuard.detect(
+            obv_value=result.get("obv_value", 0),
+            obv_trend=result.get("obv_trend", "NEUTRAL"),
+            funding_rate=funding_rate_val,
+            market_phase=result.get("market_phase", "UNKNOWN"),
+            volume_ratio=volume_ratio,
+            agg=agg_val,
+            down_energy=down_energy_val,
+            rsi6_5m=rsi6_5m_val,
+            long_liq=long_liq,
+            short_liq=short_liq
+        )
+        if massive_obv["override"]:
+            result["bias"] = massive_obv["bias"]
+            result["reason"] = f"[MASSIVE OBV DUMP] {massive_obv['reason']}"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = massive_obv["priority"]
+            result["entry_allowed"] = True
+            return result
+
         # ========== PRIORITY -28100: CROWDED LONG OBV NEGATIVE TRAP ==========
         # BLESSUSDT CASE: OBV NEGATIVE_EXTREME + funding positif (crowded long)
         # + long_liq sangat dekat + agg tinggi (spoof) + down_energy=0
