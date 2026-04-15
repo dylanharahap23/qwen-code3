@@ -1968,6 +1968,57 @@ class PreKillSweepReverseBaitCorrection:
 # 6. StochJMaxCrowdingRealityCheck (patch StochJOverflowMicroSweepGuard)
 # 7. PreKillSweepReverseBaitCorrection (patch PreKillSweepDirectionFix)
 
+class CapitulationExtremeLongOverride:
+    """
+    🔥 PRIORITY -28200 (LEBIH TINGGI dari CrowdedLongOBVNegativeTrap -28100)
+    
+    MEMAKSA LONG ketika kondisi capitulation ekstrem:
+    - RSI6 < 15 (oversold absolut)
+    - long_liq < 1.0% (target sangat dekat, hampir tersapu)
+    - change_5m < -3.0% (sudah turun signifikan)
+    - down_energy < 0.1 (tidak ada seller aktif)
+    - up_energy > 0 (ada buyer mulai masuk)
+    - exchange_safe_direction == "LONG" (Binance konfirmasi)
+    
+    Ini adalah setup "capitulation bounce" paling kuat.
+    """
+    @staticmethod
+    def detect(rsi6: float, long_liq: float, change_5m: float,
+               down_energy: float, up_energy: float,
+               exchange_safe_direction: str,
+               agg: float, volume_ratio: float) -> dict:
+        
+        # Kondisi capitulation ekstrem
+        extreme_capitulation = (
+            rsi6 < 15 and
+            long_liq < 1.0 and
+            change_5m < -3.0 and
+            down_energy < 0.1 and
+            up_energy > 0
+        )
+        
+        volume_ok = volume_ratio < 1.2  # tidak panic selling
+        exchange_supports = exchange_safe_direction == "LONG"
+        
+        if extreme_capitulation and volume_ok and (exchange_supports or agg > 0.4):
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": (
+                    f"CAPITULATION EXTREME LONG OVERRIDE: "
+                    f"RSI6={rsi6:.1f} (<15 capitulation), "
+                    f"long_liq={long_liq:.2f}% ultra close (hampir tersapu), "
+                    f"price dropped {change_5m:.1f}%, "
+                    f"down_energy={down_energy:.3f} (no sellers), "
+                    f"up_energy={up_energy:.2f} (buyers stepping in), "
+                    f"exchange_safe={exchange_safe_direction} → "
+                    f"Ini CAPITULATION BOUNCE, BUKAN cascade dump. Force LONG."
+                ),
+                "priority": -28200
+            }
+        return {"override": False}
+
+
 class CrowdedLongOBVNegativeTrap:
     """
     🔥 PRIORITY -28100 (LEBIH TINGGI DARI DIP THEN RIP):
@@ -18037,6 +18088,26 @@ class BinanceAnalyzer:
         # ========== LAYER 0: ENERGY & EXHAUSTION OVERRIDE (PRIORITAS TERTINGGI) ==========
         # Harus di awal, sebelum PHASE LOCK dan GREEKS
         # Detector-detector dari dosen untuk anti-HFT manipulation
+        
+        # ===== PRIORITY -28200: CAPITULATION EXTREME LONG OVERRIDE =====
+        # PALING AWAL sebelum CrowdedLongOBVNegativeTrap (-28100)
+        cap_extreme = CapitulationExtremeLongOverride.detect(
+            rsi6=rsi6_val,
+            long_liq=long_liq,
+            change_5m=change_5m_val,
+            down_energy=down_energy_val,
+            up_energy=up_energy_val,
+            exchange_safe_direction=result.get("exchange_safe_direction", "NEUTRAL"),
+            agg=agg_val,
+            volume_ratio=volume_ratio
+        )
+        if cap_extreme["override"]:
+            result["bias"] = cap_extreme["bias"]
+            result["reason"] = f"[CAP EXTREME] {cap_extreme['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = cap_extreme["priority"]
+            result["entry_allowed"] = True
+            return result
         
         # ========== PRIORITY -28100: CROWDED LONG OBV NEGATIVE TRAP ==========
         # BLESSUSDT CASE: OBV NEGATIVE_EXTREME + funding positif (crowded long)
