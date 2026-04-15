@@ -1,4 +1,56 @@
 ```
+# Environment
+.env
+.env.local
+*.env.*
+
+# Logs and temp files
+*.log
+*.tmp
+*.swp
+
+# Editors
+.vscode/
+.idea/
+
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+.coverage
+htmlcov/
+.coverage.*
+.pytest_cache/
+.mypy_cache/
+
+# Dependencies
+venv/
+.venv/
+.env
+pip-log.txt
+pip-selfcheck.json
+node_modules/
+.jupyter
+.ipython
+.ipynb_checkpoints
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+.target/
+target/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Icon?
 ```
