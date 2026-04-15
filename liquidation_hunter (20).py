@@ -1676,6 +1676,109 @@ class StochJOverflowShortLiqMicroSweepGuard:
         }
 
 
+# ========== LECTURER'S SARAN: PRIORITY -28600 TO -27880 DETECTORS ==========
+# PostSweepShortSqueezeContinuation (-28600), MaximumCrowdingLongLiqCloserShort (-27900),
+# CrowdedLongCascadeDump (-27880)
+
+class PostSweepShortSqueezeContinuation:
+    """
+    🔥 PRIORITY -28600: Setelah short_liq tersapu, jika funding negatif (crowded short)
+    dan OBV positif ekstrem serta RSI masih tinggi, squeeze masih berlanjut.
+    Memaksa LONG, meng-override NetLiquidationValuePriority.
+    """
+    @staticmethod
+    def detect(short_liq: float, change_5m: float, funding_rate: float,
+               obv_trend: str, rsi6: float, volume_ratio: float,
+               up_energy: float, agg: float) -> dict:
+        if funding_rate is None:
+            return {"override": False}
+        # short_liq sudah tersapu (harga naik melewati short_liq)
+        if change_5m <= short_liq * 0.8:
+            return {"override": False}
+        # Funding negatif = crowded short
+        if funding_rate >= -0.0003:
+            return {"override": False}
+        # OBV positif ekstrem (akumulasi nyata)
+        if obv_trend not in ("POSITIVE_EXTREME", "POSITIVE"):
+            return {"override": False}
+        # RSI minimal tidak oversold
+        if rsi6 < 50:
+            return {"override": False}
+        # Volume tidak panic
+        if volume_ratio > 1.2:
+            return {"override": False}
+        # Ada buy pressure
+        if up_energy <= 0.1:
+            return {"override": False}
+        # Agg tidak terlalu bearish (opsional)
+        if agg < 0.2:
+            return {"override": False}
+        return {
+            "override": True,
+            "bias": "LONG",
+            "reason": (f"POST-SWEEP SHORT SQUEEZE CONTINUATION: short_liq={short_liq:.2f}% sudah tersapu "
+                       f"(change={change_5m:.1f}%), funding={funding_rate:.5f} (crowded short), "
+                       f"OBV={obv_trend}, RSI={rsi6:.1f} → squeeze masih berlanjut, force LONG."),
+            "priority": -28600
+        }
+
+
+class MaximumCrowdingLongLiqCloserShort:
+    """
+    🔥 PRIORITY -27900: Delta exposure extreme (>0.88) + long_liq lebih dekat dari short_liq
+    + funding positif + kill_direction SHORT → crowded long akan di-liquidate, force SHORT.
+    """
+    @staticmethod
+    def detect(delta_exposure: float, long_liq: float, short_liq: float,
+               funding_rate: float, greeks_kill_direction: str,
+               who_dies_first: str) -> dict:
+        if funding_rate is None:
+            return {"override": False}
+        if (delta_exposure > 0.88 and long_liq < short_liq and long_liq < 2.0
+            and funding_rate > 0.0002 and greeks_kill_direction == "SHORT"
+            and who_dies_first == "LONG_TRADERS"):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (f"MAX CROWDING LONG LIQ CLOSER SHORT: delta={delta_exposure:.3f} (>88%), "
+                           f"long_liq={long_liq:.2f}% < short_liq={short_liq:.2f}%, "
+                           f"funding={funding_rate:.5f} (crowded long), kill=SHORT → "
+                           f"crowded long akan di-liquidate, force SHORT."),
+                "priority": -27900
+            }
+        return {"override": False}
+
+
+class CrowdedLongCascadeDump:
+    """
+    🔥 PRIORITY -27880: Cascade dump BUKAN bounce.
+    Kondisi: long_liq sangat dekat (<1.5%), harga sudah turun, volume kering,
+    funding positif (crowded long), agg tinggi (spoofed buy), tidak ada bid wall support.
+    """
+    @staticmethod
+    def detect(long_liq: float, change_5m: float, volume_ratio: float,
+               funding_rate: float, agg: float, down_energy: float,
+               ask_slope: float, bid_slope: float, obv_trend: str) -> dict:
+        if funding_rate is None:
+            return {"override": False}
+        if not (long_liq < 1.5 and change_5m < -1.0 and volume_ratio < 0.7
+                and funding_rate > 0.0003 and agg > 0.85 and down_energy < 0.1):
+            return {"override": False}
+        # Cek support: jika ask_slope >= bid_slope, tidak ada bid wall
+        if bid_slope > 0 and ask_slope >= bid_slope * 0.9:
+            if obv_trend not in ("POSITIVE_EXTREME", "POSITIVE"):
+                return {
+                    "override": True,
+                    "bias": "SHORT",
+                    "reason": (f"CROWDED LONG CASCADE DUMP: long_liq={long_liq:.2f}% ultra close, "
+                               f"price down {change_5m:.1f}%, volume {volume_ratio:.2f}x kering, "
+                               f"funding={funding_rate:.5f} (crowded long), agg={agg:.2f} spoofed, "
+                               f"no bid wall support → HFT sweep long stop and continue dump. Force SHORT."),
+                    "priority": -27880
+                }
+        return {"override": False}
+
+
 # ========== LECTURER'S SARAN LOGIC: ULTRA LOW VOLUME AGG SPOOFING & FUNDING+DELTA+KILL ==========\n
 # PRIORITY -27000 dan -26950: Deteksi pattern VELVETUSDT "Low Volume Crowded Long Distribution"
 # Pattern paling licik: semua sinyal terlihat bullish tapi volume ultra-rendah (<15% MA10)
@@ -2395,106 +2498,10 @@ class MaximumCrowdingAbsoluteBlock:
         }
 
 
-class MaximumCrowdingLongLiqCloserShort:
-    """
-    🔥 PRIORITY -27900 (TERTINGGI BARU - LECTURER SARAN LOGIC):
-    
-    AKEUSDT EXACT PATTERN — PRIORITY -27900 (TERTINGGI BARU):
-    
-    delta_exposure > 0.88 + long_liq < short_liq + greeks_kill=SHORT
-    + who_dies=LONG_TRADERS + stoch_J > 100 + funding positif
-    
-    Ini adalah "maximum crowding short liq bait":
-    93% posisi sudah LONG, long_liq lebih dekat, Greeks sudah committed SHORT.
-    short_liq yang "dekat" (0.71%) adalah umpan — HFT tidak akan sweep itu,
-    mereka langsung dump ke long_liq (1.82%) karena itulah target real.
-    
-    Perbedaan kritis dari ReverseSqueezeBait yang ada:
-    - ReverseSqueeze butuh long_liq > short_liq * 3 (ratio besar)
-    - Detector ini fire bahkan dengan ratio kecil (1.82/0.71 = 2.5x)
-    KARENA delta_exposure sudah > 0.88 (extreme crowding sebagai konfirmasi utama)
-    """
-    @staticmethod
-    def detect(
-        delta_exposure: float,
-        long_liq: float,
-        short_liq: float,
-        greeks_kill_direction: str,
-        who_dies_first: str,
-        stoch_j: float,
-        funding_rate: float,
-        volume_ratio: float,
-        rsi6: float,
-        greeks_delta_crowded: str
-    ) -> dict:
-        
-        if funding_rate is None:
-            funding_rate = 0.0
-        
-        # delta_exposure harus extreme (>88% posisi LONG)
-        if delta_exposure < 0.88:
-            return {"override": False}
-        
-        # long_liq harus LEBIH DEKAT dari short_liq
-        if long_liq >= short_liq:
-            return {"override": False}
-        
-        # long_liq harus dalam range yang bisa dicapai
-        if long_liq > 4.0:
-            return {"override": False}
-        
-        # Greeks harus sudah committed SHORT
-        if greeks_kill_direction != "SHORT":
-            return {"override": False}
-        
-        # who_dies harus LONG_TRADERS (sudah confirmed)
-        if who_dies_first not in ("LONG_TRADERS", "BOTH_POSSIBLE"):
-            return {"override": False}
-        
-        # delta_crowded harus LONG
-        if greeks_delta_crowded != "LONG":
-            return {"override": False}
-        
-        # Funding harus positif (crowded LONG)
-        if funding_rate <= 0.0001:
-            return {"override": False}
-        
-        # Minimal 2 dari 3 konfirmasi tambahan
-        extra = sum([
-            stoch_j > 95,          # stochastic maximal/overflow
-            rsi6 > 65,             # overbought
-            volume_ratio < 0.6,    # volume kering
-        ])
-        
-        if extra < 2:
-            return {"override": False}
-        
-        ratio = long_liq / short_liq if short_liq > 0 else 0
-        
-        return {
-            "override": True,
-            "bias": "SHORT",
-            "cancel_pre_kill_sweep": True,
-            "cancel_liquidity_extreme_override": True,
-            "reason": (
-                f"MAXIMUM CROWDING LONG LIQ CLOSER SHORT: "
-                f"delta_exposure={delta_exposure:.3f} ({delta_exposure*100:.0f}% posisi LONG, extreme crowding), "
-                f"long_liq={long_liq:.2f}% LEBIH DEKAT dari short_liq={short_liq:.2f}% "
-                f"(ratio {ratio:.1f}x, short_liq adalah UMPAN bukan target), "
-                f"greeks_kill={greeks_kill_direction}, who_dies={who_dies_first}, "
-                f"funding={funding_rate:.5f} (crowded LONG), stoch_J={stoch_j:.1f}, "
-                f"volume={volume_ratio:.2f}x. "
-                f"HFT tidak akan sweep short_liq — langsung dump ke long_liq. "
-                f"Force SHORT. Cancel pre-kill sweep dan liquidity extreme override."
-            ),
-            "priority": -27900
-        }
 
 
 class DipThenRipAggConfirm:
     """
-    🔥 PRIORITY -28000 (TERTINGGI ABSOLUT BARU - LECTURER SARAN LOGIC):
-    
     DUSDT CASE: long_liq dekat + agg=1.00 + down_energy=0 + ofi LONG + change_5m negatif kecil
     = HFT turunkan harga sedikit untuk sweep long stop, lalu PUMP.
     
@@ -18433,6 +18440,25 @@ class BinanceAnalyzer:
             # Update juga ofi jika perlu (tapi ofi dari result sudah pakai json)
         
         
+        # ========== PRIORITY -28600: POST-SWEEP SHORT SQUEEZE CONTINUATION ==========
+        post_sweep_squeeze = PostSweepShortSqueezeContinuation.detect(
+            short_liq=short_liq,
+            change_5m=change_5m_val,
+            funding_rate=funding_rate_val,
+            obv_trend=obv_trend,
+            rsi6=rsi6_val,
+            volume_ratio=volume_ratio,
+            up_energy=up_energy_val,
+            agg=agg_val
+        )
+        if post_sweep_squeeze["override"]:
+            result["bias"] = post_sweep_squeeze["bias"]
+            result["reason"] = f"[POST-SWEEP SQUEEZE] {post_sweep_squeeze['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = post_sweep_squeeze["priority"]
+            result["entry_allowed"] = True
+            return result
+
         # ========== PRIORITY -28500: NET LIQUIDATION VALUE PRIORITY =====
         net_liq = NetLiquidationValuePriority.calculate(
             short_liq=short_liq,
@@ -18596,6 +18622,43 @@ class BinanceAnalyzer:
             result["entry_allowed"] = True
             return result
         
+        # ===== PRIORITY -27900: MAXIMUM CROWDING LONG LIQ CLOSER SHORT =====
+        max_crowding_long = MaximumCrowdingLongLiqCloserShort.detect(
+            delta_exposure=result.get("greeks_delta_exposure", 0),
+            long_liq=long_liq,
+            short_liq=short_liq,
+            funding_rate=funding_rate_val,
+            greeks_kill_direction=result.get("greeks_kill_direction", ""),
+            who_dies_first=result.get("greeks_who_dies_first", "")
+        )
+        if max_crowding_long["override"]:
+            result["bias"] = max_crowding_long["bias"]
+            result["reason"] = f"[MAX CROWDING LONG] {max_crowding_long['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = max_crowding_long["priority"]
+            result["entry_allowed"] = True
+            return result
+
+        # ===== PRIORITY -27880: CROWDED LONG CASCADE DUMP =====
+        cascade_dump = CrowdedLongCascadeDump.detect(
+            long_liq=long_liq,
+            change_5m=change_5m_val,
+            volume_ratio=volume_ratio,
+            funding_rate=funding_rate_val,
+            agg=agg_val,
+            down_energy=down_energy_val,
+            ask_slope=result.get("ask_slope", 0),
+            bid_slope=result.get("bid_slope", 1),
+            obv_trend=obv_trend
+        )
+        if cascade_dump["override"]:
+            result["bias"] = cascade_dump["bias"]
+            result["reason"] = f"[CASCADE DUMP] {cascade_dump['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = cascade_dump["priority"]
+            result["entry_allowed"] = True
+            return result
+
         # ===== PRIORITY -27850: EXCHANGE-GREEKS TRIPLE ALIGNMENT =====
         # Harus SEBELUM OBVNegativeAlgoHFTConsensus (-27800) dan CrowdedLongOBVNegativeTrap (-28100)
         # AGTUSDT FIX: Ketika exchange_safe, greeks_kill, who_dies semuanya sepakat → tidak boleh di-override
