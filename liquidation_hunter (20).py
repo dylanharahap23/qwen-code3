@@ -2047,10 +2047,16 @@ class CrowdedLongOBVNegativeTrap:
                funding_rate: float, long_liq: float,
                agg: float, down_energy: float,
                rsi6_5m: float, change_5m: float,
-               short_liq: float = 99.0) -> dict:
+               short_liq: float = 99.0,
+               rsi6: float = 50.0,
+               up_energy: float = 0.0) -> dict:
         
         if funding_rate is None:
             return {"override": False}
+        
+        # TAMBAHAN GUARD: Jika RSI < 15 dan up_energy > 0, ini capitulation bounce BUKAN cascade dump
+        if rsi6 < 15 and up_energy > 0.2:
+            return {"override": False}  # Biarkan CapitulationBounce detector yang handle
         
         # Kondisi utama
         obv_bearish = obv_trend in ("NEGATIVE_EXTREME", "NEGATIVE")
@@ -2760,7 +2766,11 @@ class ExchangeRiskScoreHardBlock:
         rsi6: float,
         rsi6_5m: float,
         delta_exposure: float,
-        funding_rate: float
+        funding_rate: float,
+        long_liq: float = 99.0,
+        change_5m: float = 0.0,
+        ask_slope: float = 0,
+        bid_slope: float = 1
     ) -> dict:
         
         if exchange_risk_score < 7:
@@ -2771,6 +2781,12 @@ class ExchangeRiskScoreHardBlock:
         
         if current_bias == exchange_safe_direction:
             return {"override": False}  # sudah benar
+        
+        # JANGAN force LONG jika ini adalah crowded long cascade dump
+        if (funding_rate is not None and funding_rate > 0.0003 and 
+            long_liq < 1.5 and rsi6 < 20 and change_5m < 0):
+            if ask_slope > bid_slope * 1.2:
+                return {"override": False}  # biarkan detector lain yang handle
         
         if funding_rate is None:
             funding_rate = 0.0
@@ -18028,6 +18044,15 @@ class BinanceAnalyzer:
         market_phase = phase_result.phase if phase_result else "UNKNOWN"
         
         
+        # ===== FIX DATA RACE AGG (PERTAMA, SEBELUM SEMUA DETECTOR) =====
+        # Mencegah data race antara display snapshot dan JSON ground truth
+        json_agg = result.get("agg", agg_val)
+        if abs(json_agg - agg_val) > 0.15:
+            result["reason"] = f"[AGG FIX: display={agg_val:.2f} → json={json_agg:.2f}] " + result.get("reason", "")
+            agg_val = json_agg
+            # Update juga ofi jika perlu (tapi ofi dari result sudah pakai json)
+        
+        
         # ========== PRIORITY -28500: NET LIQUIDATION VALUE PRIORITY =====
         net_liq = NetLiquidationValuePriority.calculate(
             short_liq=short_liq,
@@ -18064,6 +18089,65 @@ class BinanceAnalyzer:
             result["priority_level"] = adv["priority"]
             result["entry_allowed"] = True
             return result
+
+        # ===== PRIORITY -28300: CROWDED LONG CASCADE DUMP =====
+        # Funding positif + long_liq ultra dekat + RSI oversold + sell wall dominan = LANJUT DUMP, BUKAN BOUNCE
+        # FIX INUSDT: exchange_safe_direction salah karena funding positif + long_liq dekat = cascade dump
+        if (funding_rate_val is not None and funding_rate_val > 0.0003 and
+            long_liq < 1.5 and rsi6_val < 20 and change_5m_val < -1.0):
+            
+            ask_slope_val = result.get("ask_slope", 0)
+            bid_slope_val = result.get("bid_slope", 1)
+            sell_wall_dominant = (ask_slope_val > bid_slope_val * 1.3) if bid_slope_val > 0 else False
+            agg_not_bullish = agg_val < 0.6
+            
+            if sell_wall_dominant and agg_not_bullish:
+                result["bias"] = "SHORT"
+                result["reason"] = f"[CROWDED CASCADE DUMP] funding={funding_rate_val:.5f} crowded long, long_liq={long_liq:.2f}% ultra close, RSI={rsi6_val:.1f} oversold, sell wall dominant (ask/bid={ask_slope_val/bid_slope_val:.1f}x), agg={agg_val:.2f} → BUKAN bounce, ini cascade dump. Force SHORT. | " + result.get("reason", "")
+                result["confidence"] = "ABSOLUTE"
+                result["priority_level"] = -28300
+                result["entry_allowed"] = True
+                return result
+        
+        # ===== PRIORITY -28200: CAPITULATION BOUNCE =====
+        # long_liq dekat, RSI oversold ekstrem, ada buyer (up_energy>0), sell wall tidak dominan = BOUNCE
+        # FIX BLESSUSDT #1: RSI 9.9, long_liq 0.35%, up_energy>0 → seharusnya bounce, tapi detector paksa SHORT
+        if (long_liq < 2.0 and rsi6_val < 20 and change_5m_val < -2.0 and
+            down_energy_val < 0.1 and up_energy_val > 0.2):
+            
+            ask_slope_val = result.get("ask_slope", 0)
+            bid_slope_val = result.get("bid_slope", 1)
+            sell_wall_not_dominant = (ask_slope_val <= bid_slope_val * 1.2) if bid_slope_val > 0 else True
+            funding_not_crowded_long = (funding_rate_val is None or funding_rate_val < 0.0005)
+            
+            if sell_wall_not_dominant and (funding_not_crowded_long or agg_val > 0.5):
+                result["bias"] = "LONG"
+                result["reason"] = f"[CAPITULATION BOUNCE] long_liq={long_liq:.2f}% close, RSI={rsi6_val:.1f} oversold, price dropped {change_5m_val:.1f}%, up_energy={up_energy_val:.2f}, down_energy=0, sell wall NOT dominant → bounce imminent. Force LONG. | " + result.get("reason", "")
+                result["confidence"] = "ABSOLUTE"
+                result["priority_level"] = -28200
+                result["entry_allowed"] = True
+                return result
+        
+        # ===== PRIORITY -20015: BAIT NO SELLER WITH SELL WALL =====
+        # down_energy=0 tapi ask_slope > bid_slope (sell wall) = ILUSI, akan dump
+        # FIX ARIAUSDT & BLESSUSDT #2: down_energy=0 ilusi, tapi ask_slope > bid_slope (sell wall)
+        if (market_phase == "BAIT" and volume_ratio < 0.7 and down_energy_val < 0.01 and
+            agg_val > 0.65 and change_5m_val > 0):
+            
+            ask_slope_val = result.get("ask_slope", 0)
+            bid_slope_val = result.get("bid_slope", 1)
+            sell_wall_exists = (ask_slope_val > bid_slope_val * 1.2) if bid_slope_val > 0 else False
+            
+            # Genuine short squeeze: short_liq < long_liq dan short_liq < 2%
+            genuine_squeeze = (short_liq < long_liq and short_liq < 2.0)
+            
+            if sell_wall_exists and not genuine_squeeze:
+                result["bias"] = "SHORT"
+                result["reason"] = f"[BAIT SELL WALL TRAP] market_phase=BAIT, volume={volume_ratio:.2f}x kering, down_energy=0 ilusi, agg={agg_val:.2f}, tapi ask_slope={ask_slope_val:.0f} > bid_slope={bid_slope_val:.0f} → sell wall nyata. HFT memancing LONG, akan dump. Force SHORT. | " + result.get("reason", "")
+                result["confidence"] = "ABSOLUTE"
+                result["priority_level"] = -20015
+                result["entry_allowed"] = True
+                return result
 
         # ========== REGIME BLOCK: SKIP jika MANIPULATION =====
         if result.get("regime_skip"):
@@ -18122,7 +18206,9 @@ class BinanceAnalyzer:
             down_energy=down_energy_val,
             rsi6_5m=rsi6_5m_val,
             change_5m=change_5m_val,
-            short_liq=short_liq
+            short_liq=short_liq,
+            rsi6=rsi6_val,
+            up_energy=up_energy_val
         )
         if crowded_obv_trap["override"]:
             result["bias"] = crowded_obv_trap["bias"]
@@ -18266,7 +18352,11 @@ class BinanceAnalyzer:
             rsi6=rsi6_val,
             rsi6_5m=rsi6_5m_val,
             delta_exposure=result.get("greeks_delta_exposure", 0),
-            funding_rate=funding_rate_val
+            funding_rate=funding_rate_val,
+            long_liq=long_liq,
+            change_5m=change_5m_val,
+            ask_slope=result.get("ask_slope", 0),
+            bid_slope=result.get("bid_slope", 1)
         )
         if exchange_risk_block["override"]:
             result["bias"] = exchange_risk_block["bias"]
