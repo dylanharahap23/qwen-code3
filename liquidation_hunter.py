@@ -3025,6 +3025,62 @@ class AskWallDominanceOverride:
         return {"override": False}
 
 
+class BaitNoSellerTrapOverride:
+    """
+    🔥 PRIORITY -20010 (LEBIH TINGGI dari NoSellerNoBuyerOverride -20000)
+    
+    MEMBATALKAN forced LONG dari NoSellerNoBuyerOverride ketika:
+    - market_phase == "BAIT" (fase manipulasi)
+    - volume_ratio < 0.7 (volume kering, HFT kontrol)
+    - down_energy < 0.01 (ini kondisi yang akan dipakai HFT untuk trap)
+    - agg > 0.65 (mayoritas BUY - umpan)
+    - ofi_bias == "LONG" (order flow bullish)
+    - change_5m > 0 (harga sudah naik, retail sudah masuk)
+    - short_liq > long_liq ATAU short_liq > 2.0% (tidak ada short squeeze genuine)
+    
+    Output: SHORT (atau setidaknya batalkan LONG, biarkan detector lain menentukan)
+    """
+    @staticmethod
+    def detect(market_phase: str, volume_ratio: float,
+               down_energy: float, agg: float,
+               ofi_bias: str, change_5m: float,
+               short_liq: float, long_liq: float,
+               ask_slope: float, bid_slope: float) -> dict:
+        
+        # Kondisi utama: BAIT phase + volume kering + no sellers + bullish appearance
+        if (market_phase == "BAIT" and
+            volume_ratio < 0.7 and
+            down_energy < 0.01 and
+            agg > 0.65 and
+            ofi_bias == "LONG" and
+            change_5m > 0):
+            
+            # Cek apakah ada sell wall (ask_slope > bid_slope)
+            sell_wall_exists = ask_slope > bid_slope * 1.2 if bid_slope > 0 else False
+            
+            # Cek apakah short squeeze genuine? (short_liq harus lebih dekat DAN kecil)
+            genuine_short_squeeze = (short_liq < long_liq and short_liq < 2.0)
+            
+            # Jika bukan genuine short squeeze, maka ini adalah trap
+            if not genuine_short_squeeze or sell_wall_exists:
+                return {
+                    "override": True,
+                    "bias": "SHORT",
+                    "reason": (
+                        f"BAIT NO SELLER TRAP: market_phase=BAIT, volume={volume_ratio:.2f}x kering, "
+                        f"down_energy=0 (ilusi), agg={agg:.2f} ({(agg*100):.0f}% BUY), "
+                        f"OFI LONG, price up {change_5m:.1f}%, "
+                        f"short_liq={short_liq:.2f}% vs long_liq={long_liq:.2f}% "
+                        f"({'sell wall detected' if sell_wall_exists else 'bukan genuine squeeze'}). "
+                        f"HFT menciptakan vacuum untuk memancing LONG, akan dump. "
+                        f"Batalkan NoSeller override, force SHORT."
+                    ),
+                    "priority": -20010
+                }
+        
+        return {"override": False}
+
+
 class NoSellerNoBuyerOverride:
     """
     🔥 PRIORITY -20000: Jika down_energy == 0 → TIDAK ADA SELLER → LONG.
@@ -18547,6 +18603,27 @@ class BinanceAnalyzer:
             result["reason"] = f"[ASK WALL] {ask_wall['reason']} | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = ask_wall["priority"]
+            return result
+        
+        # ===== PRIORITY -20010: BAIT NO SELLER TRAP OVERRIDE =====
+        bait_trap = BaitNoSellerTrapOverride.detect(
+            market_phase=market_phase,
+            volume_ratio=volume_ratio,
+            down_energy=down_energy_val,
+            agg=agg_val,
+            ofi_bias=result.get("ofi_bias", "NEUTRAL"),
+            change_5m=change_5m_val,
+            short_liq=short_liq,
+            long_liq=long_liq,
+            ask_slope=result.get("ask_slope", 0),
+            bid_slope=result.get("bid_slope", 1)
+        )
+        if bait_trap["override"]:
+            result["bias"] = bait_trap["bias"]
+            result["reason"] = f"[BAIT NO SELLER TRAP] {bait_trap['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = bait_trap["priority"]
+            result["entry_allowed"] = True
             return result
         
         # 0.1 No Seller / No Buyer Override (PRIORITY -20000)
