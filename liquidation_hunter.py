@@ -1920,6 +1920,73 @@ class PreKillSweepReverseBaitCorrection:
 # 6. StochJMaxCrowdingRealityCheck (patch StochJOverflowMicroSweepGuard)
 # 7. PreKillSweepReverseBaitCorrection (patch PreKillSweepDirectionFix)
 
+class CrowdedLongOBVNegativeTrap:
+    """
+    🔥 PRIORITY -28100 (LEBIH TINGGI DARI DIP THEN RIP):
+    
+    BLESSUSDT CASE: OBV NEGATIVE_EXTREME + funding positif (crowded long) 
+    + long_liq sangat dekat + agg tinggi (spoof) + down_energy=0
+    
+    Ini BUKAN dip then rip, melainkan DISTRIBUSI AKTIF.
+    HFT menggunakan micro-buy (agg=1.00) untuk menutupi distribusi.
+    long_liq yang dekat akan DITEMBUS (cascade dump), bukan disweep lalu pump.
+    
+    Kondisi:
+    - obv_trend in ("NEGATIVE_EXTREME", "NEGATIVE")
+    - funding_rate > 0.0005 (crowded long)
+    - long_liq < 1.5 (target sangat dekat)
+    - agg > 0.85 (spoofed buy pressure)
+    - down_energy < 0.01 (fake vacuum)
+    - rsi6_5m < 30 (oversold di 5m, capitulation trap)
+    - change_5m < 0 (harga sedang turun)
+    
+    Priority: -28100
+    Bias: SHORT
+    """
+    @staticmethod
+    def detect(obv_trend: str, obv_value: float,
+               funding_rate: float, long_liq: float,
+               agg: float, down_energy: float,
+               rsi6_5m: float, change_5m: float,
+               short_liq: float = 99.0) -> dict:
+        
+        if funding_rate is None:
+            return {"override": False}
+        
+        # Kondisi utama
+        obv_bearish = obv_trend in ("NEGATIVE_EXTREME", "NEGATIVE")
+        crowded_long = funding_rate > 0.0005
+        long_liq_close = long_liq < 1.5
+        agg_spoof = agg > 0.85
+        no_seller = down_energy < 0.01
+        rsi_oversold = rsi6_5m < 30
+        price_falling = change_5m < 0
+        
+        # Hitung skor (minimal 5 dari 7)
+        conditions = [
+            obv_bearish, crowded_long, long_liq_close,
+            agg_spoof, no_seller, rsi_oversold, price_falling
+        ]
+        score = sum(conditions)
+        
+        if score >= 5:
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"CROWDED LONG OBV NEGATIVE TRAP: "
+                    f"OBV={obv_trend} ({obv_value:,.0f}) = distribusi aktif, "
+                    f"funding={funding_rate:.6f} (crowded long), "
+                    f"long_liq={long_liq:.2f}% (target cascade), "
+                    f"agg={agg:.2f} (spoofed buy), down_energy={down_energy:.3f}, "
+                    f"RSI5m={rsi6_5m:.1f} oversold, price down {change_5m:.1f}% → "
+                    f"BUKAN dip then rip, ini cascade dump. Force SHORT."
+                ),
+                "priority": -28100
+            }
+        return {"override": False}
+
+
 class UltraCloseShortLiqBuyPressureOverride:
     """
     🔥 PRIORITY -28050 (TERTINGGI ABSOLUT - DI ATAS SEMUA):
@@ -17579,6 +17646,29 @@ class BinanceAnalyzer:
         # ========== LAYER 0: ENERGY & EXHAUSTION OVERRIDE (PRIORITAS TERTINGGI) ==========
         # Harus di awal, sebelum PHASE LOCK dan GREEKS
         # Detector-detector dari dosen untuk anti-HFT manipulation
+        
+        # ========== PRIORITY -28100: CROWDED LONG OBV NEGATIVE TRAP ==========
+        # BLESSUSDT CASE: OBV NEGATIVE_EXTREME + funding positif (crowded long)
+        # + long_liq sangat dekat + agg tinggi (spoof) + down_energy=0
+        # Ini BUKAN dip then rip, melainkan DISTRIBUSI AKTIF.
+        crowded_obv_trap = CrowdedLongOBVNegativeTrap.detect(
+            obv_trend=result.get("obv_trend", "NEUTRAL"),
+            obv_value=result.get("obv_value", 0.0),
+            funding_rate=result.get("funding_rate", 0.0),
+            long_liq=long_liq,
+            agg=agg_val,
+            down_energy=down_energy_val,
+            rsi6_5m=rsi6_5m_val,
+            change_5m=change_5m_val,
+            short_liq=short_liq
+        )
+        if crowded_obv_trap["override"]:
+            result["bias"] = crowded_obv_trap["bias"]
+            result["reason"] = f"[CROWDED OBV TRAP] {crowded_obv_trap['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = crowded_obv_trap["priority"]
+            result["entry_allowed"] = True
+            return result
         
         # ========== PRIORITY -28050: ULTRA CLOSE SHORT LIQ BUY PRESSURE OVERRIDE ==========
         ultra_short_buy = UltraCloseShortLiqBuyPressureOverride.detect(
