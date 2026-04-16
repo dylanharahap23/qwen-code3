@@ -873,6 +873,52 @@ class OverboughtExtremeShortLiqFakeSqueeze:
         }
 
 
+class OBVGreeksBounceOverride:
+    """
+    PNUTUSDT PATTERN: OBV POSITIVE_EXTREME + greeks_liq_7pct == "SHORT_TRADERS_DIE"
+    + greeks_kill_direction == "LONG" + up_energy > down_energy + volume_ratio < 0.6
+    + change_5m < -2.0 (sudah turun signifikan)
+    Force LONG, override RSI timeframe divergence trap.
+    Priority -27960 (lebih tinggi dari RSI timeframe divergence -27955)
+    """
+    @staticmethod
+    def detect(obv_trend: str, obv_value: float, greeks_liq_7pct: str,
+               greeks_kill_direction: str, up_energy: float, down_energy: float,
+               volume_ratio: float, change_5m: float) -> dict:
+        # OBV harus positive extreme dan nilai besar
+        if obv_trend not in ("POSITIVE_EXTREME", "POSITIVE"):
+            return {"override": False}
+        if obv_value < 50_000_000:  # threshold minimal 50 juta
+            return {"override": False}
+        # Greeks harus menunjukkan short yang mati
+        if greeks_liq_7pct != "SHORT_TRADERS_DIE":
+            return {"override": False}
+        if greeks_kill_direction != "LONG":
+            return {"override": False}
+        # Buy pressure nyata
+        if up_energy <= down_energy:
+            return {"override": False}
+        # Volume kering (exhaustion drop)
+        if volume_ratio >= 0.6:
+            return {"override": False}
+        # Harga sudah turun signifikan (setup bounce)
+        if change_5m > -2.0:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "LONG",
+            "reason": (
+                f"OBV-GREEKS BOUNCE OVERRIDE: OBV={obv_trend} ({obv_value:,.0f}) institutional accumulation, "
+                f"greeks_liq_7pct={greeks_liq_7pct} kill={greeks_kill_direction} → short traders akan mati (price up), "
+                f"up_energy={up_energy:.2f} > down_energy={down_energy:.2f}, "
+                f"volume={volume_ratio:.2f}x dry, price dropped {change_5m:.1f}% → bounce imminent. "
+                f"Force LONG, override RSI divergence trap."
+            ),
+            "priority": -27960
+        }
+
+
 class AdversarialSqueezeContinuation:
     """
     PRIORITY -29000: short_liq sudah tersapu tapi squeeze masih lanjut.
@@ -20319,6 +20365,25 @@ class BinanceAnalyzer:
             result["reason"] = f"[RSI5m TREND] {rsi5m_override['reason']} | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = rsi5m_override["priority"]
+            result["entry_allowed"] = True
+            return result
+
+        # ===== PRIORITY -27960: OBV-GREEKS BOUNCE OVERRIDE (PNUTUSDT FIX) =====
+        obv_greeks_override = OBVGreeksBounceOverride.detect(
+            obv_trend=result.get("obv_trend", "NEUTRAL"),
+            obv_value=result.get("obv_value", 0),
+            greeks_liq_7pct=result.get("greeks_liq_7pct", ""),
+            greeks_kill_direction=result.get("greeks_kill_direction", ""),
+            up_energy=up_energy_val,
+            down_energy=down_energy_val,
+            volume_ratio=volume_ratio,
+            change_5m=change_5m_val
+        )
+        if obv_greeks_override["override"]:
+            result["bias"] = obv_greeks_override["bias"]
+            result["reason"] = f"[OBV-GREEKS BOUNCE] {obv_greeks_override['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = obv_greeks_override["priority"]
             result["entry_allowed"] = True
             return result
 
