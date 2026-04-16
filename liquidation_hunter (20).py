@@ -3849,6 +3849,70 @@ class EnergyVolumeDecouplingGuard:
         return {"override": False}
 
 
+class RSI5mAlgoShortPhantomBidVeto:
+    """
+    ORDIUSDT EXACT PATTERN — PRIORITY -27850:
+    
+    rsi6_5m > 85 (5m overbought extreme) + algo_type = SHORT 
+    + up_energy >> volume_ratio (phantom bid wall)
+    + market_phase = BAIT
+    
+    When VEGA-KILL conflict resolves to LONG via kill_direction,
+    but algo says SHORT + RSI5m exhausted + bid wall is phantom →
+    override to SHORT.
+    """
+    @staticmethod
+    def detect(rsi6_5m: float, algo_type_bias: str, up_energy: float,
+               volume_ratio: float, market_phase: str,
+               greeks_vega_active: bool, kill_direction: str,
+               change_5m: float, funding_rate: float) -> dict:
+        
+        if funding_rate is None:
+            funding_rate = 0.0
+        
+        # RSI 5m must be extremely overbought
+        if rsi6_5m <= 85:
+            return {"override": False}
+        
+        # Algo must say SHORT
+        if algo_type_bias != "SHORT":
+            return {"override": False}
+        
+        # Must be BAIT phase
+        if market_phase != "BAIT":
+            return {"override": False}
+        
+        # Phantom bid wall: up_energy >> what volume supports
+        expected_max = volume_ratio * 5.0
+        if up_energy <= expected_max * 2.0:
+            return {"override": False}
+        
+        # Vega must be active (BAIT confirmation)
+        if not greeks_vega_active:
+            return {"override": False}
+        
+        # This only fires when kill_direction would normally force LONG
+        # (i.e., the VEGA-KILL conflict resolved wrong)
+        if kill_direction != "LONG":
+            return {"override": False}
+        
+        phantom_ratio = up_energy / max(expected_max, 0.1)
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"RSI5M ALGO SHORT PHANTOM BID VETO: "
+                f"rsi6_5m={rsi6_5m:.1f} (>85, 5m exhausted), "
+                f"algo=SHORT, up_energy={up_energy:.2f} vs expected_max={expected_max:.2f} "
+                f"(ratio {phantom_ratio:.1f}x = PHANTOM BID WALL), "
+                f"BAIT phase, Vega active → VEGA-KILL resolved to LONG is WRONG. "
+                f"Force SHORT."
+            ),
+            "priority": -27850
+        }
+
+
 class ExtremeShortLiqNoSellerSqueezeGuard:
     """
     🔥 PRIORITY -27400 (HIGHER THAN REVERSE SQUEEZE BAIT):
@@ -19871,6 +19935,26 @@ class BinanceAnalyzer:
             result["reason"] = f"[CASCADE DUMP] {cascade_dump['reason']} | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = cascade_dump["priority"]
+            result["entry_allowed"] = True
+            return result
+
+        # ===== PRIORITY -27850: RSI5M ALGO SHORT PHANTOM BID VETO (ORDIUSDT FIX) =====
+        rsi5m_algo_veto = RSI5mAlgoShortPhantomBidVeto.detect(
+            rsi6_5m=rsi6_5m_val,
+            algo_type_bias=result.get("algo_type_bias", "NEUTRAL"),
+            up_energy=up_energy_val,
+            volume_ratio=volume_ratio,
+            market_phase=result.get("market_phase", "UNKNOWN"),
+            greeks_vega_active=result.get("greeks_vega_active", False),
+            kill_direction=result.get("greeks_kill_direction", ""),
+            change_5m=change_5m_val,
+            funding_rate=funding_rate_val
+        )
+        if rsi5m_algo_veto["override"]:
+            result["bias"] = rsi5m_algo_veto["bias"]
+            result["reason"] = f"[RSI5M ALGO SHORT PHANTOM BID] {rsi5m_algo_veto['reason']}"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = rsi5m_algo_veto["priority"]
             result["entry_allowed"] = True
             return result
 
