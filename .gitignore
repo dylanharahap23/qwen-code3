@@ -1,83 +1,45 @@
 ```
-# Environment files
+# Environment
 .env
 .env.local
-.env.*
+*.env.*
 
-# Logs and temporary files
-*.log
-*.tmp
-*.swp
-
-# Editors and IDEs
-.vscode/
-.idea/
-
-# Python specific
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-*.py~
-.Python
-venv/
+# Dependencies
+node_modules/
 .venv/
-.env/
-pip-log.txt
-pip-selfcheck.json
-.tox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.log
-.git/
+venv/
+__pycache__/
 .mypy_cache/
 .pytest_cache/
-.hypothesis/
+.coverage
 
-# Build and distribution artifacts
+# Build artifacts
 dist/
 build/
-*.egg
-*.egg-info/
-.eggs/
-.installed.cfg
-lib/
-lib64/
-parts/
-sdist/
-develop-eggs/
-*.egg-info/
-.installed.cfg
-*.egg-link
-*.so
-*.dylib
-*.dll
-*.exe
-*.out
-*.o
-*.obj
-*.a
-*.lib
-*.pdb
-*.exp
-*.ilk
-*.map
-*.sym
-*.lst
-*.tmp
-*.temp
-*.bak
-*.backup
+target/
+
+# Editors
+.vscode/
+.idea/
 *.swp
 *.swo
-*~
+
+# Logs and temp files
+*.log
+*.tmp
+
+# System
 .DS_Store
 Thumbs.db
-.directory
-ehthumbs.db
-Icon?
+
+# Compiled files
+*.pyc
+*.class
+*.o
+*.exe
+*.dll
+*.so
+*.a
+*.obj
+*.out
 ```
