@@ -810,6 +810,69 @@ class AdversarialCloserLiquidity:
         return {"override": False}
 
 
+class OverboughtExtremeShortLiqFakeSqueeze:
+    """
+    ARIAUSDT PATTERN: RSI5m >= 98 (overbought absolut), volume kering (<0.5x),
+    up_energy sangat kecil (<0.5), short_liq dekat (1-5%) tapi down_energy=0.
+    Ini adalah FAKE SHORT SQUEEZE: HFT memasang target likuiditas dekat untuk memancing LONG,
+    namun tidak ada energi beli nyata. Harga akan turun (dump).
+    Priority -29600 (lebih tinggi dari Closer Liq -29500)
+    """
+    @staticmethod
+    def detect(rsi6_5m: float, volume_ratio: float, up_energy: float,
+               short_liq: float, long_liq: float, down_energy: float,
+               agg: float, obv_trend: str, funding_rate: float,
+               change_5m: float) -> dict:
+        if funding_rate is None:
+            funding_rate = 0.0
+        
+        # Overbought absolut
+        if rsi6_5m < 98:
+            return {"override": False}
+        
+        # Volume sangat kering
+        if volume_ratio >= 0.5:
+            return {"override": False}
+        
+        # Tidak ada buyer nyata (up_energy sangat kecil)
+        if up_energy > 0.5:
+            return {"override": False}
+        
+        # short_liq dekat (1-5%) - tidak super dekat (<0.5% yang mungkin squeeze genuine)
+        if not (1.0 <= short_liq <= 5.0):
+            return {"override": False}
+        
+        # down_energy = 0 (ilusi no seller)
+        if down_energy >= 0.1:
+            return {"override": False}
+        
+        # OBV positif tapi volume kering = OBV stale
+        if obv_trend not in ("POSITIVE_EXTREME", "POSITIVE"):
+            return {"override": False}
+        
+        # Funding positif = crowded long (korban)
+        if funding_rate <= 0.0001:
+            return {"override": False}
+        
+        # Harga sudah naik tipis (pump palsu) atau flat
+        if change_5m < 0:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"OVERBOUGHT EXTREME SHORT LIQ FAKE SQUEEZE: "
+                f"RSI5m={rsi6_5m:.1f} (>=98, overbought absolut), "
+                f"volume={volume_ratio:.2f}x kering, up_energy={up_energy:.2f} (no real buyers), "
+                f"short_liq={short_liq:.2f}% dekat tapi down_energy=0 (ilusi), "
+                f"OBV={obv_trend} stale, funding={funding_rate:.5f} crowded long. "
+                f"Force SHORT (override Closer Liq)."
+            ),
+            "priority": -29600
+        }
+
+
 class AdversarialSqueezeContinuation:
     """
     PRIORITY -29000: short_liq sudah tersapu tapi squeeze masih lanjut.
@@ -19565,6 +19628,27 @@ class BinanceAnalyzer:
             result["reason"] = f"[CAP DUMP] {cap_dump['reason']} | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = cap_dump["priority"]
+            result["entry_allowed"] = True
+            return result
+
+        # ===== PRIORITY -29600: OVERBOUGHT EXTREME SHORT LIQ FAKE SQUEEZE (ARIAUSDT FIX) =====
+        fake_squeeze = OverboughtExtremeShortLiqFakeSqueeze.detect(
+            rsi6_5m=rsi6_5m_val,
+            volume_ratio=volume_ratio,
+            up_energy=up_energy_val,
+            short_liq=short_liq,
+            long_liq=long_liq,
+            down_energy=down_energy_val,
+            agg=agg_val,
+            obv_trend=obv_trend,
+            funding_rate=funding_rate_val,
+            change_5m=change_5m_val
+        )
+        if fake_squeeze["override"]:
+            result["bias"] = fake_squeeze["bias"]
+            result["reason"] = f"[FAKE SQUEEZE] {fake_squeeze['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = fake_squeeze["priority"]
             result["entry_allowed"] = True
             return result
 
