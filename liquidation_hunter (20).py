@@ -17764,6 +17764,201 @@ class ExhaustedSqueezePostSweep:
         return {"override": False}
 
 
+class RSI5mExtremeOFIContradictionShort:
+    """
+    PNUTUSDT 19:30 PATTERN:
+    RSI5m = 92.8 (near impossible) + OFI SHORT 0.886 + volume kering + change_5m > 2%
+    = Squeeze sudah HABIS, institusi sudah SHORT, dump imminent.
+    
+    Bedakan dari genuine squeeze (RSI5m < 80, OFI masih LONG).
+    
+    Priority: -10010.3 (lebih tinggi dari ExhaustedSqueezePostSweep -10010)
+    """
+    @staticmethod
+    def detect(rsi6_5m: float, ofi_bias: str, ofi_strength: float,
+               volume_ratio: float, change_5m: float,
+               short_liq: float, long_liq: float,
+               funding_rate: float, down_energy: float,
+               agg: float) -> dict:
+        
+        if funding_rate is None:
+            funding_rate = 0.0
+        
+        # RSI 5m harus SANGAT overbought (squeeze sudah habis)
+        if rsi6_5m < 88:
+            return {"override": False}
+        
+        # OFI harus SHORT kuat (institusi sudah balik)
+        if ofi_bias != "SHORT" or ofi_strength < 0.7:
+            return {"override": False}
+        
+        # Harga sudah naik (squeeze sudah berlangsung)
+        if change_5m <= 0:
+            return {"override": False}
+        
+        # Volume kering (tidak ada momentum nyata)
+        if volume_ratio >= 0.75:
+            return {"override": False}
+        
+        # long_liq harus ada sebagai target dump
+        if long_liq <= 3.0:
+            return {"override": False}
+        
+        # Funding tidak boleh sangat negatif (genuine squeeze masih ada)
+        if funding_rate < -0.003:
+            return {"override": False}
+        
+        # Konfirmasi: minimal 2 dari 4
+        confirmations = sum([
+            funding_rate > 0,          # crowded LONG
+            down_energy < 0.01,        # manufactured vacuum (no seller ilusi)
+            agg < 0.7,                 # trades tidak semuanya bullish
+            short_liq < long_liq,      # short_liq lebih dekat (umpan)
+        ])
+        
+        if confirmations < 2:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"RSI5m EXTREME OFI CONTRADICTION SHORT: "
+                f"RSI5m={rsi6_5m:.1f} (>{88}, squeeze exhausted), "
+                f"OFI={ofi_bias} {ofi_strength:.2f} (institusi sudah SHORT), "
+                f"volume={volume_ratio:.2f}x kering, change={change_5m:.1f}% (sudah pump), "
+                f"long_liq={long_liq:.2f}% (target dump setelah short_liq={short_liq:.2f}% tersapu). "
+                f"Confirmations={confirmations}/4. Force SHORT."
+            ),
+            "priority": -10010.3
+        }
+
+
+class PostSqueezeOFIFlipShort:
+    """
+    PNUTUSDT 19:30 PATTERN LANJUTAN:
+    Setelah short_liq dekat (< 3%) + harga sudah naik > 2% + OFI flip ke SHORT kuat
+    = Sweep hampir selesai atau sudah selesai, dump imminent.
+    
+    Ini menangkap kasus di mana ExhaustedSqueezePostSweep tidak trigger
+    karena change_5m tidak cukup besar vs short_liq (ratio < 1.2)
+    TAPI OFI sudah flip SHORT = sinyal leading indicator.
+    
+    Priority: -10010.2
+    """
+    @staticmethod
+    def detect(short_liq: float, long_liq: float,
+               change_5m: float, ofi_bias: str, ofi_strength: float,
+               rsi6_5m: float, volume_ratio: float,
+               down_energy: float, agg: float,
+               gamma_executing: bool, kill_speed: float) -> dict:
+        
+        # short_liq harus dekat (squeeze target)
+        if short_liq >= 3.0:
+            return {"override": False}
+        
+        # Harga sudah naik menuju short_liq
+        if change_5m <= 1.0:
+            return {"override": False}
+        
+        # OFI harus flip ke SHORT (sinyal leading dari institusi)
+        if ofi_bias != "SHORT" or ofi_strength < 0.6:
+            return {"override": False}
+        
+        # RSI 5m harus elevated (squeeze berlangsung lama)
+        if rsi6_5m < 75:
+            return {"override": False}
+        
+        # Volume kering (tidak ada momentum baru)
+        if volume_ratio >= 0.8:
+            return {"override": False}
+        
+        # long_liq harus jauh sebagai target dump
+        if long_liq <= short_liq * 3:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"POST-SQUEEZE OFI FLIP SHORT: short_liq={short_liq:.2f}% dekat, "
+                f"harga sudah naik {change_5m:.1f}% (mendekati target), "
+                f"OFI flip ke {ofi_bias} {ofi_strength:.2f} (institusi exit squeeze), "
+                f"RSI5m={rsi6_5m:.1f} overbought, volume={volume_ratio:.2f}x kering. "
+                f"long_liq={long_liq:.2f}% = target dump ({long_liq/short_liq:.1f}x lebih jauh). "
+                f"Force SHORT."
+            ),
+            "priority": -10010.2
+        }
+
+
+class ShortLiqProximityWithHighRSI5mGuard:
+    """
+    GUARD untuk [CLOSER LIQ] dan [POST-KILL FOLLOW] override:
+    
+    Jika short_liq dekat TAPI RSI5m sangat overbought (> 85) DAN OFI SHORT kuat,
+    maka "short_liq dekat" adalah UMPAN TERAKHIR, bukan squeeze aktif.
+    
+    HFT logic: pump sampai RSI5m = 90+, pasang short_liq dekat sebagai pancingan
+    agar retail masuk LONG terakhir, lalu dump ke long_liq yang jauh.
+    
+    Ini memblokir:
+    - AdversarialCloserLiquidity (short_liq dekat → LONG)
+    - NoSellerNoBuyerOverride (down_energy=0 → LONG)
+    - PostKillFollow (gamma executing → LONG)
+    
+    Priority: -29400 (lebih tinggi dari AdversarialCloserLiquidity -29500)
+    """
+    @staticmethod
+    def detect(short_liq: float, long_liq: float,
+               rsi6_5m: float, ofi_bias: str, ofi_strength: float,
+               volume_ratio: float, change_5m: float,
+               funding_rate: float) -> dict:
+        
+        if funding_rate is None:
+            funding_rate = 0.0
+        
+        # short_liq harus dekat (yang bikin CLOSER LIQ trigger)
+        if short_liq >= 3.0:
+            return {"override": False}
+        
+        # RSI5m harus sangat overbought
+        if rsi6_5m < 85:
+            return {"override": False}
+        
+        # OFI harus SHORT (institusi tidak mendukung pump lanjutan)
+        if ofi_bias != "SHORT" or ofi_strength < 0.6:
+            return {"override": False}
+        
+        # Volume kering (pump tidak genuine)
+        if volume_ratio >= 0.75:
+            return {"override": False}
+        
+        # Harga sudah naik (pump sudah terjadi)
+        if change_5m <= 0:
+            return {"override": False}
+        
+        # long_liq harus jauh (ada target dump)
+        if long_liq <= short_liq * 4:
+            return {"override": False}
+        
+        ratio = long_liq / short_liq if short_liq > 0 else 0
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"SHORT LIQ PROXIMITY HIGH RSI5m GUARD: "
+                f"short_liq={short_liq:.2f}% dekat TAPI RSI5m={rsi6_5m:.1f} (>{85}, overbought ekstrem), "
+                f"OFI={ofi_bias} {ofi_strength:.2f} (institusi sudah exit), "
+                f"volume={volume_ratio:.2f}x kering, change={change_5m:.1f}% (sudah pump). "
+                f"short_liq adalah UMPAN TERAKHIR sebelum dump ke long_liq={long_liq:.2f}% (ratio {ratio:.1f}x). "
+                f"Cancel CLOSER LIQ dan POST-KILL FOLLOW. Force SHORT."
+            ),
+            "priority": -29400
+        }
+
+
 class UltraShortLiqSqueezeActiveGuard:
     """
     ARIAUSDT PATTERN: short_liq < 0.5% dengan agg > 0.65 + up_energy > 0
@@ -19699,6 +19894,25 @@ class BinanceAnalyzer:
             return result
 
         # ========== PRIORITY -29500: ADVERSARIAL CLOSER LIQUIDITY ==========
+        # ===== PRIORITY -29400: SHORT LIQ PROXIMITY WITH HIGH RSI5M GUARD (SEBELUM CLOSER LIQ) =====
+        short_liq_rsi5m_guard = ShortLiqProximityWithHighRSI5mGuard.detect(
+            short_liq=short_liq,
+            long_liq=long_liq,
+            rsi6_5m=rsi6_5m_val,
+            ofi_bias=result.get("ofi_bias", "NEUTRAL"),
+            ofi_strength=result.get("ofi_strength", 0.0),
+            volume_ratio=volume_ratio,
+            change_5m=change_5m_val,
+            funding_rate=funding_rate_val
+        )
+        if short_liq_rsi5m_guard["override"]:
+            result["bias"] = short_liq_rsi5m_guard["bias"]
+            result["reason"] = f"[SHORT LIQ RSI5M GUARD] {short_liq_rsi5m_guard['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = short_liq_rsi5m_guard["priority"]
+            result["entry_allowed"] = True
+            return result
+        
         adv_closer = AdversarialCloserLiquidity.detect(
             short_liq=short_liq,
             long_liq=long_liq,
@@ -22657,6 +22871,49 @@ class BinanceAnalyzer:
             result["_exhausted_sweep"] = True
             return result  # Hard return, tidak ada yang bisa override ini
         
+        # ===== PRIORITY -10010.3: RSI5M EXTREME OFI CONTRADICTION SHORT =====
+        rsi5m_ofi_contra = RSI5mExtremeOFIContradictionShort.detect(
+            rsi6_5m=rsi6_5m_val,
+            ofi_bias=result.get("ofi_bias", "NEUTRAL"),
+            ofi_strength=result.get("ofi_strength", 0.0),
+            volume_ratio=volume_ratio,
+            change_5m=change_5m_val,
+            short_liq=short_liq,
+            long_liq=long_liq,
+            funding_rate=funding_rate_val,
+            down_energy=down_energy_val,
+            agg=agg_val
+        )
+        if rsi5m_ofi_contra["override"]:
+            result["bias"] = rsi5m_ofi_contra["bias"]
+            result["reason"] = f"[RSI5M OFI CONTRA SHORT] {rsi5m_ofi_contra['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = rsi5m_ofi_contra["priority"]
+            result["entry_allowed"] = True
+            return result
+        
+        # ===== PRIORITY -10010.2: POST-SQUEEZE OFI FLIP SHORT =====
+        post_squeeze_ofi = PostSqueezeOFIFlipShort.detect(
+            short_liq=short_liq,
+            long_liq=long_liq,
+            change_5m=change_5m_val,
+            ofi_bias=result.get("ofi_bias", "NEUTRAL"),
+            ofi_strength=result.get("ofi_strength", 0.0),
+            rsi6_5m=rsi6_5m_val,
+            volume_ratio=volume_ratio,
+            down_energy=down_energy_val,
+            agg=agg_val,
+            gamma_executing=result.get("greeks_gamma_executing", False),
+            kill_speed=result.get("greeks_kill_speed", 0.0)
+        )
+        if post_squeeze_ofi["override"]:
+            result["bias"] = post_squeeze_ofi["bias"]
+            result["reason"] = f"[POST-SQUEEZE OFI FLIP] {post_squeeze_ofi['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = post_squeeze_ofi["priority"]
+            result["entry_allowed"] = True
+            return result
+
         # ===== PRIORITY -10009.8: CROWDED LONG OVERSOLD TRAP (LEBIH TINGGI DARI OVERSOLD BOUNCE) =====
         # Dipanggil SEBELUM OversoldLongLiqBounceHighPriority untuk menangkap pola velvetusdt
         crowded_oversold_trap = CrowdedLongOversoldTrap.detect(
