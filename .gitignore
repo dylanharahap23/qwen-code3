@@ -1,10 +1,10 @@
 ```
-# Environment files
+# Environment
 .env
 .env.local
 .env.*
 
-# Logs and temporary files
+# Logs and temp files
 *.log
 *.tmp
 *.swp
@@ -32,7 +32,27 @@ nosetests.xml
 coverage.xml
 *.cover
 *.log
-.git/refs/original/
-**/.gitignore
-!.gitignore
+.git/modules/
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+.eggs/
+.installed.cfg
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg
+
+# Testing
+.pytest_cache/
+.hypothesis/
+cover/
+htmlcov/
 ```
