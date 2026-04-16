@@ -706,6 +706,34 @@ class CapitulationDipThenRip:
         return {"override": False}
 
 
+class CapitulationDipThenRipWithOBV:
+    """
+    🔥 PRIORITY -30000 (TERTINGGI ABSOLUT)
+    
+    Kasus BASEDUSDT: price drop >3%, long_liq dekat (<5%), OBV POSITIVE_EXTREME,
+    agg >0.6, up_energy >1.0, down_energy=0, volume rendah. HFT sedang akumulasi saat dip,
+    akan pump untuk sweep long stop. Override semua sinyal SHORT termasuk KILL PHASE GUARD.
+    """
+    @staticmethod
+    def detect(change_5m: float, long_liq: float, obv_trend: str,
+               agg: float, up_energy: float, down_energy: float,
+               volume_ratio: float, funding_rate: float) -> dict:
+        if funding_rate is None:
+            funding_rate = 0.0
+        # Kondisi capitulation dip with institutional accumulation
+        if (change_5m < -3.0 and long_liq < 5.0 and
+            obv_trend in ("POSITIVE_EXTREME", "POSITIVE") and
+            agg > 0.6 and up_energy > 1.0 and down_energy < 0.01 and
+            volume_ratio < 0.6):
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": f"CAPITULATION DIP WITH OBV ACCUMULATION: drop {change_5m:.1f}%, long_liq={long_liq:.2f}%, OBV={obv_trend}, agg={agg:.2f}, up_energy={up_energy:.2f}, down_energy=0 → HFT akumulasi di dip, akan pump. Force LONG.",
+                "priority": -30000
+            }
+        return {"override": False}
+
+
 class AdversarialCapitulationDump:
     """
     PRIORITY -30000: capitulation dump palsu dengan down_energy=0 tetap lanjut SHORT.
@@ -19414,6 +19442,20 @@ class BinanceAnalyzer:
         new_bias = result["bias"]
         now = time.time()
         market_phase = phase_result.phase if phase_result else "UNKNOWN"
+        
+        # ========== PRIORITY -30000: CAPITULATION DIP WITH OBV ACCUMULATION (BASEDUSDT pattern) ==========
+        dip_rip_obv = CapitulationDipThenRipWithOBV.detect(
+            change_5m=change_5m_val, long_liq=long_liq, obv_trend=obv_trend,
+            agg=agg_val, up_energy=up_energy_val, down_energy=down_energy_val,
+            volume_ratio=volume_ratio, funding_rate=funding_rate_val
+        )
+        if dip_rip_obv["override"]:
+            result["bias"] = dip_rip_obv["bias"]
+            result["reason"] = f"[DIP RIP OBV] {dip_rip_obv['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = dip_rip_obv["priority"]
+            result["entry_allowed"] = True
+            return result
         
         # ========== PRIORITY -30000: CAPITULATION DIP THEN RIP (PIPPINUSDT pattern) ==========
         dip_rip = CapitulationDipThenRip.detect(
