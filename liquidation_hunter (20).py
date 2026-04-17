@@ -2752,7 +2752,33 @@ class OBVPositivePriceFallingDistributionTrap:
                     f"OBV={obv_trend}, change={change_5m:.1f}%, volume={volume_ratio:.2f}x "
                     f"-> smart money selling into strength"
                 ),
-                "priority": -28150
+                "priority": -28500  # 🔥 UPGRADED FROM -28150 TO BEAT NO SELLER/BUYER OVERRIDE
+            }
+        return {"override": False}
+
+
+class DistributionRegimeOBVContinuation:
+    """
+    🔥 PRIORITY -28400: Saat market_regime = DISTRIBUTION, OBV POSITIVE_EXTREME,
+    harga turun, volume kering, dan long_liq lebih dekat → dump lanjut.
+    
+    Ini adalah continuation pattern khusus untuk regime DISTRIBUTION di mana
+    OBV positive extreme tapi harga terus turun karena smart money distributing.
+    """
+    @staticmethod
+    def detect(market_regime: str, obv_trend: str, change_5m: float, volume_ratio: float,
+               long_liq: float, short_liq: float, funding_rate: float = 0.0) -> dict:
+        if (market_regime == "DISTRIBUTION" and
+            obv_trend == "POSITIVE_EXTREME" and
+            change_5m < -1.5 and
+            volume_ratio < 0.6 and
+            long_liq < short_liq and
+            long_liq < 5.0):
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"DISTRIBUTION REGIME OBV CONTINUATION: OBV positive extreme but price falling, volume dry → dump continues to long liq {long_liq:.2f}%.",
+                "priority": -28400
             }
         return {"override": False}
 
@@ -7109,6 +7135,25 @@ def _greeks_absolute_score(
                 }
         
         fade_direction = "SHORT" if vega["bait_direction"] == "UP" else "LONG"
+        
+        # === GUARD: OBV DISTRIBUTION TRAP (VEGA-KILL CONFLICT) ===
+        # Jika fade_direction adalah LONG, tapi ada tanda distribusi (OBV positif ekstrem + harga turun),
+        # jangan ikuti Vega fade. Biarkan bias sebelumnya (kemungkinan SHORT dari detector lain).
+        if fade_direction == "LONG":
+            obv_trend = data.get("obv_trend", "")
+            change_5m = data.get("change_5m", 0)
+            volume_ratio = data.get("volume_ratio", 1)
+            market_regime = data.get("market_regime", "")
+            if (obv_trend == "POSITIVE_EXTREME" and change_5m < -1.5 and 
+                volume_ratio < 0.6 and market_regime == "DISTRIBUTION"):
+                # Batalkan Vega fade, kembalikan NEUTRAL agar detector SHORT lain bisa bekerja
+                return {
+                    "final_bias": "NEUTRAL",
+                    "override": False,
+                    "confidence": "ABSOLUTE",
+                    "priority": -9992,
+                    "score_reason": f"VEGA FADE BLOCKED: OBV distribution detected (OBV={obv_trend}, change={change_5m:.1f}%, vol={volume_ratio:.2f}x, regime={market_regime}) → ignore fake LONG signal."
+                }
         
         # VEGA OVERRIDE GUARD (Priority -9991.8)
         # Guard: jika short liq super dekat + buy pressure, override Vega ke LONG
@@ -20689,6 +20734,24 @@ class BinanceAnalyzer:
             result["reason"] = f"[OBV DISTRIBUTION TRAP] {obv_positive_distribution['reason']} | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = obv_positive_distribution["priority"]
+            result["entry_allowed"] = True
+            return result
+
+        # ===== PRIORITY -28400: DISTRIBUTION REGIME OBV CONTINUATION =====
+        distribution_regime_obv = DistributionRegimeOBVContinuation.detect(
+            market_regime=result.get("market_regime", ""),
+            obv_trend=obv_trend,
+            change_5m=change_5m_val,
+            volume_ratio=volume_ratio,
+            long_liq=long_liq,
+            short_liq=short_liq,
+            funding_rate=funding_rate_val
+        )
+        if distribution_regime_obv["override"]:
+            result["bias"] = distribution_regime_obv["bias"]
+            result["reason"] = f"[DISTRIBUTION REGIME OBV] {distribution_regime_obv['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = distribution_regime_obv["priority"]
             result["entry_allowed"] = True
             return result
 
