@@ -4789,7 +4789,8 @@ class AskWallDominanceOverride:
         if bid_slope <= 0:
             return {"override": False}
         ratio = ask_slope / bid_slope
-        if (long_liq < 1.5 and ratio > 1.3 and down_energy < 0.01
+        # 🔥 LECTURER UPDATE: threshold ratio 1.3 → 3.0 agar tidak trigger pada ask wall moderat
+        if (long_liq < 1.5 and ratio > 3.0 and down_energy < 0.01
             and up_energy > 0 and change_5m < 0):
             return {
                 "override": True,
@@ -4798,6 +4799,75 @@ class AskWallDominanceOverride:
                 "priority": -20010
             }
         return {"override": False}
+
+
+class ShortSqueezeMildAskWallOverride:
+    """
+    🔥 PRIORITY -20050 (LEBIH TINGGI dari BaitNoSellerTrap -20010)
+    
+    Mendeteksi short squeeze genuine meskipun ada ask wall moderat (ask/bid < 3x).
+    HFT sering memasang ask wall tipis sebagai umpan SHORT, lalu memompa harga.
+    
+    Kondisi:
+    - short_liq < 5% (target dekat)
+    - agg > 0.85 (mayoritas buy)
+    - OFI LONG dengan strength > 0.7
+    - down_energy = 0 (tidak ada seller)
+    - change_5m > 0 (harga naik)
+    - volume_ratio < 0.6 (kering, kontrol HFT)
+    - ask/bid ratio < 3.0 (bukan sell wall raksasa)
+    - market_phase = BAIT (fase manipulasi)
+    
+    Override: Paksa LONG, batalkan semua sinyal SHORT (termasuk Bait Sell Wall Trap).
+    """
+    @staticmethod
+    def detect(short_liq: float, long_liq: float, agg: float, ofi_bias: str, ofi_strength: float,
+               down_energy: float, change_5m: float, volume_ratio: float,
+               ask_slope: float, bid_slope: float, market_phase: str) -> dict:
+        
+        # Short liq harus cukup dekat (target squeeze)
+        if short_liq >= 5.0:
+            return {"override": False}
+        
+        # Order flow harus sangat bullish
+        if not (agg > 0.85 and ofi_bias == "LONG" and ofi_strength > 0.7):
+            return {"override": False}
+        
+        # Tidak ada seller (vacuum)
+        if down_energy >= 0.01:
+            return {"override": False}
+        
+        # Harga harus naik (squeeze in progress)
+        if change_5m <= 0:
+            return {"override": False}
+        
+        # Volume rendah (HFT kontrol)
+        if volume_ratio >= 0.6:
+            return {"override": False}
+        
+        # Ask wall tidak terlalu dominan (bukan jebakan dump)
+        if bid_slope <= 0:
+            ask_bid_ratio = 999
+        else:
+            ask_bid_ratio = ask_slope / bid_slope
+        if ask_bid_ratio >= 3.0:
+            return {"override": False}  # biarkan Bait Sell Wall Trap yang handle
+        
+        # Market phase BAIT (manipulasi)
+        if market_phase != "BAIT":
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "LONG",
+            "reason": (
+                f"SHORT SQUEEZE MILD ASK WALL: short_liq={short_liq:.2f}% close, agg={agg:.2f} (100% buy), "
+                f"OFI LONG {ofi_strength:.2f}, down_energy=0, price up {change_5m:.1f}%, "
+                f"ask/bid={ask_bid_ratio:.1f}x (mild wall) → "
+                f"HFT baiting SHORT before squeeze. Force LONG."
+            ),
+            "priority": -20050
+        }
 
 
 class BaitNoSellerTrapOverride:
@@ -4821,6 +4891,12 @@ class BaitNoSellerTrapOverride:
                ofi_bias: str, change_5m: float,
                short_liq: float, long_liq: float,
                ask_slope: float, bid_slope: float) -> dict:
+        
+        # 🔥 GUARD: Jika short_liq dekat + agg tinggi + OFI LONG + down_energy=0,
+        # ini adalah short squeeze genuine, bukan trap.
+        if (short_liq < 5.0 and agg > 0.85 and ofi_bias == "LONG" and 
+            down_energy < 0.01 and change_5m > 0):
+            return {"override": False}
         
         # Kondisi utama: BAIT phase + volume kering + no sellers + bullish appearance
         if (market_phase == "BAIT" and
@@ -21719,6 +21795,28 @@ class BinanceAnalyzer:
             result["reason"] = f"[ASK WALL] {ask_wall['reason']} | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = ask_wall["priority"]
+            return result
+        
+        # ===== PRIORITY -20050: SHORT SQUEEZE MILD ASK WALL OVERRIDE =====
+        short_squeeze_mild = ShortSqueezeMildAskWallOverride.detect(
+            short_liq=short_liq,
+            long_liq=long_liq,
+            agg=agg_val,
+            ofi_bias=ofi_bias,
+            ofi_strength=ofi_strength,
+            down_energy=down_energy_val,
+            change_5m=change_5m_val,
+            volume_ratio=volume_ratio,
+            ask_slope=result.get("ask_slope", 0),
+            bid_slope=result.get("bid_slope", 1),
+            market_phase=market_phase
+        )
+        if short_squeeze_mild["override"]:
+            result["bias"] = short_squeeze_mild["bias"]
+            result["reason"] = f"[SQUEEZE MILD WALL] {short_squeeze_mild['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = short_squeeze_mild["priority"]
+            result["entry_allowed"] = True
             return result
         
         # ===== PRIORITY -20010: BAIT NO SELLER TRAP OVERRIDE =====
