@@ -908,6 +908,77 @@ class FakeShortLiqWithExtremeDistribution:
         return {"override": False}
 
 
+class MicroShortLiqSweepThenDump:
+    """
+    🔥 PRIORITY -29650 (LEBIH TINGGI dari CLOSER LIQ -29500)
+    
+    Mendeteksi jebakan: short_liq super dekat (<0.5%) sebagai umpan LONG.
+    HFT akan naik sedikit untuk sweep short stop, lalu DUMP ke long_liq.
+    
+    Kondisi:
+    - short_liq < 0.5% (umpan super dekat)
+    - long_liq > short_liq * 4 (target dump jelas)
+    - RSI6 antara 45-70 (tidak oversold, ada ruang turun)
+    - agg > 0.7 (retail sudah masuk LONG)
+    - down_energy = 0 (ilusi vacuum)
+    - change_5m > 0.5% (micro-sweep sudah/sedang terjadi)
+    - volume_ratio < 0.7 (kontrol HFT)
+    
+    Case: TSTUSDT 13:37 - short_liq 0.11%, long_liq 3.16%, RSI6 58.8, agg=1.0
+    """
+    @staticmethod
+    def detect(short_liq: float, long_liq: float, rsi6: float, agg: float,
+               down_energy: float, change_5m: float, volume_ratio: float,
+               funding_rate: float = 0.0) -> dict:
+        
+        if funding_rate is None:
+            funding_rate = 0.0
+        
+        # short_liq super dekat (umpan)
+        if short_liq >= 0.5:
+            return {"override": False}
+        
+        # long_liq harus cukup jauh sebagai target dump
+        if long_liq <= short_liq * 4:
+            return {"override": False}
+        
+        # RSI tidak oversold (masih ada ruang turun)
+        if not (45 <= rsi6 <= 70):
+            return {"override": False}
+        
+        # Order flow sudah bullish (retail terjebak)
+        if agg < 0.7:
+            return {"override": False}
+        
+        # Tidak ada seller (ilusi)
+        if down_energy >= 0.01:
+            return {"override": False}
+        
+        # Harga sudah naik (micro-sweep in progress)
+        if change_5m <= 0.5:
+            return {"override": False}
+        
+        # Volume kering
+        if volume_ratio >= 0.7:
+            return {"override": False}
+        
+        # Funding tidak ekstrem negatif (bukan genuine short squeeze)
+        if funding_rate < -0.003:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"MICRO SHORT LIQ SWEEP THEN DUMP: short_liq={short_liq:.2f}% (umpan), "
+                f"long_liq={long_liq:.2f}% (target dump), RSI6={rsi6:.1f} (not oversold), "
+                f"agg={agg:.2f} (retail trapped LONG), down_energy=0, change={change_5m:.1f}% → "
+                f"HFT micro-sweep completed, dump to long_liq imminent. Force SHORT."
+            ),
+            "priority": -29650
+        }
+
+
 class AdversarialCloserLiquidity:
     """
     PRIORITY -29500: paksa arah ke likuiditas terdekat saat rasio ekstrem dan volume rendah.
@@ -3371,7 +3442,13 @@ class DipThenRipAggConfirm:
                delta_exposure: float = 0.0,
                obv_trend: str = "NEUTRAL",
                ask_slope: float = 0.0,
-               bid_slope: float = 1.0) -> dict:
+               bid_slope: float = 1.0,
+               rsi6: float = 50.0) -> dict:
+
+        # GUARD: Jika short_liq super dekat dan RSI tidak oversold, jangan LONG
+        # (biarkan MicroShortLiqSweepThenDump yang handle)
+        if short_liq < 0.5 and long_liq > short_liq * 4 and rsi6 > 45:
+            return {"override": False}
 
         should_block, _block_reason = DipThenRipAggConfirm.should_block_dip_then_rip(
             delta_exposure=delta_exposure,
@@ -20413,7 +20490,8 @@ class BinanceAnalyzer:
             delta_exposure=result.get("greeks_delta_exposure", 0),
             obv_trend=result.get("obv_trend", "NEUTRAL"),
             ask_slope=result.get("ask_slope", 0),
-            bid_slope=result.get("bid_slope", 1)
+            bid_slope=result.get("bid_slope", 1),
+            rsi6=rsi6_val
         )
         if dip_rip["override"]:
             result["bias"] = dip_rip["bias"]
@@ -20458,6 +20536,25 @@ class BinanceAnalyzer:
             result["reason"] = f"[EX-GREEKS CONFLICT] {exchange_greeks_conflict['reason']} | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = exchange_greeks_conflict["priority"]
+            result["entry_allowed"] = True
+            return result
+
+        # ===== PRIORITY -29650: MICRO SHORT LIQ SWEEP THEN DUMP =====
+        micro_sweep_dump = MicroShortLiqSweepThenDump.detect(
+            short_liq=short_liq,
+            long_liq=long_liq,
+            rsi6=rsi6_val,
+            agg=agg_val,
+            down_energy=down_energy_val,
+            change_5m=change_5m_val,
+            volume_ratio=volume_ratio,
+            funding_rate=funding_rate_val
+        )
+        if micro_sweep_dump["override"]:
+            result["bias"] = micro_sweep_dump["bias"]
+            result["reason"] = f"[MICRO SWEEP DUMP] {micro_sweep_dump['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = micro_sweep_dump["priority"]
             result["entry_allowed"] = True
             return result
 
