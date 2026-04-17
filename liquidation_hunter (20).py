@@ -706,183 +706,6 @@ class CapitulationDipThenRip:
         return {"override": False}
 
 
-class PhantomBidWallLongLiqCascade:
-    """
-    🔥 PNUTUSDT EXACT PATTERN — PRIORITY -30500 (TERTINGGI ABSOLUT BARU)
-    
-    up_energy besar (>2.0) + long_liq ultra close (<1.5%) + agg_json rendah (<0.45)
-    + change_5m sangat negatif (<-4%)
-    
-    HFT inject bid wall besar untuk bikin up_energy tinggi → 
-    sistem kira ada buyer kuat → output LONG
-    Padahal long_liq 0.76% adalah TARGET CASCADE, bukan bounce.
-    agg JSON 0.29 = 71% trades SELL = tidak ada buyer nyata.
-    
-    Priority: -30500 (lebih tinggi dari CapitulationDipThenRipWithOBV -30000)
-    """
-    @staticmethod
-    def detect(up_energy: float, long_liq: float, agg_json: float,
-               change_5m: float, who_dies_first: str,
-               greeks_kill_direction: str, funding_rate: float) -> dict:
-        
-        if funding_rate is None:
-            funding_rate = 0.0
-        
-        # Core: up_energy besar tapi long_liq ultra close DAN agg rendah (sell dominant)
-        phantom_bid = (
-            up_energy > 2.0 and           # bid wall besar (terlihat bullish)
-            long_liq < 1.5 and            # target cascade sangat dekat
-            agg_json < 0.45 and           # JSON ground truth: sell dominant
-            change_5m < -3.0             # sudah drop signifikan
-        )
-        
-        if not phantom_bid:
-            return {"override": False}
-        
-        # Greeks harus confirm: LONG yang akan mati
-        greeks_confirm = (
-            who_dies_first == "LONG_TRADERS" or
-            greeks_kill_direction == "SHORT"
-        )
-        
-        if not greeks_confirm:
-            return {"override": False}
-        
-        return {
-            "override": True,
-            "bias": "SHORT",
-            "reason": (
-                f"PHANTOM BID WALL LONG LIQ CASCADE: "
-                f"up_energy={up_energy:.2f} (PHANTOM — bid wall injected), "
-                f"agg_json={agg_json:.2f} ({(1-agg_json)*100:.0f}% trades SELL = no real buyers), "
-                f"long_liq={long_liq:.2f}% (CASCADE TARGET bukan bounce), "
-                f"drop={change_5m:.1f}%, "
-                f"who_dies={who_dies_first}, kill={greeks_kill_direction} → "
-                f"HFT injected bid wall to lure LONG entries before cascade. "
-                f"Override CapitulationDipThenRip. Force SHORT."
-            ),
-            "priority": -30500
-        }
-
-
-class AggJsonVsDisplayBiasCorrection:
-    """
-    🔥 PNUTUSDT DATA RACE FIX — PRIORITY -30400
-    
-    Ketika agg_display (dari snapshot lama) SANGAT berbeda dari agg_json:
-    - agg_display > 0.70 (terlihat bullish)  
-    - agg_json < 0.40 (sebenarnya bearish)
-    - Gap > 0.30
-    
-    DAN kondisi market mendukung bearish (long_liq close, kill=SHORT):
-    → Cancel semua LONG override yang triggered oleh agg_display
-    → Force SHORT berdasarkan agg_json ground truth
-    
-    Ini fix untuk bug dimana DipRipOBV menggunakan agg display 0.82
-    padahal agg JSON 0.29.
-    """
-    @staticmethod
-    def detect(agg_display: float, agg_json: float,
-               long_liq: float, short_liq: float,
-               who_dies_first: str, greeks_kill_direction: str,
-               change_5m: float, up_energy: float) -> dict:
-        
-        gap = agg_display - agg_json
-        
-        # Data race terdeteksi: display jauh lebih bullish dari JSON
-        if gap < 0.25:
-            return {"override": False}
-        
-        # agg_json harus bearish (sell dominant)
-        if agg_json >= 0.45:
-            return {"override": False}
-        
-        # agg_display harus terlihat bullish (ini yang menipu sistem)
-        if agg_display <= 0.65:
-            return {"override": False}
-        
-        # Kondisi market: long_liq dekat = akan dump
-        liq_bearish = long_liq < short_liq and long_liq < 2.0
-        
-        if not liq_bearish:
-            return {"override": False}
-        
-        # Greeks confirm bearish
-        greeks_bearish = (
-            who_dies_first == "LONG_TRADERS" or
-            greeks_kill_direction == "SHORT"
-        )
-        
-        if not greeks_bearish:
-            return {"override": False}
-        
-        return {
-            "override": True,
-            "bias": "SHORT",
-            "reason": (
-                f"AGG JSON VS DISPLAY BIAS CORRECTION: "
-                f"agg_display={agg_display:.2f} (snapshot lama, STALE) vs "
-                f"agg_json={agg_json:.2f} (ground truth, {(1-agg_json)*100:.0f}% SELL). "
-                f"Gap={gap:.2f} → DATA RACE. "
-                f"long_liq={long_liq:.2f}% (cascade target), "
-                f"who_dies={who_dies_first}, kill={greeks_kill_direction}. "
-                f"Cancel semua LONG override dari agg_display. Force SHORT."
-            ),
-            "priority": -30400
-        }
-
-
-class CapitulationDipOBVGuardLongLiqClose:
-    """
-    🔥 PNUTUSDT FIX — GUARD untuk CapitulationDipThenRipWithOBV
-    Priority -30050 (tepat di atas CapitulationDipThenRip -30000)
-    
-    CapitulationDipThenRipWithOBV TIDAK BOLEH fire jika:
-    1. agg_json < 0.45 (sell dominant - bukan genuine accumulation)
-    2. long_liq < 1.5% (bukan setup bounce - ini cascade target)
-    3. who_dies_first == LONG_TRADERS (Greeks sudah tahu)
-    
-    Jika kondisi 1+2+3 semua terpenuhi, CapitulationDip adalah JEBAKAN.
-    OBV POSITIVE_EXTREME adalah stale dari sebelum drop.
-    """
-    @staticmethod
-    def detect(agg_json: float, long_liq: float, who_dies_first: str,
-               greeks_kill_direction: str, change_5m: float,
-               up_energy: float, down_energy: float) -> dict:
-        
-        # Cek apakah ini kondisi yang akan menipu CapitulationDipThenRip
-        fake_capitulation = (
-            agg_json < 0.45 and              # sell dominant (bukan buyer masuk)
-            long_liq < 1.5 and              # cascade target, bukan bounce target
-            who_dies_first == "LONG_TRADERS" and  # Greeks confirm LONG mati
-            change_5m < -3.0               # sudah drop
-        )
-        
-        if not fake_capitulation:
-            return {"override": False}
-        
-        # up_energy besar tapi agg rendah = PHANTOM
-        phantom_confirmed = up_energy > 1.0 and agg_json < 0.40
-        
-        if not phantom_confirmed:
-            return {"override": False}
-        
-        return {
-            "override": True,
-            "bias": "SHORT",
-            "cancel_capitulation_dip": True,
-            "reason": (
-                f"CAPITULATION DIP OBV GUARD (LONG LIQ CLOSE): "
-                f"agg_json={agg_json:.2f} ({(1-agg_json)*100:.0f}% SELL) = BUKAN genuine accumulation. "
-                f"long_liq={long_liq:.2f}% adalah CASCADE TARGET, bukan bounce target. "
-                f"up_energy={up_energy:.2f} adalah PHANTOM (agg contradicts). "
-                f"who_dies={who_dies_first} → CapitulationDipThenRip adalah JEBAKAN. "
-                f"Cancel, Force SHORT."
-            ),
-            "priority": -30050
-        }
-
-
 class CapitulationDipThenRipWithOBV:
     """
     🔥 PRIORITY -30000 (TERTINGGI ABSOLUT)
@@ -898,16 +721,12 @@ class CapitulationDipThenRipWithOBV:
                who_dies_first: str = "", greeks_kill_direction: str = "") -> dict:
         if funding_rate is None:
             funding_rate = 0.0
-        
-        # 🔥 PNUTUSDT GUARD: Jika agg < 0.45 dan long_liq < 1.5 = cascade, bukan bounce
+        # PNUTUSDT GUARD: agg rendah + long_liq ultra dekat = cascade target, bukan accumulation.
         if agg < 0.45 and long_liq < 1.5:
-            return {"override": False}  # Ini cascade, bukan bounce
-        
-        # 🔥 GUARD: who_dies_first harus bukan LONG_TRADERS
-        # Jika LONG_TRADERS yang mati, ini adalah dump bukan bounce
+            return {"override": False}
+        # Jika Greeks sudah confirm LONG yang mati, ini dump/cascade, bukan bounce.
         if who_dies_first == "LONG_TRADERS" or greeks_kill_direction == "SHORT":
             return {"override": False}
-        
         # Kondisi capitulation dip with institutional accumulation
         if (change_5m < -3.0 and long_liq < 5.0 and
             obv_trend in ("POSITIVE_EXTREME", "POSITIVE") and
@@ -920,6 +739,128 @@ class CapitulationDipThenRipWithOBV:
                 "priority": -30000
             }
         return {"override": False}
+
+
+class PhantomBidWallLongLiqCascade:
+    """
+    PRIORITY -30500: up_energy besar tapi bid wall phantom, target sebenarnya long_liq cascade.
+    """
+    @staticmethod
+    def detect(up_energy: float, long_liq: float, agg_json: float,
+               change_5m: float, who_dies_first: str,
+               greeks_kill_direction: str, funding_rate: float) -> dict:
+        if funding_rate is None:
+            funding_rate = 0.0
+
+        phantom_bid = (
+            up_energy > 2.0 and
+            long_liq < 1.5 and
+            agg_json < 0.45 and
+            change_5m < -3.0
+        )
+        if not phantom_bid:
+            return {"override": False}
+
+        greeks_confirm = (
+            who_dies_first == "LONG_TRADERS" or
+            greeks_kill_direction == "SHORT"
+        )
+        if not greeks_confirm:
+            return {"override": False}
+
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"PHANTOM BID WALL LONG LIQ CASCADE: "
+                f"up_energy={up_energy:.2f} (PHANTOM bid wall), "
+                f"agg_json={agg_json:.2f} ({(1-agg_json)*100:.0f}% trades SELL), "
+                f"long_liq={long_liq:.2f}% (cascade target), "
+                f"drop={change_5m:.1f}%, who_dies={who_dies_first}, "
+                f"kill={greeks_kill_direction} -> HFT luring LONG before cascade. Force SHORT."
+            ),
+            "priority": -30500
+        }
+
+
+class AggJsonVsDisplayBiasCorrection:
+    """
+    PRIORITY -30400: koreksi data race ketika display agg bullish tapi JSON agg bearish.
+    """
+    @staticmethod
+    def detect(agg_display: float, agg_json: float,
+               long_liq: float, short_liq: float,
+               who_dies_first: str, greeks_kill_direction: str,
+               change_5m: float, up_energy: float) -> dict:
+        gap = agg_display - agg_json
+
+        if gap < 0.25:
+            return {"override": False}
+        if agg_json >= 0.45:
+            return {"override": False}
+        if agg_display <= 0.65:
+            return {"override": False}
+
+        liq_bearish = long_liq < short_liq and long_liq < 2.0
+        if not liq_bearish:
+            return {"override": False}
+
+        greeks_bearish = (
+            who_dies_first == "LONG_TRADERS" or
+            greeks_kill_direction == "SHORT"
+        )
+        if not greeks_bearish:
+            return {"override": False}
+
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"AGG JSON VS DISPLAY BIAS CORRECTION: "
+                f"agg_display={agg_display:.2f} (stale) vs agg_json={agg_json:.2f} "
+                f"({(1-agg_json)*100:.0f}% SELL). Gap={gap:.2f}. "
+                f"long_liq={long_liq:.2f}%, who_dies={who_dies_first}, "
+                f"kill={greeks_kill_direction} -> cancel LONG bias from display snapshot. Force SHORT."
+            ),
+            "priority": -30400
+        }
+
+
+class CapitulationDipOBVGuardLongLiqClose:
+    """
+    PRIORITY -30050: blokir false positive DipThenRip OBV saat long_liq adalah target cascade.
+    """
+    @staticmethod
+    def detect(agg_json: float, long_liq: float, who_dies_first: str,
+               greeks_kill_direction: str, change_5m: float,
+               up_energy: float, down_energy: float) -> dict:
+        fake_capitulation = (
+            agg_json < 0.45 and
+            long_liq < 1.5 and
+            who_dies_first == "LONG_TRADERS" and
+            change_5m < -3.0
+        )
+        if not fake_capitulation:
+            return {"override": False}
+
+        phantom_confirmed = up_energy > 1.0 and agg_json < 0.40
+        if not phantom_confirmed:
+            return {"override": False}
+
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "cancel_capitulation_dip": True,
+            "reason": (
+                f"CAPITULATION DIP OBV GUARD (LONG LIQ CLOSE): "
+                f"agg_json={agg_json:.2f} ({(1-agg_json)*100:.0f}% SELL) is not genuine accumulation. "
+                f"long_liq={long_liq:.2f}% is cascade target, "
+                f"up_energy={up_energy:.2f} is PHANTOM, down_energy={down_energy:.2f}, "
+                f"who_dies={who_dies_first}, kill={greeks_kill_direction}. "
+                f"CapitulationDipThenRip is a trap here. Force SHORT."
+            ),
+            "priority": -30050
+        }
 
 
 class AdversarialCapitulationDump:
@@ -2581,6 +2522,83 @@ class CapitulationExtremeLongOverride:
         return {"override": False}
 
 
+class ExtremeOversoldLongLiqSweepReversal:
+    """
+    PRIORITY -28100: extreme oversold + long_liq ultra close = micro-sweep lalu pump.
+    """
+    @staticmethod
+    def detect(rsi6: float, rsi6_5m: float, long_liq: float, short_liq: float,
+               down_energy: float, volume_ratio: float, agg: float,
+               funding_rate: float = 0.0) -> dict:
+
+        if funding_rate is None:
+            funding_rate = 0.0
+
+        if not (rsi6 < 15 and long_liq < 1.5 and down_energy < 0.01):
+            return {"override": False}
+
+        confirmations = sum([
+            volume_ratio < 0.7,
+            rsi6_5m < 20,
+            agg > 0.4,
+            funding_rate > -0.005,
+        ])
+
+        if confirmations >= 2:
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": (
+                    f"EXTREME OVERSOLD LONG LIQ SWEEP REVERSAL: "
+                    f"RSI6={rsi6:.1f} (<15 capitulation), long_liq={long_liq:.2f}% ultra close, "
+                    f"down_energy=0, volume={volume_ratio:.2f}x -> "
+                    f"HFT akan micro-sweep long stop lalu PUMP. JANGAN SHORT. Force LONG."
+                ),
+                "priority": -28100
+            }
+
+        return {"override": False}
+
+
+class ExchangeRiskGreeksConflictResolver:
+    """
+    PRIORITY -28050: resolve conflict exchange risk vs Greeks pakai liquidity + RSI context.
+    """
+    @staticmethod
+    def detect(exchange_safe: str, greeks_kill: str, who_dies: str,
+               short_liq: float, long_liq: float,
+               rsi6: float, rsi6_5m: float, volume_ratio: float) -> dict:
+
+        if exchange_safe == "NEUTRAL" or greeks_kill == "NEUTRAL":
+            return {"override": False}
+        if exchange_safe == greeks_kill:
+            return {"override": False}
+
+        if exchange_safe == "SHORT" and greeks_kill == "LONG":
+            if short_liq < 2.0 and rsi6 < 40:
+                return {
+                    "override": True,
+                    "bias": "LONG",
+                    "reason": (
+                        f"EXCHANGE-GREEKS CONFLICT RESOLVED: short_liq={short_liq:.2f}% close, "
+                        f"RSI={rsi6:.1f} oversold -> ikuti Greeks LONG."
+                    ),
+                    "priority": -28050
+                }
+            if long_liq < 2.0 and rsi6 > 40:
+                return {
+                    "override": True,
+                    "bias": "SHORT",
+                    "reason": (
+                        f"EXCHANGE-GREEKS CONFLICT RESOLVED: long_liq={long_liq:.2f}% close, "
+                        f"RSI={rsi6:.1f} not oversold -> ikuti Exchange SHORT."
+                    ),
+                    "priority": -28050
+                }
+
+        return {"override": False}
+
+
 class CapitulationGammaExecutingBlock:
     """
     🔥 PRIORITY -28150 (antara CapitulationExtremeLong -28200 dan CrowdedOBV -28100):
@@ -3229,6 +3247,42 @@ class MaximumCrowdingLongLiqCloserShort:
         }
 
 
+class ModerateOversoldDipThenRipOverride:
+    """
+    PRIORITY -29600: dip-then-rip untuk RSI oversold moderat dengan order flow sangat bullish.
+    """
+    @staticmethod
+    def detect(rsi6: float, long_liq: float, short_liq: float,
+               agg: float, ofi_bias: str, ofi_strength: float,
+               down_energy: float, change_5m: float,
+               volume_ratio: float) -> dict:
+
+        if not (15 <= rsi6 <= 30):
+            return {"override": False}
+        if long_liq >= 1.5:
+            return {"override": False}
+        if not (agg > 0.85 and ofi_bias == "LONG" and ofi_strength > 0.7):
+            return {"override": False}
+        if down_energy >= 0.01:
+            return {"override": False}
+        if change_5m >= 0:
+            return {"override": False}
+        if volume_ratio >= 0.7:
+            return {"override": False}
+
+        return {
+            "override": True,
+            "bias": "LONG",
+            "reason": (
+                f"MODERATE OVERSOLD DIP THEN RIP: RSI6={rsi6:.1f} (moderate oversold), "
+                f"long_liq={long_liq:.2f}% ultra close, agg={agg:.2f} (100% buy), "
+                f"OFI LONG {ofi_strength:.2f}, down_energy=0, price dipping -> "
+                f"HFT sweep long stops then PUMP. Force LONG."
+            ),
+            "priority": -29600
+        }
+
+
 class DipThenRipAggConfirm:
     """
     🔥 PRIORITY -28000 (TERTINGGI ABSOLUT BARU - LECTURER SARAN LOGIC):
@@ -3346,6 +3400,49 @@ class DipThenRipAggConfirm:
         return {"override": False}
 
 
+class BaitOversoldFakeBounceTrap:
+    """
+    PRIORITY -28000: fake bounce trap di BAIT phase oversold ekstrem.
+    """
+    @staticmethod
+    def detect(market_phase: str, volume_ratio: float, rsi6_5m: float, rsi6: float,
+               agg: float, ofi_bias: str, ofi_strength: float,
+               algo_type_bias: str, hft_6pct_bias: str,
+               down_energy: float, change_5m: float) -> dict:
+
+        bait_phase = market_phase == "BAIT"
+        volume_dry = volume_ratio < 0.7
+        rsi5m_oversold_extreme = rsi6_5m < 15
+        rsi1m_already_overbought = rsi6 > 60
+        agg_sell_dominant = agg < 0.45
+
+        if not (bait_phase and volume_dry and rsi5m_oversold_extreme and
+                rsi1m_already_overbought and agg_sell_dominant):
+            return {"override": False}
+
+        institutional_bearish = (
+            algo_type_bias == "SHORT" or hft_6pct_bias == "SHORT"
+        )
+        ofi_bearish = ofi_bias == "SHORT" and ofi_strength > 0.3
+        fake_vacuum = down_energy < 0.01
+
+        if institutional_bearish or ofi_bearish or fake_vacuum:
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"BAIT OVERSOLD FAKE BOUNCE TRAP: market_phase=BAIT, volume={volume_ratio:.2f}x kering, "
+                    f"RSI5m={rsi6_5m:.1f} (<15 oversold umpan) vs RSI1m={rsi6:.1f} (>60 already bounced), "
+                    f"agg={agg:.2f} ({(1-agg)*100:.0f}% SELL real-time), "
+                    f"algo={algo_type_bias}, hft={hft_6pct_bias} -> fake bounce HFT sebelum dump. "
+                    f"Override semua sinyal LONG. Force SHORT."
+                ),
+                "priority": -29600
+            }
+
+        return {"override": False}
+
+
 class RSI5mExtremeTrendOverride:
     """
     🔥 PRIORITY -27950 (TERTINGGI KEDUA - LECTURER SARAN LOGIC):
@@ -3377,7 +3474,10 @@ class RSI5mExtremeTrendOverride:
     def detect(rsi6_5m: float, change_5m: float,
                market_phase: str, volume_ratio: float,
                down_energy: float, up_energy: float,
-               agg: float = 0.5, ofi_bias: str = "NEUTRAL") -> dict:
+               agg: float = 0.5, ofi_bias: str = "NEUTRAL",
+               rsi6: float = 50.0, ofi_strength: float = 0.0,
+               algo_type_bias: str = "NEUTRAL",
+               hft_6pct_bias: str = "NEUTRAL") -> dict:
         
         # CASE A: Overbought ekstrem di 5m + harga turun = lanjut SHORT
         if (rsi6_5m > 85 and
@@ -3411,7 +3511,15 @@ class RSI5mExtremeTrendOverride:
             change_5m > 0 and
             market_phase == "BAIT" and
             volume_ratio < 0.8):
-            
+
+            # Guard: bounce sudah terjadi tapi real-time trade masih distribusi.
+            if rsi6 > 60 and agg < 0.45:
+                return {"override": False}
+
+            # Guard tambahan: institusi sudah konsensus SHORT.
+            if algo_type_bias == "SHORT" and hft_6pct_bias == "SHORT":
+                return {"override": False}
+
             no_buyer_trap = up_energy < 0.01
             agg_strong_bearish = agg < 0.15 and ofi_bias == "SHORT"
             
@@ -4858,6 +4966,10 @@ class NoSellerNoBuyerOverride:
         # ========== ARIAUSDT GUARD: algo+hft both SHORT + OBV negatif = manufactured vacuum ==========
         # Jika algo DAN hft keduanya SHORT, dan OBV negatif, maka down_energy=0 adalah jebakan
         if down_energy < 0.01:
+            if (market_phase == "BAIT" and volume_ratio < 0.7):
+                genuine_short_squeeze = (short_liq < long_liq and short_liq < 2.0)
+                if not genuine_short_squeeze:
+                    return {"override": False}
             if (algo_type_bias == "SHORT" and 
                 hft_6pct_bias == "SHORT" and
                 obv_trend in ("NEGATIVE_EXTREME", "NEGATIVE")):
@@ -5082,9 +5194,16 @@ class ExhaustionReversalOverride:
     """
     @staticmethod
     def detect(change_5m: float, volume_ratio: float,
-               down_energy: float, up_energy: float) -> dict:
+               down_energy: float, up_energy: float,
+               greeks_kill_direction: str = "",
+               greeks_who_dies_first: str = "",
+               long_liq: float = 99.0) -> dict:
         # Exhaustion dump → LONG
         if change_5m < -6.0 and volume_ratio < 0.6 and down_energy < 0.01:
+            if (greeks_kill_direction == "SHORT" and
+                greeks_who_dies_first == "LONG_TRADERS" and
+                long_liq > 3.0):
+                return {"override": False}
             return {
                 "override": True,
                 "bias": "LONG",
@@ -19972,7 +20091,9 @@ class BinanceAnalyzer:
         # FIX: Definisi dictionary liq untuk kompatibilitas dengan detector yang masih menggunakan liq["..."]
         liq = {"short_dist": short_liq, "long_dist": long_liq}
         
-        agg_val = result.get("agg", 0.5)
+        agg_json_val = result.get("agg", 0.5)
+        agg_display_val = result.get("agg_display", agg_json_val)
+        agg_val = agg_json_val
         ofi_bias = result.get("ofi_bias", "NEUTRAL")
         ofi_strength = result.get("ofi_strength", 0.0)
         volume_ratio = result.get("volume_ratio", 1.0)
@@ -20001,12 +20122,12 @@ class BinanceAnalyzer:
         
         # ===== PRIORITY -30500: PHANTOM BID WALL LONG LIQ CASCADE (PNUTUSDT FIX) =====
         phantom_bid_cascade = PhantomBidWallLongLiqCascade.detect(
-            up_energy=result.get("up_energy", 0),
+            up_energy=up_energy_val,
             long_liq=long_liq,
-            agg_json=result.get("agg", agg_val),   # pakai result["agg"] = JSON ground truth
+            agg_json=agg_json_val,
             change_5m=change_5m_val,
-            who_dies_first=result.get("greeks_who_dies_first", ""),
-            greeks_kill_direction=result.get("greeks_kill_direction", ""),
+            who_dies_first=who_dies_first,
+            greeks_kill_direction=kill_direction,
             funding_rate=funding_rate_val
         )
         if phantom_bid_cascade["override"]:
@@ -20016,17 +20137,17 @@ class BinanceAnalyzer:
             result["priority_level"] = phantom_bid_cascade["priority"]
             result["entry_allowed"] = True
             return result
-        
-        # ===== PRIORITY -30400: AGG JSON VS DISPLAY CORRECTION =====
+
+        # ===== PRIORITY -30400: AGG JSON VS DISPLAY CORRECTION (PNUTUSDT FIX) =====
         agg_json_fix = AggJsonVsDisplayBiasCorrection.detect(
-            agg_display=agg_val,                          # snapshot value (mungkin stale)
-            agg_json=result.get("agg", agg_val),          # JSON ground truth
+            agg_display=agg_display_val,
+            agg_json=agg_json_val,
             long_liq=long_liq,
             short_liq=short_liq,
-            who_dies_first=result.get("greeks_who_dies_first", ""),
-            greeks_kill_direction=result.get("greeks_kill_direction", ""),
+            who_dies_first=who_dies_first,
+            greeks_kill_direction=kill_direction,
             change_5m=change_5m_val,
-            up_energy=result.get("up_energy", 0)
+            up_energy=up_energy_val
         )
         if agg_json_fix["override"]:
             result["bias"] = agg_json_fix["bias"]
@@ -20035,16 +20156,16 @@ class BinanceAnalyzer:
             result["priority_level"] = agg_json_fix["priority"]
             result["entry_allowed"] = True
             return result
-        
-        # ===== PRIORITY -30050: CAPITULATION DIP OBV GUARD =====
+
+        # ===== PRIORITY -30050: CAPITULATION DIP OBV GUARD (PNUTUSDT FIX) =====
         cap_dip_guard = CapitulationDipOBVGuardLongLiqClose.detect(
-            agg_json=result.get("agg", agg_val),
+            agg_json=agg_json_val,
             long_liq=long_liq,
-            who_dies_first=result.get("greeks_who_dies_first", ""),
-            greeks_kill_direction=result.get("greeks_kill_direction", ""),
+            who_dies_first=who_dies_first,
+            greeks_kill_direction=kill_direction,
             change_5m=change_5m_val,
-            up_energy=result.get("up_energy", 0),
-            down_energy=result.get("down_energy", 0)
+            up_energy=up_energy_val,
+            down_energy=down_energy_val
         )
         if cap_dip_guard["override"]:
             result["bias"] = cap_dip_guard["bias"]
@@ -20053,11 +20174,11 @@ class BinanceAnalyzer:
             result["priority_level"] = cap_dip_guard["priority"]
             result["entry_allowed"] = True
             return result
-        
+
         # ========== PRIORITY -30000: CAPITULATION DIP WITH OBV ACCUMULATION (BASEDUSDT pattern) ==========
         dip_rip_obv = CapitulationDipThenRipWithOBV.detect(
             change_5m=change_5m_val, long_liq=long_liq, obv_trend=obv_trend,
-            agg=agg_val, up_energy=up_energy_val, down_energy=down_energy_val,
+            agg=agg_json_val, up_energy=up_energy_val, down_energy=down_energy_val,
             volume_ratio=volume_ratio, funding_rate=funding_rate_val,
             who_dies_first=who_dies_first, greeks_kill_direction=kill_direction
         )
@@ -20134,6 +20255,88 @@ class BinanceAnalyzer:
             result["reason"] = f"[FAKE SQUEEZE] {fake_squeeze['reason']} | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = fake_squeeze["priority"]
+            result["entry_allowed"] = True
+            return result
+
+        # ===== PRIORITY -29600: MODERATE OVERSOLD DIP THEN RIP =====
+        moderate_dip_rip = ModerateOversoldDipThenRipOverride.detect(
+            rsi6=rsi6_val,
+            long_liq=long_liq,
+            short_liq=short_liq,
+            agg=agg_val,
+            ofi_bias=ofi_bias,
+            ofi_strength=ofi_strength,
+            down_energy=down_energy_val,
+            change_5m=change_5m_val,
+            volume_ratio=volume_ratio
+        )
+        if moderate_dip_rip["override"]:
+            result["bias"] = moderate_dip_rip["bias"]
+            result["reason"] = f"[MODERATE DIP RIP] {moderate_dip_rip['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = moderate_dip_rip["priority"]
+            result["entry_allowed"] = True
+            return result
+
+        # ===== PRIORITY -29600: DIP THEN RIP AGG CONFIRM =====
+        dip_rip = DipThenRipAggConfirm.detect(
+            agg=result.get("agg", 0.5),
+            down_energy=down_energy_val,
+            ofi_bias=ofi_bias,
+            ofi_strength=ofi_strength,
+            long_liq=long_liq,
+            short_liq=short_liq,
+            change_5m=change_5m_val,
+            up_energy=up_energy_val,
+            funding_rate=funding_rate_val,
+            delta_exposure=result.get("greeks_delta_exposure", 0),
+            obv_trend=result.get("obv_trend", "NEUTRAL"),
+            ask_slope=result.get("ask_slope", 0),
+            bid_slope=result.get("bid_slope", 1)
+        )
+        if dip_rip["override"]:
+            result["bias"] = dip_rip["bias"]
+            result["reason"] = f"[DIP THEN RIP] {dip_rip['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = dip_rip["priority"]
+            result["entry_allowed"] = True
+            return result
+
+        # ===== PRIORITY -28100: EXTREME OVERSOLD LONG LIQ SWEEP REVERSAL =====
+        extreme_oversold_sweep = ExtremeOversoldLongLiqSweepReversal.detect(
+            rsi6=rsi6_val,
+            rsi6_5m=rsi6_5m_val,
+            long_liq=long_liq,
+            short_liq=short_liq,
+            down_energy=down_energy_val,
+            volume_ratio=volume_ratio,
+            agg=agg_val,
+            funding_rate=funding_rate_val
+        )
+        if extreme_oversold_sweep["override"]:
+            result["bias"] = extreme_oversold_sweep["bias"]
+            result["reason"] = f"[EXTREME OVERSOLD SWEEP] {extreme_oversold_sweep['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = extreme_oversold_sweep["priority"]
+            result["entry_allowed"] = True
+            return result
+
+        # ===== PRIORITY -28050: EXCHANGE-GREEKS CONFLICT RESOLVER =====
+        exchange_greeks_conflict = ExchangeRiskGreeksConflictResolver.detect(
+            exchange_safe=result.get("exchange_safe_direction", "NEUTRAL"),
+            greeks_kill=result.get("greeks_kill_direction", ""),
+            who_dies=result.get("greeks_who_dies_first", ""),
+            short_liq=short_liq,
+            long_liq=long_liq,
+            rsi6=rsi6_val,
+            rsi6_5m=rsi6_5m_val,
+            volume_ratio=volume_ratio
+        )
+        if exchange_greeks_conflict["override"]:
+            result["bias"] = exchange_greeks_conflict["bias"]
+            result["reason"] = f"[EX-GREEKS CONFLICT] {exchange_greeks_conflict['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = exchange_greeks_conflict["priority"]
             result["entry_allowed"] = True
             return result
 
@@ -20779,32 +20982,28 @@ class BinanceAnalyzer:
             result["entry_allowed"] = True
             return result
         
-        # ===== PRIORITY -28000: DIP THEN RIP AGG CONFIRM (TERTINGGI ABSOLUT BARU) =====
-        # DUSDT CASE: long_liq dekat + agg=1.00 + down_energy=0 + ofi LONG + change_5m negatif kecil
-        # = HFT turunkan harga sedikit untuk sweep long stop, lalu PUMP.
-        dip_rip = DipThenRipAggConfirm.detect(
-            agg=result.get("agg", 0.5),
-            down_energy=down_energy_val,
+        # ===== PRIORITY -28000: BAIT OVERSOLD FAKE BOUNCE TRAP =====
+        fake_bounce_trap = BaitOversoldFakeBounceTrap.detect(
+            market_phase=market_phase,
+            volume_ratio=volume_ratio,
+            rsi6_5m=rsi6_5m_val,
+            rsi6=rsi6_val,
+            agg=agg_val,
             ofi_bias=ofi_bias,
             ofi_strength=ofi_strength,
-            long_liq=long_liq,
-            short_liq=short_liq,
-            change_5m=change_5m_val,
-            up_energy=up_energy_val,
-            funding_rate=funding_rate_val,
-            delta_exposure=result.get("greeks_delta_exposure", 0),
-            obv_trend=result.get("obv_trend", "NEUTRAL"),
-            ask_slope=result.get("ask_slope", 0),
-            bid_slope=result.get("bid_slope", 1)
+            algo_type_bias=result.get("algo_type_bias", "NEUTRAL"),
+            hft_6pct_bias=result.get("hft_6pct_bias", "NEUTRAL"),
+            down_energy=down_energy_val,
+            change_5m=change_5m_val
         )
-        if dip_rip["override"]:
-            result["bias"] = dip_rip["bias"]
-            result["reason"] = f"[DIP THEN RIP] {dip_rip['reason']} | " + result.get("reason", "")
+        if fake_bounce_trap["override"]:
+            result["bias"] = fake_bounce_trap["bias"]
+            result["reason"] = f"[FAKE BOUNCE TRAP] {fake_bounce_trap['reason']} | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
-            result["priority_level"] = dip_rip["priority"]
+            result["priority_level"] = fake_bounce_trap["priority"]
             result["entry_allowed"] = True
             return result
-        
+
         # ===== PRIORITY -27950: RSI5m EXTREME TREND OVERRIDE (TERTINGGI KEDUA) =====
         # INUSDT CASE: RSI 5m > 85 (overbought ekstrem) meskipun harga turun sedikit
         # = trend 5m masih bearish, reversal ke bawah belum selesai.
@@ -20815,8 +21014,12 @@ class BinanceAnalyzer:
             volume_ratio=volume_ratio,
             down_energy=down_energy_val,
             up_energy=up_energy_val,
-            agg=result.get("agg", 0.5),
-            ofi_bias=ofi_bias
+            agg=agg_val,
+            ofi_bias=ofi_bias,
+            rsi6=rsi6_val,
+            ofi_strength=ofi_strength,
+            algo_type_bias=result.get("algo_type_bias", "NEUTRAL"),
+            hft_6pct_bias=result.get("hft_6pct_bias", "NEUTRAL")
         )
         if rsi5m_override["override"]:
             result["bias"] = rsi5m_override["bias"]
@@ -21533,7 +21736,7 @@ class BinanceAnalyzer:
             result["priority_level"] = rsi5m_ask_trap["priority"]
             result["entry_allowed"] = True
             return result
-        
+
         # 0.1 No Seller / No Buyer Override (PRIORITY -20000)
         no_seller_buyer = NoSellerNoBuyerOverride.detect(
             down_energy=down_energy_val,
@@ -21668,7 +21871,10 @@ class BinanceAnalyzer:
             change_5m=change_5m_val,
             volume_ratio=volume_ratio,
             down_energy=down_energy_val,
-            up_energy=up_energy_val
+            up_energy=up_energy_val,
+            greeks_kill_direction=result.get("greeks_kill_direction", ""),
+            greeks_who_dies_first=result.get("greeks_who_dies_first", ""),
+            long_liq=long_liq
         )
         if exhaustion["override"]:
             result["bias"] = exhaustion["bias"]
