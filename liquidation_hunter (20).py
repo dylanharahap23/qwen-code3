@@ -2595,39 +2595,56 @@ class CapitulationExtremeLongOverride:
 
 class ExtremeOversoldLongLiqSweepReversal:
     """
-    PRIORITY -28100: extreme oversold + long_liq ultra close = micro-sweep lalu pump.
+    🔥 PRIORITY -29600 (LEBIH TINGGI dari CLOSER LIQ -29500)
+    
+    Mendeteksi capitulation bounce: RSI5m < 20 ATAU RSI6 < 15, dengan long_liq super dekat,
+    down_energy=0, dan volume kering. HFT akan micro-sweep long stop lalu PUMP besar.
+    
+    Case: EVAAUSDT (RSI6 30.6, RSI5m 12.4, long_liq 0.88%)
     """
     @staticmethod
     def detect(rsi6: float, rsi6_5m: float, long_liq: float, short_liq: float,
                down_energy: float, volume_ratio: float, agg: float,
-               funding_rate: float = 0.0) -> dict:
-
+               funding_rate: float = 0.0, obv_trend: str = "NEUTRAL") -> dict:
+        
         if funding_rate is None:
             funding_rate = 0.0
-
-        if not (rsi6 < 15 and long_liq < 1.5 and down_energy < 0.01):
+        
+        # Core: capitulation di RSI5m atau RSI6 + long_liq ultra close + no sellers
+        capitulation_5m = rsi6_5m < 20
+        capitulation_1m = rsi6 < 15
+        if not (capitulation_5m or capitulation_1m):
             return {"override": False}
-
+        
+        if long_liq >= 1.5:
+            return {"override": False}
+        
+        if down_energy >= 0.01:
+            return {"override": False}
+        
+        # Harga harus turun (setup bounce)
+        # (change_5m akan diperiksa di pemanggil)
+        
+        # Konfirmasi tambahan: volume kering, agg tidak terlalu bearish
         confirmations = sum([
             volume_ratio < 0.7,
-            rsi6_5m < 20,
-            agg > 0.4,
-            funding_rate > -0.005,
+            agg > 0.3,   # tidak full bearish
+            obv_trend in ("NEGATIVE_EXTREME", "NEGATIVE")  # OBV negatif = capitulation
         ])
-
+        
         if confirmations >= 2:
             return {
                 "override": True,
                 "bias": "LONG",
                 "reason": (
                     f"EXTREME OVERSOLD LONG LIQ SWEEP REVERSAL: "
-                    f"RSI6={rsi6:.1f} (<15 capitulation), long_liq={long_liq:.2f}% ultra close, "
-                    f"down_energy=0, volume={volume_ratio:.2f}x -> "
-                    f"HFT akan micro-sweep long stop lalu PUMP. JANGAN SHORT. Force LONG."
+                    f"RSI5m={rsi6_5m:.1f} (<20 capitulation), RSI6={rsi6:.1f}, "
+                    f"long_liq={long_liq:.2f}% ultra close, down_energy=0, volume={volume_ratio:.2f}x → "
+                    f"HFT micro-sweep long stop lalu PUMP. JANGAN SHORT. Force LONG."
                 ),
-                "priority": -28100
+                "priority": -29600   # <-- UBAH PRIORITY
             }
-
+        
         return {"override": False}
 
 
@@ -20578,7 +20595,7 @@ class BinanceAnalyzer:
             result["entry_allowed"] = True
             return result
 
-        # ===== PRIORITY -28100: EXTREME OVERSOLD LONG LIQ SWEEP REVERSAL =====
+        # ===== PRIORITY -29600: EXTREME OVERSOLD LONG LIQ SWEEP REVERSAL =====
         extreme_oversold_sweep = ExtremeOversoldLongLiqSweepReversal.detect(
             rsi6=rsi6_val,
             rsi6_5m=rsi6_5m_val,
@@ -20587,7 +20604,8 @@ class BinanceAnalyzer:
             down_energy=down_energy_val,
             volume_ratio=volume_ratio,
             agg=agg_val,
-            funding_rate=funding_rate_val
+            funding_rate=funding_rate_val,
+            obv_trend=obv_trend
         )
         if extreme_oversold_sweep["override"]:
             result["bias"] = extreme_oversold_sweep["bias"]
