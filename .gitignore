@@ -1,49 +1,43 @@
 ```
-# Environment and config
+# Environment variables
 .env
 .env.local
 .env.*
 
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
 # Logs and temporary files
 *.log
 *.tmp
-*.swp
 
-# Editors and IDEs
-.vscode/
-.idea/
-
-# Dependencies and build artifacts
+# Dependencies
 node_modules/
-venv/
 .venv/
+venv/
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+.mypy_cache/
+.pytest_cache/
+
+# Build artifacts
 dist/
 build/
 target/
-.gradle/
-.mypy_cache/
-.pytest_cache/
-.coverage
-coverage/
-htmlcov/
 
 # System files
 .DS_Store
 Thumbs.db
 
-# Compiled and binary files
-*.class
-*.o
-*.exe
-*.dll
-*.so
-*.a
-*.obj
-*.out
+# Coverage reports
+coverage/
+htmlcov/
+.coverage
+
+# Gradle
+.gradle/
 
 # Compressed files
 *.zip
