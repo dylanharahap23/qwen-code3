@@ -2,7 +2,7 @@
 # Environment
 .env
 .env.local
-*.env.*
+.env.*
 
 # Dependencies
 node_modules/
@@ -11,12 +11,22 @@ venv/
 __pycache__/
 .mypy_cache/
 .pytest_cache/
-.coverage
+.julia/
+zig*/
 
 # Build artifacts
 dist/
 build/
 target/
+*.pyc
+*.class
+*.o
+*.exe
+*.dll
+*.so
+*.a
+*.obj
+*.out
 
 # Editors
 .vscode/
@@ -28,18 +38,12 @@ target/
 *.log
 *.tmp
 
-# System
+# Coverage
+coverage/
+htmlcov/
+.coverage
+
+# OS
 .DS_Store
 Thumbs.db
-
-# Compiled files
-*.pyc
-*.class
-*.o
-*.exe
-*.dll
-*.so
-*.a
-*.obj
-*.out
 ```
