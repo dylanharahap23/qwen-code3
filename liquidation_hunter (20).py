@@ -5475,6 +5475,54 @@ class FallingKnifeExhaustionGuard:
         return {"override": False}
 
 
+class ExhaustionPumpReversalOverride:
+    """
+    🔥 PRIORITY -20080 (DI ATAS NO SELLER -20000 DAN GREEKS -9995)
+    
+    Mendeteksi pump besar (>5%) dengan volume rendah, RSI overbought, dan down_energy=0.
+    Ini adalah fake pump HFT untuk menjebak LONG sebelum dump.
+    
+    Kondisi:
+    - change_5m > 5.0%
+    - volume_ratio < 1.0 (tidak ada volume pendukung)
+    - rsi6 > 70 atau rsi6_5m > 70 (overbought)
+    - down_energy < 0.01 (ilusi no seller)
+    - (opsional) short_liq > 1.5% (bukan genuine squeeze)
+    """
+    @staticmethod
+    def detect(change_5m: float, volume_ratio: float, rsi6: float, rsi6_5m: float,
+               down_energy: float, short_liq: float) -> dict:
+        
+        # Core: pump besar dengan volume rendah
+        if change_5m <= 5.0:
+            return {"override": False}
+        if volume_ratio >= 1.0:
+            return {"override": False}
+        
+        # RSI overbought di salah satu timeframe
+        if not (rsi6 > 70 or rsi6_5m > 70):
+            return {"override": False}
+        
+        # Ilusi no seller
+        if down_energy >= 0.01:
+            return {"override": False}
+        
+        # Jangan override jika short_liq sangat dekat (mungkin genuine squeeze)
+        if short_liq < 1.5:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"EXHAUSTION PUMP REVERSAL: price pumped {change_5m:.1f}%, "
+                f"vol={volume_ratio:.2f}x, RSI1m={rsi6:.1f}, RSI5m={rsi6_5m:.1f}, "
+                f"down_energy=0 → fake pump, dump imminent. Force SHORT."
+            ),
+            "priority": -20080
+        }
+
+
 class ExhaustionReversalOverride:
     """
     🔥 PRIORITY -19900: Deteksi exhaustion dump/pump tanpa volume.
@@ -13691,7 +13739,7 @@ class EnergyGapTrapDetector:
                     f"Energy Gap Trap: RSI {rsi14:.1f} overbought + "
                     f"down_energy {down_energy:.2f} << up_energy {up_energy:.2f} → HFT akan dump"
                 ),
-                "priority": -215
+                "priority": -21000
             }
         if rsi14 < 25 and up_energy < down_energy * 0.1:
             return {
@@ -13701,7 +13749,7 @@ class EnergyGapTrapDetector:
                     f"Energy Gap Trap: RSI {rsi14:.1f} oversold + "
                     f"up_energy {up_energy:.2f} << down_energy {down_energy:.2f} → HFT akan pump"
                 ),
-                "priority": -215
+                "priority": -21000
             }
         return {"override": False, "priority": 0}
 
@@ -22054,6 +22102,23 @@ class BinanceAnalyzer:
             result["reason"] = f"[SQUEEZE MILD WALL] {short_squeeze_mild['reason']} | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = short_squeeze_mild["priority"]
+            result["entry_allowed"] = True
+            return result
+        
+        # ===== PRIORITY -20080: EXHAUSTION PUMP REVERSAL =====
+        exhaust_pump = ExhaustionPumpReversalOverride.detect(
+            change_5m=change_5m_val,
+            volume_ratio=volume_ratio,
+            rsi6=rsi6_val,
+            rsi6_5m=rsi6_5m_val,
+            down_energy=down_energy_val,
+            short_liq=short_liq
+        )
+        if exhaust_pump["override"]:
+            result["bias"] = exhaust_pump["bias"]
+            result["reason"] = f"[EXHAUSTION PUMP] {exhaust_pump['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = exhaust_pump["priority"]
             result["entry_allowed"] = True
             return result
         
