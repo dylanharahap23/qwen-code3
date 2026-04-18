@@ -2602,41 +2602,42 @@ class CapitulationExtremeLongOverride:
 
 class ExtremeOversoldLongLiqSweepReversal:
     """
-    🔥 PRIORITY -29600 (LEBIH TINGGI dari CLOSER LIQ -29500)
+    🔥 PRIORITY -28100 (LEBIH TINGGI dari CLOSER LIQ -27900, TAPI lebih rendah dari DipThenRip -28000)
     
     Mendeteksi capitulation bounce: RSI5m < 20 ATAU RSI6 < 15, dengan long_liq super dekat,
     down_energy=0, dan volume kering. HFT akan micro-sweep long stop lalu PUMP besar.
     
     Case: EVAAUSDT (RSI6 30.6, RSI5m 12.4, long_liq 0.88%)
+    
+    🔥 UPGRADE: Lebih ketat dengan guard Greeks gamma executing + OBV negatif / vol spike
     """
     @staticmethod
     def detect(rsi6: float, rsi6_5m: float, long_liq: float, short_liq: float,
                down_energy: float, volume_ratio: float, agg: float,
-               funding_rate: float = 0.0, obv_trend: str = "NEUTRAL") -> dict:
+               funding_rate: float = 0.0,
+               greeks_kill_direction: str = "",
+               greeks_gamma_executing: bool = False,
+               obv_trend: str = "NEUTRAL",
+               vol_spike: float = 1.0) -> dict:
         
         if funding_rate is None:
             funding_rate = 0.0
         
-        # Core: capitulation di RSI5m atau RSI6 + long_liq ultra close + no sellers
-        capitulation_5m = rsi6_5m < 20
-        capitulation_1m = rsi6 < 15
-        if not (capitulation_5m or capitulation_1m):
+        # Core: extreme oversold pada DUA timeframe + long_liq ultra close
+        if not (rsi6 < 15 and rsi6_5m < 20 and long_liq < 1.5 and down_energy < 0.01):
             return {"override": False}
         
-        if long_liq >= 1.5:
+        # GUARD: Jika Greeks sudah committed SHORT dengan gamma executing,
+        # dan OBV negatif / volume spike nyata, ini capitulation trap, bukan bounce.
+        if (greeks_kill_direction == "SHORT" and greeks_gamma_executing and 
+            (obv_trend == "NEGATIVE_EXTREME" or vol_spike > 3.0)):
             return {"override": False}
         
-        if down_energy >= 0.01:
-            return {"override": False}
-        
-        # Harga harus turun (setup bounce)
-        # (change_5m akan diperiksa di pemanggil)
-        
-        # Konfirmasi tambahan: volume kering, agg tidak terlalu bearish
+        # Konfirmasi tambahan
         confirmations = sum([
             volume_ratio < 0.7,
-            agg > 0.3,   # tidak full bearish
-            obv_trend in ("NEGATIVE_EXTREME", "NEGATIVE")  # OBV negatif = capitulation
+            agg > 0.4,
+            funding_rate > -0.005,
         ])
         
         if confirmations >= 2:
@@ -2645,11 +2646,11 @@ class ExtremeOversoldLongLiqSweepReversal:
                 "bias": "LONG",
                 "reason": (
                     f"EXTREME OVERSOLD LONG LIQ SWEEP REVERSAL: "
-                    f"RSI5m={rsi6_5m:.1f} (<20 capitulation), RSI6={rsi6:.1f}, "
-                    f"long_liq={long_liq:.2f}% ultra close, down_energy=0, volume={volume_ratio:.2f}x → "
-                    f"HFT micro-sweep long stop lalu PUMP. JANGAN SHORT. Force LONG."
+                    f"RSI6={rsi6:.1f} (<15), RSI5m={rsi6_5m:.1f} (<20), "
+                    f"long_liq={long_liq:.2f}% ultra close, down_energy=0 → "
+                    f"HFT micro-sweep long stop lalu PUMP. Force LONG."
                 ),
-                "priority": -29600   # <-- UBAH PRIORITY
+                "priority": -28100
             }
         
         return {"override": False}
@@ -3468,6 +3469,10 @@ class DipThenRipAggConfirm:
                ask_slope: float = 0.0,
                bid_slope: float = 1.0,
                rsi6_5m: float = 50.0) -> dict:
+
+        # 🔥 GUARD: RSI5m extreme overbought → reversal risk too high
+        if rsi6_5m > 80:
+            return {"override": False}
 
         # 🔥 GUARD: RSI 5m overbought (>70) + sell wall dominan → jangan LONG
         if rsi6_5m > 70 and bid_slope > 0 and ask_slope > bid_slope * 2.0:
@@ -20606,7 +20611,7 @@ class BinanceAnalyzer:
             result["entry_allowed"] = True
             return result
 
-        # ===== PRIORITY -29600: EXTREME OVERSOLD LONG LIQ SWEEP REVERSAL =====
+        # ===== PRIORITY -28100: EXTREME OVERSOLD LONG LIQ SWEEP REVERSAL =====
         extreme_oversold_sweep = ExtremeOversoldLongLiqSweepReversal.detect(
             rsi6=rsi6_val,
             rsi6_5m=rsi6_5m_val,
@@ -20616,7 +20621,10 @@ class BinanceAnalyzer:
             volume_ratio=volume_ratio,
             agg=agg_val,
             funding_rate=funding_rate_val,
-            obv_trend=obv_trend
+            greeks_kill_direction=result.get("greeks_kill_direction", ""),
+            greeks_gamma_executing=result.get("greeks_gamma_executing", False),
+            obv_trend=obv_trend,
+            vol_spike=result.get("greeks_vol_spike", 1.0)
         )
         if extreme_oversold_sweep["override"]:
             result["bias"] = extreme_oversold_sweep["bias"]
