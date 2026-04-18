@@ -1,44 +1,80 @@
 ```
-# Environment and temporary files
+# Environment variables
 .env
 .env.local
-*.env.*
+.env.*
 
-# Logs and temporary files
-*.log
-*.tmp
-*.swp
-
-# Editors
-.vscode/
-.idea/
-
-# Python specific
-__pycache__/
+# Compiled Python files
 *.pyc
-*.pyo
-*.pyd
-.Python
-env/
+__pycache__/
+
+# Virtual environments
 venv/
 .venv/
-.venv*/
-pip-log.txt
-pip-delete-this-directory.txt
-.tox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
+env/
+.ENV/
+
+# Dependencies
+node_modules/
+vendor/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Logs
 *.log
-.git/modules/
+
+# Temporary files
+*.tmp
+*.swp
+*~
+
+# OS generated files
 .DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
 Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Coverage reports
+coverage/
+htmlcov/
+.coverage
+
+# Package manager caches
+.npm/
+.yarn/
+.pip/
+.mypy_cache/
+.pytest_cache/
+.cache/
+
+# Java/Maven
+target/
+.gradle/
+*.class
+
+# C/C++
+*.o
+*.obj
+*.a
+*.so
+*.dll
+*.exe
+
+# Compressed files
+*.zip
+*.gz
+*.tar
+*.tgz
+*.bz2
+*.xz
+*.7z
+*.rar
+*.zst
 ```
