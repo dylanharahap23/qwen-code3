@@ -5948,6 +5948,144 @@ class FakeVacuumLongTrapOverride:
         }
 
 
+class ConflictVeto_VacuumVsBearishContext:
+    """
+    🛡️ PRIORITY -19600: VETO "VACUUM REBOUND" TRAP (MLNUSDT, SCRUSDT Pattern)
+    
+    Kasus: down_energy=0, agg>0.7 terlihat bullish, TAPI konteks bearish.
+    HFT menciptakan ilusi "no seller" untuk memancing LONG, padahal siap dump.
+    """
+    @staticmethod
+    def detect(
+        down_energy: float,
+        agg: float,
+        kill_dir: str,
+        who_dies: str,
+        long_liq: float,
+        vol_ratio: float
+    ) -> dict:
+        if (down_energy < 0.01 and 
+            agg > 0.7 and 
+            kill_dir == "SHORT" and 
+            who_dies == "LONG_TRADERS" and 
+            long_liq < 5.0 and 
+            vol_ratio < 0.8):
+            return {
+                "override": True, 
+                "bias": "SHORT", 
+                "priority": -19600,
+                "reason": (
+                    f"CONFLICT VETO - VACUUM VS BEARISH CONTEXT: down_energy={down_energy:.3f} (vacuum), "
+                    f"agg={agg:.2f} (spoofed buy), BUT kill_dir=SHORT, who_dies=LONG_TRADERS, "
+                    f"long_liq={long_liq:.2f}% (hunt target), vol_ratio={vol_ratio:.2f}x (dry liquidity). "
+                    f"HFT trap: fake vacuum to lure LONG before dump. Force SHORT."
+                )
+            }
+        return {"override": False}
+
+
+class ConflictVeto_MicroShortLiqInDistribution:
+    """
+    🛡️ PRIORITY -29400: VETO "MICRO SHORT LIQ HUNT" TRAP (BLESSUSDT Pattern)
+    
+    Kasus: short_liq sangat dekat (<1%), TAPI konteks adalah distribution phase.
+    Ini bukan genuine short squeeze, tapi trap untuk memancing SHORT sebelum pump palsu.
+    """
+    @staticmethod
+    def detect(
+        short_liq: float,
+        long_liq: float,
+        obv_trend: str,
+        greeks_delta_exposure: float,
+        funding_rate: float
+    ) -> dict:
+        if (short_liq < 1.0 and 
+            long_liq > short_liq * 3 and 
+            obv_trend == "NEGATIVE_EXTREME" and 
+            greeks_delta_exposure > 0.85 and 
+            funding_rate > -0.0005):
+            return {
+                "override": True, 
+                "bias": "SHORT", 
+                "priority": -29400,
+                "reason": (
+                    f"CONFLICT VETO - MICRO SHORT LIQ IN DISTRIBUTION: short_liq={short_liq:.2f}% (micro), "
+                    f"long_liq={long_liq:.2f}% (3x farther), BUT obv_trend=NEGATIVE_EXTREME (distribution), "
+                    f"delta_exposure={greeks_delta_exposure:.2f} (crowded longs), funding={funding_rate:.5f} (not squeeze). "
+                    f"HFT trap: fake short hunt to lure shorts before dump continuation. Force SHORT."
+                )
+            }
+        return {"override": False}
+
+
+class ConflictVeto_ExhaustionDropWithoutTrendReversal:
+    """
+    🛡️ PRIORITY -19850: VETO "FAKE CRASH REVERSAL" TRAP (DEGOUSDT, SCRUSDT Pattern)
+    
+    Kasus: price drop >5%, down_energy=0 (无量空跌), TAPI RSI belum oversold.
+    Ini adalah下跌中继 (continuation pattern), bukan reversal. Greeks masih指向杀多.
+    """
+    @staticmethod
+    def detect(
+        change_5m: float,
+        down_energy: float,
+        rsi6_5m: float,
+        kill_dir: str,
+        long_liq: float
+    ) -> dict:
+        if (change_5m < -5.0 and 
+            down_energy < 0.01 and 
+            rsi6_5m > 40 and 
+            kill_dir == "SHORT" and 
+            long_liq < 5.0):
+            return {
+                "override": True, 
+                "bias": "SHORT", 
+                "priority": -19850,
+                "reason": (
+                    f"CONFLICT VETO - EXHAUSTION DROP WITHOUT TREND REVERSAL: change_5m={change_5m:.1f}% (crash), "
+                    f"down_energy={down_energy:.3f} (no volume), BUT rsi6_5m={rsi6_5m:.1f} (not oversold), "
+                    f"kill_dir=SHORT, long_liq={long_liq:.2f}% (still in range). "
+                    f"This is 下跌中继 (continuation), NOT reversal. Force SHORT."
+                )
+            }
+        return {"override": False}
+
+
+class ConflictVeto_ExtremeOversoldWithoutAccumulation:
+    """
+    🛡️ PRIORITY -29750: VETO "EXTREME OVERSOLD REBOUND" TRAP (RSI<10 Pattern)
+    
+    Kasus: RSI<10极度超卖, long_liq很近, TAPI konteks是派发且无吸筹迹象.
+    Ini adalah value trap: retail pikir "oversold = buy", tapi HFT siap lanjut dump.
+    """
+    @staticmethod
+    def detect(
+        rsi6: float,
+        long_liq: float,
+        obv_trend: str,
+        volume_ratio: float,
+        funding_rate: float
+    ) -> dict:
+        if (rsi6 < 10 and 
+            long_liq < 2.0 and 
+            obv_trend == "NEGATIVE_EXTREME" and 
+            volume_ratio < 0.7 and 
+            funding_rate > 0):
+            return {
+                "override": True, 
+                "bias": "SHORT", 
+                "priority": -29750,
+                "reason": (
+                    f"CONFLICT VETO - EXTREME OVERSOLD WITHOUT ACCUMULATION: RSI={rsi6:.1f} (extreme oversold), "
+                    f"long_liq={long_liq:.2f}% (close), BUT obv_trend=NEGATIVE_EXTREME (distribution), "
+                    f"vol_ratio={volume_ratio:.2f}x (no accumulation), funding={funding_rate:.5f} (crowded longs). "
+                    f"Value trap: retail buys oversold, HFT continues dump. Force SHORT."
+                )
+            }
+        return {"override": False}
+
+
 class VacuumContinuationOverride:
     """
     🔥 PRIORITY -19800: Jika tidak ada seller tapi agg bullish → continuation LONG.
@@ -22932,6 +23070,76 @@ class BinanceAnalyzer:
             result["priority_level"] = falling_knife_guard["priority"]
             result["entry_allowed"] = True
             return result
+        
+        # ========== HIGHEST PRIORITY CONFLICT VETO LAYER (PRIORITY -19600 to -29750) ==========
+        # These detectors check for conflicting signals that indicate HFT traps
+        
+        # 1. VETO: Vacuum Rebound Trap (PRIORITY -19600) - MLNUSDT, SCRUSDT Pattern
+        veto_vacuum = ConflictVeto_VacuumVsBearishContext.detect(
+            down_energy=down_energy_val,
+            agg=agg_val,
+            kill_dir=kill_direction,
+            who_dies=who_dies_first,
+            long_liq=long_liq,
+            vol_ratio=volume_ratio
+        )
+        if veto_vacuum["override"]:
+            result["bias"] = veto_vacuum["bias"]
+            result["reason"] = f"[VETO-VACUUM] {veto_vacuum['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = veto_vacuum["priority"]
+            result["entry_allowed"] = True
+            return result
+        
+        # 2. VETO: Micro Short Liq in Distribution (PRIORITY -29400) - BLESSUSDT Pattern
+        veto_micro_short = ConflictVeto_MicroShortLiqInDistribution.detect(
+            short_liq=short_liq,
+            long_liq=long_liq,
+            obv_trend=obv_trend,
+            greeks_delta_exposure=result.get("greeks_delta_exposure", 0),
+            funding_rate=funding_rate_val
+        )
+        if veto_micro_short["override"]:
+            result["bias"] = veto_micro_short["bias"]
+            result["reason"] = f"[VETO-MICRO] {veto_micro_short['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = veto_micro_short["priority"]
+            result["entry_allowed"] = True
+            return result
+        
+        # 3. VETO: Exhaustion Drop Without Trend Reversal (PRIORITY -19850) - DEGOUSDT, SCRUSDT Pattern
+        veto_exhaust_drop = ConflictVeto_ExhaustionDropWithoutTrendReversal.detect(
+            change_5m=change_5m_val,
+            down_energy=down_energy_val,
+            rsi6_5m=rsi6_5m_val,
+            kill_dir=kill_direction,
+            long_liq=long_liq
+        )
+        if veto_exhaust_drop["override"]:
+            result["bias"] = veto_exhaust_drop["bias"]
+            result["reason"] = f"[VETO-EXHAUST] {veto_exhaust_drop['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = veto_exhaust_drop["priority"]
+            result["entry_allowed"] = True
+            return result
+        
+        # 4. VETO: Extreme Oversold Without Accumulation (PRIORITY -29750) - RSI<10 Pattern
+        veto_oversold = ConflictVeto_ExtremeOversoldWithoutAccumulation.detect(
+            rsi6=rsi6_val,
+            long_liq=long_liq,
+            obv_trend=obv_trend,
+            volume_ratio=volume_ratio,
+            funding_rate=funding_rate_val
+        )
+        if veto_oversold["override"]:
+            result["bias"] = veto_oversold["bias"]
+            result["reason"] = f"[VETO-OVERSOLD] {veto_oversold['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = veto_oversold["priority"]
+            result["entry_allowed"] = True
+            return result
+        
+        # ========== END OF CONFLICT VETO LAYER ==========
         
         # 0.2 Exhaustion Reversal Override (PRIORITY -19900)
         exhaustion = ExhaustionReversalOverride.detect(
