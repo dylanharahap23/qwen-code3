@@ -3517,6 +3517,63 @@ class MaximumCrowdingLongLiqCloserShort:
         }
 
 
+class CapitulationCascadeContinuationShort:
+    """
+    🔥 PRIORITY -29600: FALSE CAPITULATION -> CASCADE DUMP CONTINUATION
+    
+    Kasus DEGOUSDT: RSI5m=5.6, long_liq=0.43%, agg=1.00 tapi OBV NEGATIVE_EXTREME.
+    Sistem salah mengira ini "Fake Breakdown Reversal" (LONG).
+    Padahal ini "Crowded Long Liquidation Cascade" yang belum selesai.
+    
+    HFT membuat micro-buy (agg=1.0) untuk memancing retail Long,
+    lalu melanjutkan dump untuk menyapu semua Long Stop.
+    """
+    @staticmethod
+    def detect(
+        rsi6_5m: float,
+        long_liq: float,
+        change_5m: float,
+        obv_trend: str,
+        volume_ratio: float,
+        funding_rate: float,
+        agg: float,
+        down_energy: float
+    ) -> dict:
+        # Kondisi Wajib
+        if rsi6_5m >= 15:
+            return {"override": False}
+        if long_liq >= 2.0:
+            return {"override": False}
+        if change_5m >= -0.5:  # Harga harus masih turun atau flat, bukan naik
+            return {"override": False}
+        if obv_trend not in ("NEGATIVE_EXTREME", "NEGATIVE"):
+            return {"override": False}
+            
+        # Skor Konfirmasi
+        score = sum([
+            volume_ratio < 0.8,                     # Volume kering
+            funding_rate > -0.0005,                 # Tidak ada short squeeze
+            agg > 0.7,                              # Umpan buy pressure
+            down_energy < 0.1,                      # No seller di book (vacuum)
+            long_liq < 1.0,                         # Ultra close (cascade trigger)
+        ])
+        
+        if score >= 3:  # Butuh 3 dari 5 konfirmasi tambahan
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"CAPITULATION CASCADE CONTINUATION: RSI5m={rsi6_5m:.1f} (capitulation), "
+                    f"long_liq={long_liq:.2f}% (ultra close), price still down {change_5m:.1f}%, "
+                    f"OBV={obv_trend} (active distribution), volume={volume_ratio:.2f}x dry. "
+                    f"agg={agg:.2f} adalah BAIT untuk menjebak Long. "
+                    f"HFT akan melanjutkan DUMP untuk liquidasi crowded Long. Force SHORT."
+                ),
+                "priority": -29600
+            }
+        return {"override": False}
+
+
 class OversoldFakeBreakdownReversal:
     """
     🔥 PRIORITY -29700 (高于 CLOSER LIQ -29500 和 MODERATE DIP RIP -29600)
@@ -20905,6 +20962,26 @@ class BinanceAnalyzer:
             result["reason"] = f"[FAKE SQUEEZE] {fake_squeeze['reason']} | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = fake_squeeze["priority"]
+            result["entry_allowed"] = True
+            return result
+
+        # ===== PRIORITY -29600: CAPITULATION CASCADE CONTINUATION (OVERRIDE FAKE BREAKDOWN) =====
+        # Harus SEBELUM OversoldFakeBreakdownReversal (-29700) karena priority lebih tinggi (-29600 > -29700)
+        cascade_short = CapitulationCascadeContinuationShort.detect(
+            rsi6_5m=rsi6_5m_val,
+            long_liq=long_liq,
+            change_5m=change_5m_val,
+            obv_trend=obv_trend,
+            volume_ratio=volume_ratio,
+            funding_rate=funding_rate_val,
+            agg=agg_val,
+            down_energy=down_energy_val
+        )
+        if cascade_short["override"]:
+            result["bias"] = cascade_short["bias"]
+            result["reason"] = f"[CASCADE SHORT] {cascade_short['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = cascade_short["priority"]
             result["entry_allowed"] = True
             return result
 
