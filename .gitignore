@@ -1,5 +1,5 @@
 ```
-# Environment files
+# Environment and config
 .env
 .env.local
 *.env.*
@@ -9,29 +9,24 @@
 *.tmp
 *.swp
 
-# Editor/IDE files
-.vscode/
-.idea/
-
 # Dependencies
+node_modules/
 .venv/
 venv/
-node_modules/
 __pycache__/
 .mypy_cache/
 .pytest_cache/
-
-# Build artifacts
 dist/
 build/
-target/
+
+# Editors
+.vscode/
+.idea/
+
+# Compiled files
 *.pyc
 *.class
 *.o
 *.obj
-*.exe
-*.dll
-*.so
-*.a
 *.out
 ```

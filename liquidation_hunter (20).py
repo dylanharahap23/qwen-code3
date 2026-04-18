@@ -5896,6 +5896,58 @@ class ExhaustionReversalOverride:
         return {"override": False}
 
 
+class FakeVacuumLongTrapOverride:
+    """
+    🔥 PRIORITY -19700: MANUFACTURED VACUUM LONG TRAP (MLNUSDT Pattern)
+    
+    Kasus MLNUSDT: down_energy=0, agg=0.90, OFI LONG, sistem paksa LONG.
+    Tapi market_phase=BAIT, vega_active=True, kill_direction=SHORT.
+    Ini adalah jebakan: HFT menghapus sell order untuk menciptakan ilusi "no seller",
+    memancing retail LONG, lalu DUMP untuk memburu long_liq.
+    """
+    @staticmethod
+    def detect(
+        market_phase: str,
+        down_energy: float,
+        agg: float,
+        greeks_kill_direction: str,
+        greeks_vega_active: bool,
+        volume_ratio: float,
+        long_liq: float,
+        short_liq: float,
+        ofi_bias: str
+    ) -> dict:
+        if market_phase != "BAIT":
+            return {"override": False}
+        if down_energy >= 0.01:
+            return {"override": False}
+        if agg <= 0.7:
+            return {"override": False}
+        if greeks_kill_direction != "SHORT":
+            return {"override": False}
+        if not greeks_vega_active:
+            return {"override": False}
+        if volume_ratio >= 0.8:
+            return {"override": False}
+        # Long_liq harus lebih besar (target dump) dan short_liq tidak terlalu dekat (bukan genuine squeeze)
+        if long_liq <= short_liq * 1.2:
+            return {"override": False}
+        if short_liq < 2.0:
+            return {"override": False}  # Mungkin genuine short squeeze, jangan override
+            
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"FAKE VACUUM LONG TRAP: market_phase=BAIT, down_energy=0 (manufactured vacuum), "
+                f"agg={agg:.2f} (spoofed buy), kill_direction=SHORT, vega_active=True. "
+                f"Volume={volume_ratio:.2f}x kering, long_liq={long_liq:.2f}% (dump target). "
+                f"HFT memancing LONG sebelum dump besar. Override Vacuum Continuation. Force SHORT."
+            ),
+            "priority": -19700
+        }
+
+
 class VacuumContinuationOverride:
     """
     🔥 PRIORITY -19800: Jika tidak ada seller tapi agg bullish → continuation LONG.
@@ -22919,6 +22971,26 @@ class BinanceAnalyzer:
             result["reason"] = f"[REGIME SWITCH] {regime_switch['reason']} | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = regime_switch["priority"]
+            result["entry_allowed"] = True
+            return result
+        
+        # 0.2 Fake Vacuum Long Trap Override (PRIORITY -19700) - OVERRIDE VACUUM CONTINUATION
+        fake_vacuum_long = FakeVacuumLongTrapOverride.detect(
+            market_phase=market_phase,
+            down_energy=down_energy_val,
+            agg=agg_val,
+            greeks_kill_direction=kill_direction,
+            greeks_vega_active=result.get("greeks_vega_active", False),
+            volume_ratio=volume_ratio,
+            long_liq=long_liq,
+            short_liq=short_liq,
+            ofi_bias=ofi_bias
+        )
+        if fake_vacuum_long["override"]:
+            result["bias"] = fake_vacuum_long["bias"]
+            result["reason"] = f"[FAKE VACUUM LONG] {fake_vacuum_long['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = fake_vacuum_long["priority"]
             result["entry_allowed"] = True
             return result
         
