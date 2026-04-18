@@ -1,49 +1,77 @@
 ```
-# Environment files
+# Environment variables
 .env
 .env.local
 *.env.*
 
-# Logs and temporary files
-*.log
-*.tmp
-*.swp
-
-# Editors
-.vscode/
-.idea/
-
-# Python
+# Python specific
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 .Python
 *.so
-
-# Build artifacts
-build/
-dist/
 *.egg-info/
 
-# Dependencies
-.venv/
+# Virtual environments
 venv/
-.env/
-node_modules/
+.venv/
+env/
+ENV/
+
+# Build and distribution artifacts
+build/
+dist/
+*.egg
+*.whl
+*.zip
+*.tar.gz
+
+# Logs
+*.log
 
 # OS generated files
 .DS_Store
 Thumbs.db
 
+# IDE specific
+.vscode/
+.idea/
+*.swp
+*.swo
+
 # Testing
 .coverage
-coverage/
 htmlcov/
+.coverage.*
+.cache
 .pytest_cache/
-.mypy_cache/
+.hypothesis/
 
-# Compressed files
+# Dependency management
+Pipfile.lock
+poetry.lock
+requirements.txt
+
+# Coverage reports
+coverage.xml
+*.cover
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+
+# Compiled files
+*.class
+*.o
+*.obj
+*.out
+*.dll
+*.so
+*.a
+
+# Compression archives
 *.zip
 *.gz
 *.tar
@@ -52,18 +80,9 @@ htmlcov/
 *.xz
 *.7z
 *.rar
-*.zst
-*.lz4
-*.lzh
-*.cab
-*.arj
-*.rpm
-*.deb
 *.Z
 *.lz
-*.lzo
-*.tar.gz
-*.tar.bz2
-*.tar.xz
-*.tar.zst
+
+# Git related (if accidentally tracked)
+!.gitignore
 ```
