@@ -4114,6 +4114,68 @@ class RSITimeframeDivergenceTrapV2:
         }
 
 
+class FakeRSIDivergenceSqueezeOverride:
+    """
+    🔥 PRIORITY -28080: FAKE RSI DIVERGENCE BEAR TRAP -> FORCE LONG
+    
+    Kasus MOVEUSDT: RSI5m=100, RSI1m=29 (divergence), sistem paksa SHORT karena 
+    RSI TF Divergence Trap V2. Tapi Greeks kill=LONG, up_energy=2.04, down_energy=0.
+    Ini adalah jebakan: HFT menciptakan overbought ekstrem dan sinyal bearish palsu
+    untuk memancing SHORT, lalu melakukan short squeeze.
+    """
+    @staticmethod
+    def detect(
+        rsi6_5m: float,
+        rsi6_1m: float,
+        greeks_kill_direction: str,
+        greeks_who_dies_first: str,
+        up_energy: float,
+        down_energy: float,
+        volume_ratio: float,
+        short_liq: float,
+        market_phase: str
+    ) -> dict:
+        # Kondisi divergensi yang biasanya memicu sinyal SHORT
+        if rsi6_5m <= 90:
+            return {"override": False}
+        if rsi6_1m >= 50:
+            return {"override": False}
+        
+        # Greeks harus mendukung LONG
+        greeks_long = (greeks_kill_direction == "LONG" or 
+                       greeks_who_dies_first == "SHORT_TRADERS")
+        if not greeks_long:
+            return {"override": False}
+        
+        # Energi beli harus kuat dan tidak ada tekanan jual
+        if up_energy <= 1.5:
+            return {"override": False}
+        if down_energy >= 0.1:
+            return {"override": False}
+        
+        # Konfirmasi tambahan
+        score = sum([
+            volume_ratio < 0.7,
+            short_liq < 8.0,
+            market_phase == "BAIT"
+        ])
+        if score < 2:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "LONG",
+            "reason": (
+                f"FAKE RSI DIVERGENCE SQUEEZE: RSI5m={rsi6_5m:.1f} (>90), RSI1m={rsi6_1m:.1f} (<50) "
+                f"creating false bearish divergence. BUT Greeks kill={greeks_kill_direction}, "
+                f"who_dies={greeks_who_dies_first}, up_energy={up_energy:.2f} (strong buyers), "
+                f"down_energy={down_energy:.2f} (no sellers). "
+                f"HFT luring SHORT sellers before massive squeeze. Force LONG."
+            ),
+            "priority": -28080
+        }
+
+
 class ExchangeRiskTripleAlignmentVeto:
     """
     PRIORITY -27860: Veto triple alignment LONG saat exchange risk tinggi
@@ -22206,6 +22268,26 @@ class BinanceAnalyzer:
             result["reason"] = f"[OBV-GREEKS BOUNCE] {obv_greeks_override['reason']} | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = obv_greeks_override["priority"]
+            result["entry_allowed"] = True
+            return result
+
+        # ===== PRIORITY -28080: FAKE RSI DIVERGENCE SQUEEZE OVERRIDE =====
+        fake_rsi_div = FakeRSIDivergenceSqueezeOverride.detect(
+            rsi6_5m=rsi6_5m_val,
+            rsi6_1m=rsi6_val,
+            greeks_kill_direction=kill_direction,
+            greeks_who_dies_first=who_dies_first,
+            up_energy=up_energy_val,
+            down_energy=down_energy_val,
+            volume_ratio=volume_ratio,
+            short_liq=short_liq,
+            market_phase=market_phase
+        )
+        if fake_rsi_div["override"]:
+            result["bias"] = fake_rsi_div["bias"]
+            result["reason"] = f"[FAKE RSI DIV SQUEEZE] {fake_rsi_div['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = fake_rsi_div["priority"]
             result["entry_allowed"] = True
             return result
 
