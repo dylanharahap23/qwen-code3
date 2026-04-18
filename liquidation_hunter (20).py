@@ -2865,6 +2865,62 @@ class ExtremeOversoldLongLiqSweepReversal:
         return {"override": False}
 
 
+class ExtremeOversoldWithOBVDistributionShort:
+    """
+    🔥 PRIORITY -28050: EXTREME OVERSOLD + OBV DISTRIBUTION -> FORCE SHORT
+    
+    Kasus GENIUSUSDT: RSI5m=1.5, long_liq=1.04%, down_energy=0, sistem paksa LONG.
+    Tapi OBV NEGATIVE_EXTREME, funding_rate=-0.0012 (tidak cukup negatif), Greeks kill=LONG.
+    Ini adalah jebakan: HFT menciptakan extreme oversold untuk memancing buyer,
+    sementara distribusi masih berlangsung. Tidak ada katalis short squeeze.
+    Harga akan lanjut dump melewati long_liq.
+    """
+    @staticmethod
+    def detect(
+        rsi6_5m: float,
+        long_liq: float,
+        change_5m: float,
+        obv_trend: str,
+        volume_ratio: float,
+        funding_rate: float,
+        greeks_kill_direction: str,
+        greeks_who_dies_first: str,
+        down_energy: float
+    ) -> dict:
+        if rsi6_5m >= 20:
+            return {"override": False}
+        if long_liq >= 2.0:
+            return {"override": False}
+        if change_5m > -1.5:
+            return {"override": False}
+        if obv_trend not in ("NEGATIVE_EXTREME", "NEGATIVE"):
+            return {"override": False}
+        if volume_ratio >= 0.7:
+            return {"override": False}
+        if funding_rate is not None and funding_rate < -0.002:
+            return {"override": False}  # Ada potensi short squeeze
+        
+        # Greeks tidak mendukung reversal
+        greeks_bearish = (greeks_kill_direction == "SHORT" or 
+                          greeks_who_dies_first == "LONG_TRADERS")
+        if not greeks_bearish:
+            # Jika Greeks bullish, tetap perhatikan OBV dominan
+            pass
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"EXTREME OVERSOLD WITH OBV DISTRIBUTION: RSI5m={rsi6_5m:.1f} (<20), "
+                f"long_liq={long_liq:.2f}% (ultra close), price down {change_5m:.1f}%, "
+                f"OBV={obv_trend} (active distribution), volume={volume_ratio:.2f}x dry, "
+                f"funding={funding_rate:.6f} (no short squeeze catalyst). "
+                f"HFT creating fake capitulation to lure buyers, distribution continues. Force SHORT."
+            ),
+            "priority": -28050
+        }
+
+
 class ExchangeRiskGreeksConflictResolver:
     """
     PRIORITY -28050: resolve conflict exchange risk vs Greeks pakai liquidity + RSI context.
@@ -21301,6 +21357,26 @@ class BinanceAnalyzer:
             result["reason"] = f"[DIP THEN RIP] {dip_rip['reason']} | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = dip_rip["priority"]
+            result["entry_allowed"] = True
+            return result
+
+        # ===== PRIORITY -28050: EXTREME OVERSOLD WITH OBV DISTRIBUTION -> SHORT =====
+        oversold_obv_short = ExtremeOversoldWithOBVDistributionShort.detect(
+            rsi6_5m=rsi6_5m_val,
+            long_liq=long_liq,
+            change_5m=change_5m_val,
+            obv_trend=obv_trend,
+            volume_ratio=volume_ratio,
+            funding_rate=funding_rate_val,
+            greeks_kill_direction=kill_direction,
+            greeks_who_dies_first=who_dies_first,
+            down_energy=down_energy_val
+        )
+        if oversold_obv_short["override"]:
+            result["bias"] = oversold_obv_short["bias"]
+            result["reason"] = f"[OVERSOLD OBV SHORT] {oversold_obv_short['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = oversold_obv_short["priority"]
             result["entry_allowed"] = True
             return result
 
