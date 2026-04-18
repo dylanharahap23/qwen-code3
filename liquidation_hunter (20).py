@@ -679,6 +679,125 @@ class CrowdedLongRSI5mExtremeOverboughtTrap:
         }
 
 
+class RSI5mBaitTrapShortOverride:
+    """
+    🔥 PRIORITY -26400: RSI5M BAIT TRAP -> FORCE SHORT
+    
+    Kasus EDGEUSDT & BASEDUSDT:
+    - market_phase = BAIT
+    - rsi6_5m > 70 (5m overbought = sudah naik tinggi)
+    - kill_direction = SHORT (Greeks bilang LONG yang mati)
+    - down_energy = 0 (ilusi no seller)
+    
+    Ini adalah jebakan LONG di BAIT phase.
+    HFT sudah naikkan harga ke RSI5m tinggi, lalu memancing LONG dengan order book tipis.
+    Seharusnya SHORT.
+    """
+    @staticmethod
+    def detect(
+        market_phase: str,
+        rsi6_5m: float,
+        kill_direction: str,
+        down_energy: float,
+        short_liq: float,
+        long_liq: float,
+        volume_ratio: float,
+        agg: float
+    ) -> dict:
+        if market_phase != "BAIT":
+            return {"override": False}
+        if rsi6_5m <= 70:
+            return {"override": False}
+        if kill_direction != "SHORT":
+            return {"override": False}
+        if down_energy >= 0.01:
+            return {"override": False}
+        
+        # Konfirmasi tambahan: volume rendah, short_liq mungkin dekat sebagai umpan
+        if volume_ratio < 0.7 and short_liq < long_liq * 0.5:
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"RSI5M BAIT TRAP: market_phase=BAIT, RSI5m={rsi6_5m:.1f} (>70), "
+                    f"kill_direction=SHORT, down_energy=0. "
+                    f"HFT sudah naikkan harga, memancing LONG, akan dump. Force SHORT."
+                ),
+                "priority": -26400
+            }
+        
+        # Versi ringan: RSI5m > 75 saja sudah cukup jika down_energy=0
+        if rsi6_5m > 75 and down_energy < 0.01:
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"RSI5M BAIT TRAP (strong): RSI5m={rsi6_5m:.1f} (>75), "
+                    f"down_energy=0, BAIT phase -> Force SHORT."
+                ),
+                "priority": -26400
+            }
+        
+        return {"override": False}
+
+
+class RSI5mAccumulationLongOverride:
+    """
+    🔥 PRIORITY -26350: RSI5M ACCUMULATION -> FORCE LONG
+    
+    Kasus BASEDUSDT:
+    - market_phase = BAIT
+    - rsi6_5m < 45 (5m belum overbought = masih ada ruang naik)
+    - delta_crowded = LONG (banyak posisi LONG) -> seharusnya ini akumulasi diam-diam
+    - down_energy = 0, volume rendah
+    - kill_direction bisa SHORT tapi ini adalah jebakan SHORT
+    
+    Delta crowded LONG dengan RSI5m rendah di BAIT phase = smart money akumulasi,
+    akan pump untuk squeeze short.
+    """
+    @staticmethod
+    def detect(
+        market_phase: str,
+        rsi6_5m: float,
+        delta_crowded: str,
+        delta_exposure: float,
+        kill_direction: str,
+        down_energy: float,
+        up_energy: float,
+        volume_ratio: float,
+        short_liq: float,
+        long_liq: float
+    ) -> dict:
+        if market_phase != "BAIT":
+            return {"override": False}
+        if rsi6_5m >= 45:
+            return {"override": False}
+        if delta_crowded != "LONG":
+            return {"override": False}
+        if delta_exposure < 0.75:
+            return {"override": False}
+        if down_energy >= 0.01:
+            return {"override": False}
+        if up_energy <= 0.1:
+            return {"override": False}
+        
+        # Konfirmasi: short_liq bisa dekat sebagai target pump
+        if short_liq < long_liq and short_liq < 3.0:
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": (
+                    f"RSI5M ACCUMULATION TRAP: market_phase=BAIT, RSI5m={rsi6_5m:.1f} (<45), "
+                    f"delta_crowded=LONG ({delta_exposure:.2f}), down_energy=0, "
+                    f"short_liq={short_liq:.2f}% dekat. "
+                    f"Ini akumulasi diam-diam, akan pump untuk squeeze short. Force LONG."
+                ),
+                "priority": -26350
+            }
+        
+        return {"override": False}
+
+
 # ================= ADVERSARIAL LIQUIDITY SWEEP OVERRIDES (PRIORITY -30000 s/d -28000) =================
 class CapitulationDipThenRip:
     """
@@ -22022,6 +22141,46 @@ class BinanceAnalyzer:
             result["reason"] = f"[CROWDED RSI5M TRAP] {crowded_rsi5m_trap['reason']}"
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = crowded_rsi5m_trap["priority"]
+            result["entry_allowed"] = True
+            return result
+
+        # ===== PRIORITY -26400: RSI5M BAIT TRAP -> FORCE SHORT =====
+        rsi5m_bait_short = RSI5mBaitTrapShortOverride.detect(
+            market_phase=market_phase,
+            rsi6_5m=rsi6_5m_val,
+            kill_direction=kill_direction,
+            down_energy=down_energy_val,
+            short_liq=short_liq,
+            long_liq=long_liq,
+            volume_ratio=volume_ratio,
+            agg=agg_val
+        )
+        if rsi5m_bait_short["override"]:
+            result["bias"] = rsi5m_bait_short["bias"]
+            result["reason"] = f"[RSI5M BAIT SHORT] {rsi5m_bait_short['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = rsi5m_bait_short["priority"]
+            result["entry_allowed"] = True
+            return result
+
+        # ===== PRIORITY -26350: RSI5M ACCUMULATION -> FORCE LONG =====
+        rsi5m_accum_long = RSI5mAccumulationLongOverride.detect(
+            market_phase=market_phase,
+            rsi6_5m=rsi6_5m_val,
+            delta_crowded=delta_crowded,
+            delta_exposure=result.get("greeks_delta_exposure", 0),
+            kill_direction=kill_direction,
+            down_energy=down_energy_val,
+            up_energy=up_energy_val,
+            volume_ratio=volume_ratio,
+            short_liq=short_liq,
+            long_liq=long_liq
+        )
+        if rsi5m_accum_long["override"]:
+            result["bias"] = rsi5m_accum_long["bias"]
+            result["reason"] = f"[RSI5M ACCUM LONG] {rsi5m_accum_long['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = rsi5m_accum_long["priority"]
             result["entry_allowed"] = True
             return result
 
