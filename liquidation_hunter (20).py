@@ -3398,6 +3398,62 @@ class MaximumCrowdingLongLiqCloserShort:
         }
 
 
+class OversoldFakeBreakdownReversal:
+    """
+    🔥 PRIORITY -29700 (高于 CLOSER LIQ -29500 和 MODERATE DIP RIP -29600)
+    
+    在 RSI5m < 15 的极度超卖区域，价格继续微跌但 long_liq 极近、卖压枯竭，
+    HFT 制造假跌破引诱空头，随后会快速拉升。
+    
+    条件：
+    - rsi6_5m < 15 (5 分钟极度超卖)
+    - long_liq < 1.0% (多头清算价极近，即将被扫)
+    - down_energy < 0.01 (没有真实卖压)
+    - change_5m < 0 但 > -3% (微跌而非暴跌)
+    - volume_ratio < 0.7 (量能枯竭)
+    - agg > 0.6 或 ofi_bias == "LONG" (暗中买盘)
+    """
+    @staticmethod
+    def detect(rsi6_5m: float, long_liq: float, short_liq: float,
+               down_energy: float, change_5m: float, volume_ratio: float,
+               agg: float, ofi_bias: str, ofi_strength: float) -> dict:
+        
+        # 必须极度超卖
+        if rsi6_5m >= 15:
+            return {"override": False}
+        
+        # long_liq 必须极近（空头陷阱的目标）
+        if long_liq >= 1.0:
+            return {"override": False}
+        
+        # 没有真实卖压
+        if down_energy >= 0.01:
+            return {"override": False}
+        
+        # 价格在下跌，但不是瀑布（-3% ~ 0%）
+        if not (-3.0 <= change_5m < 0):
+            return {"override": False}
+        
+        # 成交量枯竭（HFT 完全控盘）
+        if volume_ratio >= 0.7:
+            return {"override": False}
+        
+        # 必须有暗中买盘（agg 高或 OFI 为 LONG）
+        if not (agg > 0.6 or (ofi_bias == "LONG" and ofi_strength > 0.5)):
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "LONG",
+            "reason": (
+                f"OVERSOLD FAKE BREAKDOWN REVERSAL: RSI5m={rsi6_5m:.1f} (<15), "
+                f"long_liq={long_liq:.2f}% ultra close, down_energy=0, change={change_5m:.1f}%, "
+                f"volume={volume_ratio:.2f}x, agg={agg:.2f} → HFT faking breakdown to trap shorts, PUMP imminent. Force LONG."
+            ),
+            "priority": -29700
+        }
+
+
 class ModerateOversoldDipThenRipOverride:
     """
     PRIORITY -29600: dip-then-rip untuk RSI oversold moderat dengan order flow sangat bullish.
@@ -20675,6 +20731,26 @@ class BinanceAnalyzer:
             result["reason"] = f"[FAKE SQUEEZE] {fake_squeeze['reason']} | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = fake_squeeze["priority"]
+            result["entry_allowed"] = True
+            return result
+
+        # ===== PRIORITY -29700: OVERSOLD FAKE BREAKDOWN REVERSAL =====
+        fake_breakdown = OversoldFakeBreakdownReversal.detect(
+            rsi6_5m=rsi6_5m_val,
+            long_liq=long_liq,
+            short_liq=short_liq,
+            down_energy=down_energy_val,
+            change_5m=change_5m_val,
+            volume_ratio=volume_ratio,
+            agg=agg_val,
+            ofi_bias=ofi_bias,
+            ofi_strength=ofi_strength
+        )
+        if fake_breakdown["override"]:
+            result["bias"] = fake_breakdown["bias"]
+            result["reason"] = f"[FAKE BREAKDOWN] {fake_breakdown['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = fake_breakdown["priority"]
             result["entry_allowed"] = True
             return result
 
