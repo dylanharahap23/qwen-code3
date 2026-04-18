@@ -1105,6 +1105,67 @@ class MicroShortLiqSweepThenDump:
         }
 
 
+class BaitShortLiqInCrowdedDistribution:
+    """
+    🔥 PRIORITY -29400: MICRO SHORT LIQ BAIT IN CROWDED LONG DISTRIBUTION
+    
+    Kasus BLESSUSDT: short_liq=0.51% (umpan), long_liq=3.88% (target dump),
+    OBV NEGATIVE_EXTREME, delta exposure 0.95 (crowded long).
+    Sistem memaksa LONG karena short_liq dekat (AdversarialCloserLiquidity).
+    Padahal ini adalah jebakan di tengah distribusi besar.
+    
+    HFT pasang short_liq dekat + micro-buy (agg=1.0) untuk memancing LONG,
+    lalu dump untuk memburu long_liq yang lebih besar.
+    """
+    @staticmethod
+    def detect(
+        short_liq: float,
+        long_liq: float,
+        obv_trend: str,
+        delta_exposure: float,
+        funding_rate: float,
+        market_phase: str,
+        volume_ratio: float,
+        agg: float,
+        ofi_bias: str
+    ) -> dict:
+        if short_liq >= 1.0:
+            return {"override": False}
+        if long_liq <= short_liq * 3:
+            return {"override": False}
+        if obv_trend not in ("NEGATIVE_EXTREME", "NEGATIVE"):
+            return {"override": False}
+        if delta_exposure < 0.88:
+            return {"override": False}
+        if funding_rate is not None and funding_rate < -0.0005:
+            return {"override": False}  # Ada potensi genuine short squeeze
+        if market_phase != "BAIT":
+            return {"override": False}
+            
+        # Hitung skor konfirmasi tambahan
+        score = sum([
+            volume_ratio < 0.8,
+            agg > 0.7 or ofi_bias == "LONG",
+            delta_exposure > 0.93,
+            long_liq > short_liq * 5
+        ])
+        
+        if score >= 3:
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"MICRO SHORT LIQ BAIT IN DISTRIBUTION: short_liq={short_liq:.2f}% (umpan), "
+                    f"long_liq={long_liq:.2f}% (target dump, ratio {long_liq/short_liq:.1f}x), "
+                    f"OBV={obv_trend} (distribusi aktif), delta_exposure={delta_exposure:.3f} (crowded long). "
+                    f"agg={agg:.2f}, OFI={ofi_bias} adalah spoofing. "
+                    f"HFT memancing LONG sebelum dump besar. Force SHORT."
+                ),
+                "priority": -29400
+            }
+        return {"override": False}
+
+
 class AdversarialCloserLiquidity:
     """
     PRIORITY -29500: paksa arah ke likuiditas terdekat saat rasio ekstrem dan volume rendah.
@@ -21132,6 +21193,27 @@ class BinanceAnalyzer:
             result["reason"] = f"[SHORT LIQ RSI5M GUARD] {short_liq_rsi5m_guard['reason']} | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = short_liq_rsi5m_guard["priority"]
+            result["entry_allowed"] = True
+            return result
+        
+        # ===== PRIORITY -29400: BAIT SHORT LIQ IN CROWDED DISTRIBUTION =====
+        # Harus SEBELUM AdversarialCloserLiquidity (-29500)
+        bait_short_dist = BaitShortLiqInCrowdedDistribution.detect(
+            short_liq=short_liq,
+            long_liq=long_liq,
+            obv_trend=obv_trend,
+            delta_exposure=result.get("greeks_delta_exposure", 0),
+            funding_rate=funding_rate_val,
+            market_phase=market_phase,
+            volume_ratio=volume_ratio,
+            agg=agg_val,
+            ofi_bias=ofi_bias
+        )
+        if bait_short_dist["override"]:
+            result["bias"] = bait_short_dist["bias"]
+            result["reason"] = f"[BAIT SHORT LIQ] {bait_short_dist['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = bait_short_dist["priority"]
             result["entry_allowed"] = True
             return result
         
