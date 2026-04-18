@@ -1285,7 +1285,8 @@ class AlgoHFTBothShortNoSellerVeto:
     maka NO SELLER rule (down_energy=0 → LONG) adalah jebakan.
     
     Veto: kembalikan ke SHORT bukan NEUTRAL.
-    Priority: -27600
+    🔥 LECTURER FIX #3:提升 Algo+HFT Veto 优先级
+    Priority: -28500 (原 -27600，提高到 -28500，高于 DipThenRip -28000)
     """
     @staticmethod
     def detect(algo_type_bias: str, hft_6pct_bias: str,
@@ -1310,7 +1311,7 @@ class AlgoHFTBothShortNoSellerVeto:
                 f"OBV={obv_trend}, down_energy={down_energy:.3f} (manufactured vacuum). "
                 f"NO SELLER rule dibatalkan. Force SHORT."
             ),
-            "priority": -27600
+            "priority": -28500  # 🔥 LECTURER FIX: 从 -27600 提升到 -28500
         }
 
 
@@ -1634,6 +1635,34 @@ class AstronomicalOBVStaleVeto:
                 "priority": -24000
             }
         
+        return {"override": False}
+
+
+class OBVExtremeDistributionVeto:
+    """
+    🔥 LECTURER FIX #4:新增 OBV 极端派发否决器（可选）
+    
+    OBV < -50M + Algo=SHORT + HFT=SHORT → 强制 SHORT，优先级 -28600
+    
+    Ini adalah sinyal distribusi institusional ekstrem:
+    - OBV sangat negatif menunjukkan penjualan besar-besaran
+    - Algo dan HFT keduanya SHORT konfirmasi arah
+    - Priority -28600 (lebih tinggi dari semua veto lain)
+    """
+    @staticmethod
+    def detect(obv_value: float, algo: str, hft: str,
+               down_energy: float = 0.0) -> dict:
+        if obv_value < -50_000_000 and algo == "SHORT" and hft == "SHORT":
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"OBV EXTREME DISTRIBUTION VETO: OBV={obv_value:,.0f} (<-50M), "
+                    f"algo={algo}, hft={hft} → distribusi institusional ekstrem. "
+                    f"Force SHORT."
+                ),
+                "priority": -28600
+            }
         return {"override": False}
 
 
@@ -3468,7 +3497,23 @@ class DipThenRipAggConfirm:
                obv_trend: str = "NEUTRAL",
                ask_slope: float = 0.0,
                bid_slope: float = 1.0,
-               rsi6_5m: float = 50.0) -> dict:
+               rsi6_5m: float = 50.0,
+               algo_type_bias: str = "NEUTRAL",
+               hft_6pct_bias: str = "NEUTRAL",
+               obv_value: float = 0.0) -> dict:
+
+        # 🔥 LECTURER FIX #2:强化 DipThenRip 准入条件
+        # ① long_liq 必须真正接近（<2.5%）
+        if long_liq > 2.5:
+            return {"override": False}
+
+        # ② 如果 Algo 和 HFT 双空头，直接否决
+        if algo_type_bias == "SHORT" and hft_6pct_bias == "SHORT":
+            return {"override": False}
+
+        # ③ OBV 极度负值时否决
+        if obv_value < -50_000_000:
+            return {"override": False}
 
         # 🔥 GUARD: RSI5m extreme overbought → reversal risk too high
         if rsi6_5m > 80:
@@ -20476,6 +20521,25 @@ class BinanceAnalyzer:
         now = time.time()
         market_phase = phase_result.phase if phase_result else "UNKNOWN"
         
+        # ===== DATA CONSISTENCY GUARD (PRIORITY -30000) =====
+        # LECTURER FIX #1: Force use JSON real values and correct contradictions
+        json_agg = result.get("agg", agg_val)
+        json_algo = result.get("algo_type_bias", result.get("algo_bias", "NEUTRAL"))
+        json_hft = result.get("hft_6pct_bias", "NEUTRAL")
+        
+        # Jika显示 agg 与 JSON agg 差距 >0.3，强制使用 JSON agg
+        if abs(agg_val - json_agg) > 0.3:
+            result["reason"] = f"[AGG CORRECTED {agg_val:.2f}→{json_agg:.2f}] " + result.get("reason", "")
+            agg_val = json_agg
+            # 同时修正 ofi_bias（如果 ofi 是从显示快照算出的）
+            if ofi_bias == "LONG" and agg_val < 0.5:
+                ofi_bias = "SHORT"
+                ofi_strength = 0.5
+        
+        # Jika algo 显示与 JSON 矛盾，采用 JSON
+        if result.get("algo_type_bias", "NEUTRAL") != json_algo:
+            result["algo_type_bias"] = json_algo
+        
         # ===== PRIORITY -30500: PHANTOM BID WALL LONG LIQ CASCADE (PNUTUSDT FIX) =====
         phantom_bid_cascade = PhantomBidWallLongLiqCascade.detect(
             up_energy=up_energy_val,
@@ -20649,7 +20713,10 @@ class BinanceAnalyzer:
             obv_trend=result.get("obv_trend", "NEUTRAL"),
             ask_slope=result.get("ask_slope", 0),
             bid_slope=result.get("bid_slope", 1),
-            rsi6_5m=rsi6_5m_val
+            rsi6_5m=rsi6_5m_val,
+            algo_type_bias=result.get("algo_type_bias", "NEUTRAL"),
+            hft_6pct_bias=result.get("hft_6pct_bias", "NEUTRAL"),
+            obv_value=obv_value
         )
         if dip_rip["override"]:
             result["bias"] = dip_rip["bias"]
@@ -21847,7 +21914,22 @@ class BinanceAnalyzer:
             result["entry_allowed"] = True
             return result
         
-        # ===== PRIORITY -27600: ALGO+HFT BOTH SHORT NO SELLER VETO =====
+        # ===== PRIORITY -28600: OBV EXTREME DISTRIBUTION VETO (LECTURER FIX #4) =====
+        obv_extreme_dist = OBVExtremeDistributionVeto.detect(
+            obv_value=obv_value,
+            algo=result.get("algo_type_bias", "NEUTRAL"),
+            hft=result.get("hft_6pct_bias", "NEUTRAL"),
+            down_energy=down_energy_val
+        )
+        if obv_extreme_dist["override"]:
+            result["bias"] = obv_extreme_dist["bias"]
+            result["reason"] = f"[OBV EXTREME DIST] {obv_extreme_dist['reason']}"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = obv_extreme_dist["priority"]
+            result["entry_allowed"] = True
+            return result
+        
+        # ===== PRIORITY -28500: ALGO+HFT BOTH SHORT NO SELLER VETO (LECTURER FIX #3) =====
         algo_hft_veto = AlgoHFTBothShortNoSellerVeto.detect(
             algo_type_bias=result.get("algo_type_bias", "NEUTRAL"),
             hft_6pct_bias=result.get("hft_6pct_bias", "NEUTRAL"),
