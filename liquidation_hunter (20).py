@@ -912,38 +912,45 @@ class MicroShortLiqSweepThenDump:
     """
     🔥 PRIORITY -29650 (LEBIH TINGGI dari CLOSER LIQ -29500)
     
-    Mendeteksi jebakan: short_liq super dekat (<0.5%) sebagai umpan LONG.
+    Mendeteksi jebakan: short_liq super dekat (<0.6%) sebagai umpan LONG.
     HFT akan naik sedikit untuk sweep short stop, lalu DUMP ke long_liq.
     
-    Kondisi:
-    - short_liq < 0.5% (umpan super dekat)
-    - long_liq > short_liq * 4 (target dump jelas)
-    - RSI6 antara 45-70 (tidak oversold, ada ruang turun)
-    - agg > 0.7 (retail sudah masuk LONG)
-    - down_energy = 0 (ilusi vacuum)
-    - change_5m > 0.5% (micro-sweep sudah/sedang terjadi)
-    - volume_ratio < 0.7 (kontrol HFT)
-    
-    Case: TSTUSDT 13:37 - short_liq 0.11%, long_liq 3.16%, RSI6 58.8, agg=1.0
+    Versi upgrade: menangkap blow-off top dengan RSI ekstrem.
     """
     @staticmethod
     def detect(short_liq: float, long_liq: float, rsi6: float, agg: float,
                down_energy: float, change_5m: float, volume_ratio: float,
-               funding_rate: float = 0.0) -> dict:
+               funding_rate: float = 0.0, rsi6_5m: float = 50.0) -> dict:
         
         if funding_rate is None:
             funding_rate = 0.0
         
         # short_liq super dekat (umpan)
-        if short_liq >= 0.5:
+        if short_liq >= 0.6:
             return {"override": False}
         
         # long_liq harus cukup jauh sebagai target dump
-        if long_liq <= short_liq * 4:
+        if long_liq <= short_liq * 3:   # turunkan dari 4 ke 3 agar lebih sensitif
             return {"override": False}
         
-        # RSI tidak oversold (masih ada ruang turun)
-        if not (45 <= rsi6 <= 70):
+        # ===== BLOW-OFF TOP DETECTION =====
+        # Jika RSI sudah ekstrem overbought dan harga sudah naik banyak,
+        # ini PASTI dump meskipun short_liq dekat.
+        if (rsi6 > 90 or rsi6_5m > 85) and change_5m > 3.0:
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"MICRO SHORT LIQ BLOW-OFF TOP: short_liq={short_liq:.2f}% (umpan), "
+                    f"RSI6={rsi6:.1f} (extreme overbought), change={change_5m:.1f}%, "
+                    f"vol={volume_ratio:.2f}x → no room for pump. Force SHORT."
+                ),
+                "priority": -29650
+            }
+        
+        # ===== MODERATE OVERSOLD / NETRAL DETECTION =====
+        # RSI tidak oversold (masih ada ruang turun) atau sudah overbought moderat
+        if not (45 <= rsi6 <= 80):
             return {"override": False}
         
         # Order flow sudah bullish (retail terjebak)
@@ -971,9 +978,9 @@ class MicroShortLiqSweepThenDump:
             "bias": "SHORT",
             "reason": (
                 f"MICRO SHORT LIQ SWEEP THEN DUMP: short_liq={short_liq:.2f}% (umpan), "
-                f"long_liq={long_liq:.2f}% (target dump), RSI6={rsi6:.1f} (not oversold), "
-                f"agg={agg:.2f} (retail trapped LONG), down_energy=0, change={change_5m:.1f}% → "
-                f"HFT micro-sweep completed, dump to long_liq imminent. Force SHORT."
+                f"long_liq={long_liq:.2f}% (target dump), RSI6={rsi6:.1f}, "
+                f"agg={agg:.2f}, down_energy=0, change={change_5m:.1f}% → "
+                f"HFT micro-sweep completed, dump imminent. Force SHORT."
             ),
             "priority": -29650
         }
@@ -5310,6 +5317,10 @@ class NoSellerNoBuyerOverride:
         
         # KASUS down_energy == 0 (tidak ada seller)
         if down_energy < 0.01:
+            # 🔥 GUARD: Jangan paksa LONG jika RSI overbought ekstrem + short_liq dekat
+            if (rsi6 > 90 or rsi6_5m > 85) and short_liq < 2.0 and change_5m > 2.0:
+                return {"override": False}
+            
             # 🔥 GUARD DI KILL PHASE: Jangan paksa LONG jika Greeks bilang SHORT & long_liq lebih dekat & funding positif
             if (market_phase == "KILL" and
                 greeks_kill_direction == "SHORT" and
@@ -16420,7 +16431,7 @@ class OverboughtSqueezeGuard:
                 "override": True,
                 "bias": "SHORT",
                 "reason": f"OVERBOUGHT SQUEEZE GUARD: short_liq={short_liq:.2f}% close tapi RSI6={rsi6:.1f} RSI5m={rsi6_5m:.1f} extreme overbought → squeeze fake, reversal imminent",
-                "priority": -1103.5
+                "priority": -29600
             }
         return {"override": False}
 
@@ -20643,7 +20654,8 @@ class BinanceAnalyzer:
             down_energy=down_energy_val,
             change_5m=change_5m_val,
             volume_ratio=volume_ratio,
-            funding_rate=funding_rate_val
+            funding_rate=funding_rate_val,
+            rsi6_5m=rsi6_5m_val      # <-- PASTIKAN ADA
         )
         if micro_sweep_dump["override"]:
             result["bias"] = micro_sweep_dump["bias"]
