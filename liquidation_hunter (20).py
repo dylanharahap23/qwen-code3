@@ -17838,6 +17838,46 @@ class BlowOffSqueezeReversal:
         return {"override": False}
 
 
+class FakePumpThenDumpTrap:
+    """
+    🔥 PRIORITY -29800
+    Detect HFT fake breakout trap: recent rapid low-volume pump, current price declining, strong bearish consensus.
+    """
+    @staticmethod
+    def detect(change_5m: float, volume_ratio: float, rsi6_5m: float,
+               greeks_kill_direction: str, exchange_safe_direction: str,
+               funding_rate: float, long_liq: float, 
+               recent_pump: bool = False) -> dict:
+        # Volume drying up
+        if volume_ratio >= 0.55:
+            return {"override": False}
+        # Price is falling
+        if change_5m > -0.5:
+            return {"override": False}
+        # RSI 5m falling from high level (was pumped)
+        if not (45 <= rsi6_5m <= 70):
+            return {"override": False}
+        # Bearish consensus (any one satisfied)
+        bearish = (greeks_kill_direction == "SHORT" or 
+                   exchange_safe_direction == "SHORT" or 
+                   (funding_rate is not None and funding_rate > 0.0005))
+        if not bearish:
+            return {"override": False}
+        # long_liq cannot be too close, otherwise might be stop-hunt bounce
+        if long_liq < 2.0:
+            return {"override": False}
+
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"FAKE PUMP THEN DUMP: vol={volume_ratio:.2f}x, RSI5m={rsi6_5m:.1f}, "
+                f"bearish consensus → HFT lured longs, now real dump. Force SHORT."
+            ),
+            "priority": -29800
+        }
+
+
 class NetLiquidationValuePriority:
     MIN_RATIO_THRESHOLD = 5.0
     
@@ -17845,9 +17885,24 @@ class NetLiquidationValuePriority:
     def calculate(short_liq: float, long_liq: float,
                   change_5m: float, rsi6: float,
                   volume_ratio: float, funding_rate: float,
-                  delta_exposure: float) -> dict:
+                  delta_exposure: float,
+                  greeks_kill_direction: str = "",
+                  exchange_safe_direction: str = "") -> dict:
         if short_liq <= 0 or long_liq <= 0:
             return {"dominant_target": "UNKNOWN", "ratio": 0}
+        
+        # Strong bearish consensus overrides sweep logic, directly look short
+        if (greeks_kill_direction == "SHORT" and 
+            exchange_safe_direction == "SHORT" and 
+            funding_rate is not None and funding_rate > 0.0005):
+            return {
+                "dominant_target": "SHORT",
+                "override": True,
+                "bias": "SHORT",
+                "reason": "Strong bearish consensus overrides sweep scenario.",
+                "priority": -28600
+            }
+        
         ratio = long_liq / short_liq
         short_liq_swept = change_5m > short_liq * 2.5
         long_liq_swept = change_5m < -long_liq * 2.5
@@ -20987,6 +21042,24 @@ class BinanceAnalyzer:
             result["entry_allowed"] = False
             return result
 
+        # ========== PRIORITY -29800: FAKE PUMP THEN DUMP TRAP =====
+        fake_pump = FakePumpThenDumpTrap.detect(
+            change_5m=change_5m_val,
+            volume_ratio=volume_ratio,
+            rsi6_5m=rsi6_5m_val,
+            greeks_kill_direction=kill_direction,
+            exchange_safe_direction=result.get("exchange_safe_direction", "NEUTRAL"),
+            funding_rate=funding_rate_val,
+            long_liq=long_liq
+        )
+        if fake_pump["override"]:
+            result["bias"] = fake_pump["bias"]
+            result["reason"] = f"[FAKE PUMP DUMP] {fake_pump['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = fake_pump["priority"]
+            result["entry_allowed"] = True
+            return result
+
         # ========== PRIORITY -28500: NET LIQUIDATION VALUE PRIORITY =====
         net_liq = NetLiquidationValuePriority.calculate(
             short_liq=short_liq,
@@ -20995,7 +21068,9 @@ class BinanceAnalyzer:
             rsi6=rsi6_val,
             volume_ratio=volume_ratio,
             funding_rate=funding_rate_val,
-            delta_exposure=result.get("greeks_delta_exposure", 0)
+            delta_exposure=result.get("greeks_delta_exposure", 0),
+            greeks_kill_direction=kill_direction,
+            exchange_safe_direction=result.get("exchange_safe_direction", "NEUTRAL")
         )
         if net_liq.get("override"):
             result["_net_liq_override"] = True
