@@ -4176,6 +4176,56 @@ class FakeRSIDivergenceSqueezeOverride:
         }
 
 
+class QuietAccumulationLongOverride:
+    """
+    PRIORITY -28070: Quiet Accumulation in BAIT Phase → Force LONG
+    Kasus LABUSDT: Volume 0.18x, down_energy=0, agg JSON=0.91, OBV netral.
+    Sistem terkecoh sinyal bearish jangka pendek, padahal HFT sedang akumulasi.
+    """
+    @staticmethod
+    def detect(market_phase, volume_ratio, down_energy, agg_json, obv_trend,
+               up_energy, short_liq, long_liq, funding_rate):
+        if market_phase != "BAIT": return {"override": False}
+        if volume_ratio >= 0.25: return {"override": False}  # ultra kering
+        if down_energy >= 0.01: return {"override": False}
+        if agg_json <= 0.80: return {"override": False}
+        if obv_trend == "NEGATIVE_EXTREME": return {"override": False}
+        if up_energy <= 0.1: return {"override": False}
+        # Tidak ada crowding ekstrem yang memaksa dump
+        if funding_rate and abs(funding_rate) > 0.005: return {"override": False}
+        
+        return {
+            "override": True, "bias": "LONG",
+            "reason": f"QUIET ACCUMULATION: BAIT phase, vol={volume_ratio:.2f}x ultra dry, agg_json={agg_json:.2f} real buying, down_energy=0, OBV={obv_trend}. HFT accumulating silently. Force LONG.",
+            "priority": -28070
+        }
+
+
+class CrowdedLongFakeBullishShortOverride:
+    """
+    PRIORITY -28060: Crowded LONG + Fake Bullish Signals → Force SHORT
+    Kasus ALICEUSDT: delta_exposure=0.885, agg=0.80, OFI LONG, up_energy besar.
+    Semua terlihat bullish, tapi pasar sudah jenuh LONG. HFT distribusi.
+    """
+    @staticmethod
+    def detect(delta_exposure, agg, ofi_bias, up_energy, down_energy,
+               volume_ratio, market_phase, long_liq, short_liq):
+        if delta_exposure < 0.85: return {"override": False}
+        if agg <= 0.70: return {"override": False}
+        if ofi_bias != "LONG": return {"override": False}
+        if up_energy <= 2.0: return {"override": False}
+        if down_energy >= 0.01: return {"override": False}
+        if volume_ratio >= 0.75: return {"override": False}
+        if market_phase != "BAIT": return {"override": False}
+        if long_liq >= short_liq: return {"override": False}  # long lebih dekat
+        
+        return {
+            "override": True, "bias": "SHORT",
+            "reason": f"CROWDED LONG FAKE BULLISH: delta={delta_exposure:.3f} (>85% long), agg={agg:.2f} (spoofed), up_energy={up_energy:.2f} (manufactured vacuum). Market saturated, HFT distributing. Force SHORT.",
+            "priority": -28060
+        }
+
+
 class ExchangeRiskTripleAlignmentVeto:
     """
     PRIORITY -27860: Veto triple alignment LONG saat exchange risk tinggi
@@ -21420,6 +21470,30 @@ class BinanceAnalyzer:
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = dip_rip["priority"]
             result["entry_allowed"] = True
+            return result
+
+        # ----- PRIORITY -28070: QUIET ACCUMULATION -----
+        quiet_acc = QuietAccumulationLongOverride.detect(
+            market_phase, volume_ratio, down_energy_val, result.get("agg", agg_val),
+            obv_trend, up_energy_val, short_liq, long_liq, funding_rate_val
+        )
+        if quiet_acc["override"]:
+            result["bias"] = quiet_acc["bias"]
+            result["reason"] = f"[QUIET ACCUM] {quiet_acc['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = quiet_acc["priority"]
+            return result
+
+        # ----- PRIORITY -28060: CROWDED LONG FAKE BULLISH -----
+        crowded_fake = CrowdedLongFakeBullishShortOverride.detect(
+            result.get("greeks_delta_exposure", 0), agg_val, ofi_bias, up_energy_val,
+            down_energy_val, volume_ratio, market_phase, long_liq, short_liq
+        )
+        if crowded_fake["override"]:
+            result["bias"] = crowded_fake["bias"]
+            result["reason"] = f"[CROWDED FAKE] {crowded_fake['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = crowded_fake["priority"]
             return result
 
         # ===== PRIORITY -28050: EXTREME OVERSOLD WITH OBV DISTRIBUTION -> SHORT =====
