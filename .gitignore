@@ -11,39 +11,45 @@ venv/
 __pycache__/
 .mypy_cache/
 .pytest_cache/
-pip-log.txt
-pipenv.lock
 
-# Compiled and build artifacts
-*.pyc
-*.class
-*.o
-*.obj
-*.out
-*.dll
-*.so
-*.a
-*.exe
+# Build artifacts
 dist/
 build/
 target/
-.coverage
-coverage/
-htmlcov/
 
-# Editors and IDEs
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+
+# Editors
 .vscode/
 .idea/
-*.swp
-*.swo
-*.tmp
 
-# System files
+# OS
 .DS_Store
 Thumbs.db
-*.log
 
-# Archives
+# Compiled files
+*.pyc
+*.class
+*.o
+*.exe
+*.dll
+*.so
+*.a
+*.obj
+*.out
+
+# Coverage
+coverage/
+htmlcov/
+.coverage
+
+# Gradle
+.gradle/
+
+# Compressed files
 *.zip
 *.gz
 *.tar
