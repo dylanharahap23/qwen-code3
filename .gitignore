@@ -7,55 +7,31 @@
 # Logs and temporary files
 *.log
 *.tmp
-*.swp
 
-# Editors and IDEs
+# Editors
 .vscode/
 .idea/
 
-# Dependencies and build artifacts
-node_modules/
+# Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-*.class
-*.o
-*.obj
-*.so
-*.dll
-*.exe
-*.out
+*.py~
+*.pyc~
+*.pyo~
+*.pyd~
 
-# Distribution and build directories
+# Build artifacts
 dist/
 build/
-target/
-.coverage
-coverage/
-htmlcov/
+*.so
+*.dylib
+*.dll
 
-# Compression and archive files
-*.zip
-*.gz
-*.tar
-*.tgz
-*.bz2
-*.xz
-*.7z
-*.rar
-*.zst
-*.lz4
-*.lzh
-*.cab
-*.arj
-*.rpm
-*.deb
-*.Z
-*.lz
-*.lzo
-*.tar.gz
-*.tar.bz2
-*.tar.xz
-*.tar.zst
+# Dependencies
+node_modules/
+venv/
+.venv/
+.env/
 ```

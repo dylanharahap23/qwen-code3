@@ -3835,6 +3835,58 @@ class ModerateOversoldDipThenRipOverride:
         }
 
 
+class DeltaExposureMaxCrowdingCascade:
+    """
+    🔥 PRIORITY -28060: LABUSDT FIX
+    long_liq ultra dekat + delta_exposure > 90% + volume kering + up_energy lemah.
+    Ini bukan "Dip Then Rip", melainkan jebakan cascade dump.
+    HFT akan terus mendorong harga turun untuk melikuidasi semua LONG.
+    Force SHORT.
+    """
+    @staticmethod
+    def detect(long_liq: float, delta_exposure: float, volume_ratio: float,
+               up_energy: float, exchange_risk_score: int, rsi6_5m: float,
+               down_energy: float = 0.0) -> dict:
+        
+        # 1. Target dekat (ilusi)
+        if long_liq >= 1.5:
+            return {"override": False}
+        
+        # 2. Pasar jenuh LONG
+        if delta_exposure < 0.90:
+            return {"override": False}
+        
+        # 3. Likuiditas tipis
+        if volume_ratio >= 0.6:
+            return {"override": False}
+        
+        # 4. Buy pressure lemah
+        if up_energy >= 0.5:
+            return {"override": False}
+        
+        # 5. Binance warning
+        if exchange_risk_score < 5:
+            return {"override": False}
+        
+        # 6. Tren 5m bearish
+        if rsi6_5m >= 40:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"DELTA EXPOSURE MAX CROWDING CASCADE: "
+                f"long_liq={long_liq:.2f}% (ilusi Dip Then Rip), "
+                f"delta_exposure={delta_exposure:.3f} (>90% jenuh LONG), "
+                f"vol={volume_ratio:.2f}x kering, up_energy={up_energy:.2f} lemah, "
+                f"exchange_risk={exchange_risk_score}/10, RSI5m={rsi6_5m:.1f} bearish → "
+                f"tidak ada bahan bakar untuk pump, HFT akan cascade dump. Force SHORT."
+            ),
+            "priority": -28060
+        }
+
+
 class DipThenRipAggConfirm:
     """
     🔥 PRIORITY -28000 (TERTINGGI ABSOLUT BARU - LECTURER SARAN LOGIC):
@@ -21976,6 +22028,24 @@ class BinanceAnalyzer:
             result["reason"] = f"[MODERATE DIP RIP] {moderate_dip_rip['reason']} | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = moderate_dip_rip["priority"]
+            result["entry_allowed"] = True
+            return result
+
+        # ===== PRIORITY -28060: DELTA EXPOSURE MAX CROWDING CASCADE (LABUSDT FIX) =====
+        delta_cascade = DeltaExposureMaxCrowdingCascade.detect(
+            long_liq=long_liq,
+            delta_exposure=result.get("greeks_delta_exposure", 0),
+            volume_ratio=volume_ratio,
+            up_energy=up_energy_val,
+            exchange_risk_score=result.get("exchange_risk_score", 0),
+            rsi6_5m=rsi6_5m_val,
+            down_energy=down_energy_val
+        )
+        if delta_cascade["override"]:
+            result["bias"] = delta_cascade["bias"]
+            result["reason"] = f"[DELTA CASCADE] {delta_cascade['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = delta_cascade["priority"]
             result["entry_allowed"] = True
             return result
 
