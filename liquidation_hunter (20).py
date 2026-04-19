@@ -4997,6 +4997,60 @@ class ExtremeShortLiqNoSellerSqueezeGuard:
         return {"override": False}
 
 
+class MassiveOBVAccumulationShakeout:
+    """
+    🔥 PRIORITY -27080: BULLAUSDT FIX
+    OBV > 300 juta + volume rendah + harga pullback + no seller + agg bullish.
+    Ini adalah akumulasi besar yang diikuti shakeout (guncangan) untuk menjebak short.
+    HFT akan segera pompa. Force LONG.
+    """
+    @staticmethod
+    def detect(obv_value: float, obv_trend: str,
+               volume_ratio: float, change_5m: float,
+               down_energy: float, agg: float,
+               rsi6_5m: float, funding_rate: float = 0.0) -> dict:
+        
+        # OBV akumulasi masif
+        if obv_value < 300_000_000 or obv_trend != "POSITIVE_EXTREME":
+            return {"override": False}
+        
+        # Volume ultra rendah (kontrol penuh)
+        if volume_ratio >= 0.6:
+            return {"override": False}
+        
+        # Harga turun tapi tidak crash (pullback sehat)
+        if not (-5.0 <= change_5m < 0):
+            return {"override": False}
+        
+        # Tidak ada seller nyata (ilusi yang digunakan untuk akumulasi, bukan distribusi)
+        if down_energy >= 0.1:
+            return {"override": False}
+        
+        # Transaksi real-time tetap didominasi BUY
+        if agg <= 0.55:
+            return {"override": False}
+        
+        # RSI 5m masih tinggi (menandakan trend naik sebelumnya)
+        if rsi6_5m <= 65:
+            return {"override": False}
+        
+        # Opsional: funding tidak boleh sangat positif (jika funding > 0.003 mungkin ada risiko)
+        if funding_rate is not None and funding_rate > 0.003:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "LONG",
+            "reason": (
+                f"MASSIVE OBV ACCUMULATION SHAKEOUT: OBV={obv_value:,.0f} (POSITIVE_EXTREME), "
+                f"vol={volume_ratio:.2f}x, price down {change_5m:.1f}%, down_energy=0, "
+                f"agg={agg:.2f} (buy dominant), RSI5m={rsi6_5m:.1f} → "
+                f"Institusi akumulasi besar, shakeout untuk jebak short, pompa imminent. Force LONG."
+            ),
+            "priority": -27080
+        }
+
+
 class UltraLowVolumeFakeSqueezeTrap:
     """
     🔥 PRIORITY -27520: GENIUSUSDT FIX
@@ -23407,6 +23461,25 @@ class BinanceAnalyzer:
             result["reason"] = f"[ENERGY-AGG RESOLVER] {energy_agg_resolver['reason']} | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = energy_agg_resolver["priority"]
+            result["entry_allowed"] = True
+            return result
+
+        # ===== PRIORITY -27080: MASSIVE OBV ACCUMULATION SHAKEOUT (BULLAUSDT FIX) =====
+        massive_obv_shakeout = MassiveOBVAccumulationShakeout.detect(
+            obv_value=obv_value,
+            obv_trend=obv_trend,
+            volume_ratio=volume_ratio,
+            change_5m=change_5m_val,
+            down_energy=down_energy_val,
+            agg=agg_val,
+            rsi6_5m=rsi6_5m_val,
+            funding_rate=funding_rate_val
+        )
+        if massive_obv_shakeout["override"]:
+            result["bias"] = massive_obv_shakeout["bias"]
+            result["reason"] = f"[MASSIVE OBV SHAKEOUT] {massive_obv_shakeout['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = massive_obv_shakeout["priority"]
             result["entry_allowed"] = True
             return result
 
