@@ -21262,6 +21262,58 @@ class UltraLowVolumeOBVExtremeReversal:
         return {"override": False}
 
 
+class MaxCrowdingMicroSweepThenDump:
+    """
+    🔥 PRIORITY -28000: GRIFFAINUSDT FIX
+    short_liq < 0.5% sebagai umpan + delta_exposure > 92% (jenuh) + sinyal blow-off.
+    Ini adalah jebakan "Sweep then Dump". HFT akan naikkan harga sedikit untuk menyapu short stop,
+    lalu menjatuhkan harga ke long_liq yang jauh lebih besar.
+    Force SHORT.
+    """
+    @staticmethod
+    def detect(short_liq: float, long_liq: float,
+               delta_exposure: float, stoch_j: float, rsi6_5m: float,
+               exchange_risk_score: int, exchange_safe_direction: str,
+               volume_ratio: float, funding_rate: float = 0.0) -> dict:
+        
+        # 1. Umpan dekat, target jauh
+        if short_liq >= 0.5 or long_liq <= short_liq * 5:
+            return {"override": False}
+        
+        # 2. Pasar jenuh LONG
+        if delta_exposure < 0.92:
+            return {"override": False}
+        
+        # 3. Sinyal blow-off
+        blow_off = (stoch_j > 110 or rsi6_5m > 75)
+        if not blow_off:
+            return {"override": False}
+        
+        # 4. Konfirmasi risiko dari Exchange
+        exchange_warning = (exchange_risk_score >= 5 or exchange_safe_direction == "SHORT")
+        if not exchange_warning:
+            return {"override": False}
+        
+        # 5. Volume rendah (kontrol penuh)
+        if volume_ratio >= 0.6:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"MAX CROWDING MICRO-SWEEP THEN DUMP: "
+                f"short_liq={short_liq:.2f}% (umpan), long_liq={long_liq:.2f}% (target, ratio {long_liq/short_liq:.1f}x), "
+                f"delta_exposure={delta_exposure:.3f} (>{0.92}, pasar jenuh LONG), "
+                f"stoch_j={stoch_j:.1f}, RSI5m={rsi6_5m:.1f} (blow-off), "
+                f"exchange_risk={exchange_risk_score}/10, safe_dir={exchange_safe_direction}, "
+                f"vol={volume_ratio:.2f}x → "
+                f"HFT naikkan harga sedikit untuk jebak LONG, lalu dump besar ke long_liq. Force SHORT."
+            ),
+            "priority": -28000
+        }
+
+
 class ShortLiqCloseStrongBuyPressure:
     """
     🔥 PRIORITY -27950: GWEIUSDT FIX
@@ -21533,6 +21585,26 @@ class BinanceAnalyzer:
             result["reason"] = f"[SHORT LIQ BUY PRESSURE] {short_liq_buy_pressure['reason']} | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = short_liq_buy_pressure["priority"]
+            result["entry_allowed"] = True
+            return result
+        
+        # ===== PRIORITY -28000: MAX CROWDING MICRO-SWEEP THEN DUMP (GRIFFAINUSDT FIX) =====
+        max_crowding_sweep = MaxCrowdingMicroSweepThenDump.detect(
+            short_liq=short_liq,
+            long_liq=long_liq,
+            delta_exposure=result.get("greeks_delta_exposure", 0),
+            stoch_j=stoch_j_val,
+            rsi6_5m=rsi6_5m_val,
+            exchange_risk_score=result.get("exchange_risk_score", 0),
+            exchange_safe_direction=result.get("exchange_safe_direction", "NEUTRAL"),
+            volume_ratio=volume_ratio,
+            funding_rate=funding_rate_val
+        )
+        if max_crowding_sweep["override"]:
+            result["bias"] = max_crowding_sweep["bias"]
+            result["reason"] = f"[MAX CROWDING SWEEP-DUMP] {max_crowding_sweep['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = max_crowding_sweep["priority"]
             result["entry_allowed"] = True
             return result
         
