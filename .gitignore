@@ -4,6 +4,8 @@
 __pycache__/
 *.o
 *.obj
+dist/
+build/
 *.class
 *.exe
 *.dll
@@ -17,8 +19,6 @@ venv/
 node_modules/
 .mypy_cache/
 .pytest_cache/
-dist/
-build/
 target/
 .gradle/
 
@@ -65,4 +65,8 @@ htmlcov/
 *.Z
 *.lz
 *.lzo
+*.tar.gz
+*.tar.bz2
+*.tar.xz
+*.tar.zst
 ```

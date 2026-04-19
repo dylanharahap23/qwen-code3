@@ -21056,6 +21056,123 @@ class StateManager:
 
 # ================= ANALYZER =================
 
+class LongLiqCloserButZeroSellers:
+    """
+    🔥 PRIORITY -27980: TAUSDT FIX
+    long_liq lebih dekat dari short_liq, TAPI down_energy=0 dan ada up_energy.
+    HFT tidak akan dump karena tidak ada seller; mereka akan sweep long stop tipis lalu pump.
+    Force LONG.
+    """
+    @staticmethod
+    def detect(long_liq: float, short_liq: float,
+               down_energy: float, up_energy: float,
+               change_5m: float, rsi6: float,
+               volume_ratio: float) -> dict:
+        if (long_liq < short_liq and long_liq < 2.5 and
+            down_energy < 0.01 and up_energy > 0.05 and
+            change_5m > -1.0 and rsi6 > 25 and volume_ratio < 0.8):
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": (
+                    f"LONG LIQ CLOSER BUT ZERO SELLERS: long_liq={long_liq:.2f}% dekat, "
+                    f"down_energy=0, up_energy={up_energy:.2f} → HFT sweep long stop lalu pump. Force LONG."
+                ),
+                "priority": -27980
+            }
+        return {"override": False}
+
+
+class ExtremeOverboughtPostSqueezeReversal:
+    """
+    🔥 PRIORITY -27970: SIRENUSDT FIX
+    RSI 1m >= 99 atau RSI 5m >= 85, short_liq dekat, harga sudah naik → blow-off top.
+    Force SHORT.
+    """
+    @staticmethod
+    def detect(rsi6: float, rsi6_5m: float,
+               short_liq: float, change_5m: float,
+               volume_ratio: float, agg: float) -> dict:
+        extreme_ob = (rsi6 >= 99 or rsi6_5m >= 85)
+        if extreme_ob and short_liq < 3.0 and change_5m > 1.0 and volume_ratio < 0.8:
+            # Konfirmasi tambahan: agg tidak terlalu bullish
+            if agg < 0.9:
+                return {
+                    "override": True,
+                    "bias": "SHORT",
+                    "reason": (
+                        f"EXTREME OVERBOUGHT POST-SQUEEZE: RSI1m={rsi6:.1f}, RSI5m={rsi6_5m:.1f}, "
+                        f"short_liq={short_liq:.2f}% dekat, price up {change_5m:.1f}% → blow-off top, force SHORT."
+                    ),
+                    "priority": -27970
+                }
+        return {"override": False}
+
+
+class UltraLowVolumeOBVExtremeReversal:
+    """
+    🔥 PRIORITY -27960: AIOTUSDT FIX
+    Volume ultra rendah (<0.4x), OBV ekstrem, pergerakan kecil → OBV stale, arah kebalikan.
+    """
+    @staticmethod
+    def detect(volume_ratio: float, obv_trend: str,
+               change_5m: float, agg: float,
+               short_liq: float, long_liq: float) -> dict:
+        if volume_ratio >= 0.4:
+            return {"override": False}
+        if abs(change_5m) > 2.5:
+            return {"override": False}  # sudah ada pergerakan signifikan, OBV mungkin valid
+
+        if obv_trend == "POSITIVE_EXTREME":
+            # OBV bilang akumulasi tapi volume kering → sebenarnya distribusi → SHORT
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"ULTRA LOW VOL OBV EXTREME: vol={volume_ratio:.2f}x, OBV={obv_trend} (stale), "
+                    f"price move {change_5m:.1f}% → OBV tidak mencerminkan kondisi sekarang, force SHORT."
+                ),
+                "priority": -27960
+            }
+        elif obv_trend == "NEGATIVE_EXTREME":
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": (
+                    f"ULTRA LOW VOL OBV EXTREME: vol={volume_ratio:.2f}x, OBV={obv_trend} (stale), "
+                    f"force LONG."
+                ),
+                "priority": -27960
+            }
+        return {"override": False}
+
+
+class ShortLiqCloseStrongBuyPressure:
+    """
+    🔥 PRIORITY -27950: GWEIUSDT FIX
+    short_liq < 1.0% + agg tinggi + up_energy dominan + down_energy=0 → squeeze aktif.
+    Override Greeks SHORT.
+    """
+    @staticmethod
+    def detect(short_liq: float, long_liq: float,
+               agg: float, up_energy: float, down_energy: float,
+               change_5m: float, funding_rate: float) -> dict:
+        if (short_liq < 1.0 and short_liq < long_liq and
+            agg > 0.65 and up_energy > down_energy and down_energy < 0.05 and
+            change_5m > -0.5):
+            # Funding bisa positif (crowded long) tetapi short_liq super dekat dan buy pressure nyata → LONG dulu
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": (
+                    f"SHORT LIQ CLOSE + STRONG BUY PRESSURE: short_liq={short_liq:.2f}% ultra close, "
+                    f"agg={agg:.2f}, up_energy={up_energy:.2f}, down_energy=0 → HFT squeeze shorts. Force LONG."
+                ),
+                "priority": -27950
+            }
+        return {"override": False}
+
+
 class BinanceAnalyzer:
     def __init__(self, symbol: str):
         self.symbol = symbol.upper()
@@ -21245,6 +21362,64 @@ class BinanceAnalyzer:
         # Jika algo 显示与 JSON 矛盾，采用 JSON
         if result.get("algo_type_bias", "NEUTRAL") != json_algo:
             result["algo_type_bias"] = json_algo
+        
+        # ===== NEW DETECTORS (LECTURER'S SARAN: TAUSDT, SIRENUSDT, AIOTUSDT, GWEIUSDT) =====
+
+        # 1. TAUSDT Pattern: Long liq closer but zero sellers → force LONG
+        long_liq_zero_seller = LongLiqCloserButZeroSellers.detect(
+            long_liq=long_liq, short_liq=short_liq,
+            down_energy=down_energy_val, up_energy=up_energy_val,
+            change_5m=change_5m_val, rsi6=rsi6_val, volume_ratio=volume_ratio
+        )
+        if long_liq_zero_seller["override"]:
+            result["bias"] = long_liq_zero_seller["bias"]
+            result["reason"] = f"[LONG LIQ ZERO SELLER] {long_liq_zero_seller['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = long_liq_zero_seller["priority"]
+            result["entry_allowed"] = True
+            return result
+
+        # 2. SIRENUSDT Pattern: Extreme overbought post-squeeze → force SHORT
+        extreme_ob_reversal = ExtremeOverboughtPostSqueezeReversal.detect(
+            rsi6=rsi6_val, rsi6_5m=rsi6_5m_val,
+            short_liq=short_liq, change_5m=change_5m_val,
+            volume_ratio=volume_ratio, agg=agg_val
+        )
+        if extreme_ob_reversal["override"]:
+            result["bias"] = extreme_ob_reversal["bias"]
+            result["reason"] = f"[EXTREME OB REVERSAL] {extreme_ob_reversal['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = extreme_ob_reversal["priority"]
+            result["entry_allowed"] = True
+            return result
+
+        # 3. AIOTUSDT Pattern: Ultra low volume + OBV extreme → force opposite
+        ultra_low_obv_rev = UltraLowVolumeOBVExtremeReversal.detect(
+            volume_ratio=volume_ratio, obv_trend=obv_trend,
+            change_5m=change_5m_val, agg=agg_val,
+            short_liq=short_liq, long_liq=long_liq
+        )
+        if ultra_low_obv_rev["override"]:
+            result["bias"] = ultra_low_obv_rev["bias"]
+            result["reason"] = f"[ULTRA LOW VOL OBV] {ultra_low_obv_rev['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = ultra_low_obv_rev["priority"]
+            result["entry_allowed"] = True
+            return result
+
+        # 4. GWEIUSDT Pattern: Short liq close + strong buy pressure → force LONG
+        short_liq_buy_pressure = ShortLiqCloseStrongBuyPressure.detect(
+            short_liq=short_liq, long_liq=long_liq,
+            agg=agg_val, up_energy=up_energy_val, down_energy=down_energy_val,
+            change_5m=change_5m_val, funding_rate=funding_rate_val
+        )
+        if short_liq_buy_pressure["override"]:
+            result["bias"] = short_liq_buy_pressure["bias"]
+            result["reason"] = f"[SHORT LIQ BUY PRESSURE] {short_liq_buy_pressure['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = short_liq_buy_pressure["priority"]
+            result["entry_allowed"] = True
+            return result
         
         # ===== PRIORITY -30500: PHANTOM BID WALL LONG LIQ CASCADE (PNUTUSDT FIX) =====
         phantom_bid_cascade = PhantomBidWallLongLiqCascade.detect(
