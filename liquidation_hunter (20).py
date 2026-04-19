@@ -21584,6 +21584,51 @@ class StrongBullishConsensusLock:
         }
 
 
+class GreeksKillDirectionCorrector:
+    """
+    🔥 PRIORITY -10010: PIEVERSEUSDT 17:35 FIX
+    Memperbaiki bug fatal Greeks: kill_direction = SHORT padahal SHORT_TRADERS_DIE.
+    Jika real-time buy pressure kuat, koreksi bias ke LONG.
+    """
+    @staticmethod
+    def detect(greeks_liq_7pct: str, greeks_kill_direction: str,
+               up_energy: float, down_energy: float, agg: float,
+               hft_bias: str, algo_bias: str, short_liq: float,
+               rsi6_5m: float = 50.0) -> dict:
+        
+        # Bug trigger: Greeks bilang SHORT_TRADERS_DIE tapi kill_direction = SHORT
+        if greeks_liq_7pct != "SHORT_TRADERS_DIE":
+            return {"override": False}
+        if greeks_kill_direction != "SHORT":
+            return {"override": False}
+        
+        # Real-time bullish confirmation
+        if not (up_energy > 1.0 and down_energy < 0.1):
+            return {"override": False}
+        if agg <= 0.5:
+            return {"override": False}
+        if hft_bias != "LONG" and algo_bias != "LONG":
+            return {"override": False}
+        
+        # Jangan koreksi jika RSI5m sudah terlalu overbought (>90)
+        if rsi6_5m > 90:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "LONG",
+            "reason": (
+                f"GREEKS KILL DIRECTION CORRECTOR: "
+                f"greeks_liq_7pct={greeks_liq_7pct} (SHORT akan mati duluan), "
+                f"tapi kill_direction={greeks_kill_direction} (BUG!). "
+                f"Real-time: up_energy={up_energy:.2f}, down_energy={down_energy:.2f}, agg={agg:.2f}, "
+                f"HFT={hft_bias}, Algo={algo_bias} → semua bullish. "
+                f"Koreksi bias ke LONG."
+            ),
+            "priority": -10010
+        }
+
+
 class BinanceAnalyzer:
     def __init__(self, symbol: str):
         self.symbol = symbol.upper()
@@ -21853,6 +21898,26 @@ class BinanceAnalyzer:
             result["entry_allowed"] = True
             # Batalkan flag regime_skip jika ada
             result["regime_skip"] = False
+            return result
+        
+        # ===== PRIORITY -10010: GREEKS KILL DIRECTION CORRECTOR (PIEVERSEUSDT BUG FIX) =====
+        greeks_corrector = GreeksKillDirectionCorrector.detect(
+            greeks_liq_7pct=result.get("greeks_liq_7pct", ""),
+            greeks_kill_direction=result.get("greeks_kill_direction", ""),
+            up_energy=up_energy_val,
+            down_energy=down_energy_val,
+            agg=agg_val,
+            hft_bias=result.get("hft_6pct_bias", "NEUTRAL"),
+            algo_bias=result.get("algo_type_bias", "NEUTRAL"),
+            short_liq=short_liq,
+            rsi6_5m=rsi6_5m_val
+        )
+        if greeks_corrector["override"]:
+            result["bias"] = greeks_corrector["bias"]
+            result["reason"] = f"[GREEKS CORRECTOR] {greeks_corrector['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = greeks_corrector["priority"]
+            result["entry_allowed"] = True
             return result
         
         # ===== PRIORITY -28050: STRONG BULLISH CONSENSUS LOCK (PIEVERSEUSDT FIX) =====
