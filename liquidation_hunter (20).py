@@ -1166,6 +1166,58 @@ class BaitShortLiqInCrowdedDistribution:
         return {"override": False}
 
 
+class ExhaustedPumpVolumeDryReversal:
+    """
+    🔥 PRIORITY -29650: GRIFFAINUSDT 15:26 FIX
+    Pump besar (>8%) dengan volume kering, energi nol, dan short_liq sudah terlampaui.
+    Ini adalah puncak kelelahan. HFT akan segera dump. Force SHORT.
+    """
+    @staticmethod
+    def detect(change_5m: float, volume_ratio: float,
+               up_energy: float, down_energy: float,
+               short_liq: float, long_liq: float,
+               exchange_safe_direction: str, delta_exposure: float,
+               rsi6_5m: float = 50.0) -> dict:
+        
+        # 1. Pump signifikan
+        if change_5m <= 8.0:
+            return {"override": False}
+        
+        # 2. Volume ultra kering
+        if volume_ratio >= 0.55:
+            return {"override": False}
+        
+        # 3. Energi pasar nol (tidak ada buyer/seller aktif)
+        if up_energy >= 0.1 or down_energy >= 0.1:
+            return {"override": False}
+        
+        # 4. Short_liq sudah terlampaui
+        if short_liq <= 0 or change_5m <= short_liq * 1.5:
+            return {"override": False}
+        
+        # 5. Konfirmasi bearish
+        bearish_confirmation = (
+            exchange_safe_direction == "SHORT" or
+            delta_exposure > 0.8
+        )
+        if not bearish_confirmation:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"EXHAUSTED PUMP VOLUME DRY REVERSAL: "
+                f"price pumped {change_5m:.1f}%, vol={volume_ratio:.2f}x ultra dry, "
+                f"up_energy={up_energy:.2f}, down_energy={down_energy:.2f} (energy zero), "
+                f"short_liq={short_liq:.2f}% already swept ({change_5m:.1f}% > {short_liq*1.5:.1f}%), "
+                f"exchange_safe={exchange_safe_direction}, delta_exposure={delta_exposure:.3f} → "
+                f"HFT exhausted pump, dump imminent. Force SHORT."
+            ),
+            "priority": -29650
+        }
+
+
 class AdversarialCloserLiquidity:
     """
     PRIORITY -29500: paksa arah ke likuiditas terdekat saat rasio ekstrem dan volume rendah.
@@ -21978,6 +22030,26 @@ class BinanceAnalyzer:
             result["reason"] = f"[BAIT SHORT LIQ] {bait_short_dist['reason']} | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = bait_short_dist["priority"]
+            result["entry_allowed"] = True
+            return result
+        
+        # ===== PRIORITY -29650: EXHAUSTED PUMP VOLUME DRY REVERSAL (GRIFFAINUSDT 15:26 FIX) =====
+        exhausted_pump_rev = ExhaustedPumpVolumeDryReversal.detect(
+            change_5m=change_5m_val,
+            volume_ratio=volume_ratio,
+            up_energy=up_energy_val,
+            down_energy=down_energy_val,
+            short_liq=short_liq,
+            long_liq=long_liq,
+            exchange_safe_direction=result.get("exchange_safe_direction", "NEUTRAL"),
+            delta_exposure=result.get("greeks_delta_exposure", 0),
+            rsi6_5m=rsi6_5m_val
+        )
+        if exhausted_pump_rev["override"]:
+            result["bias"] = exhausted_pump_rev["bias"]
+            result["reason"] = f"[EXHAUSTED PUMP REVERSAL] {exhausted_pump_rev['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = exhausted_pump_rev["priority"]
             result["entry_allowed"] = True
             return result
         
