@@ -1062,6 +1062,88 @@ class AdversarialCapitulationDump:
                 "priority": -30000
             }
         return {"override": False}
+
+
+class MassiveDistributionOverride:
+    """
+    🔥 PRIORITY -28010: DOGSUSDT FIX
+    short_liq dekat sebagai umpan, tapi OBV distribusi masif + OFI SHORT + exchange SHORT.
+    Ini adalah jebakan LONG di tengah distribusi institusional. Force SHORT.
+    """
+    @staticmethod
+    def detect(short_liq: float, obv_trend: str, obv_value: float,
+               ofi_bias: str, ofi_strength: float,
+               exchange_safe_direction: str, agg_json: float,
+               up_energy: float, long_liq: float = 99.0) -> dict:
+        
+        # Umpan dekat
+        if short_liq >= 3.0:
+            return {"override": False}
+        
+        # Distribusi masif (minimal 1 miliar)
+        if obv_trend != "NEGATIVE_EXTREME" or abs(obv_value) < 1_000_000_000:
+            return {"override": False}
+        
+        # OFI SELL dominan
+        if ofi_bias != "SHORT" or ofi_strength < 0.8:
+            return {"override": False}
+        
+        # Konfirmasi bearish
+        if exchange_safe_direction != "SHORT" and agg_json >= 0.5:
+            return {"override": False}
+        
+        # Tidak ada buy pressure
+        if up_energy >= 0.5:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"MASSIVE DISTRIBUTION OVERRIDE: "
+                f"short_liq={short_liq:.2f}% (umpan), OBV={obv_trend} ({obv_value:,.0f} distribusi masif), "
+                f"OFI={ofi_bias} {ofi_strength:.2f}, exchange_safe={exchange_safe_direction}, agg_json={agg_json:.2f}, "
+                f"up_energy={up_energy:.2f} → institusi distribusi besar, HFT akan dump. Force SHORT."
+            ),
+            "priority": -28010
+        }
+
+
+class WeakBuyPressureFakeSqueeze:
+    """
+    🔥 PRIORITY -27990: BLESSUSDT FIX
+    short_liq dekat + down_energy=0 TAPI up_energy sangat lemah + OBV POSITIVE_EXTREME.
+    Ini adalah fake pump dengan micro-buy, HFT akan segera dump. Force SHORT.
+    """
+    @staticmethod
+    def detect(short_liq: float, down_energy: float, up_energy: float,
+               volume_ratio: float, obv_trend: str, change_5m: float,
+               long_liq: float = 99.0) -> dict:
+        
+        if not (short_liq < 5.0 and down_energy < 0.01):
+            return {"override": False}
+        if up_energy >= 0.2:
+            return {"override": False}
+        if volume_ratio >= 0.6:
+            return {"override": False}
+        if obv_trend != "POSITIVE_EXTREME":
+            return {"override": False}
+        if change_5m <= 0.5:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"WEAK BUY PRESSURE FAKE SQUEEZE: "
+                f"short_liq={short_liq:.2f}% dekat, down_energy=0, tapi up_energy={up_energy:.2f} (lemah), "
+                f"vol={volume_ratio:.2f}x, OBV={obv_trend}, change={change_5m:.1f}% → "
+                f"fake pump dengan micro-buy, HFT akan dump. Force SHORT."
+            ),
+            "priority": -27990
+        }
+
+
 class FakeShortLiqWithExtremeDistribution:
     """
     🔥 PRIORITY -29800
@@ -21937,6 +22019,44 @@ class BinanceAnalyzer:
             result["reason"] = f"[STRONG BULLISH LOCK] {strong_bullish_lock['reason']} | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = strong_bullish_lock["priority"]
+            result["entry_allowed"] = True
+            return result
+
+        # ===== PRIORITY -28010: MASSIVE DISTRIBUTION OVERRIDE (DOGSUSDT FIX) =====
+        massive_dist = MassiveDistributionOverride.detect(
+            short_liq=short_liq,
+            obv_trend=obv_trend,
+            obv_value=obv_value,
+            ofi_bias=ofi_bias,
+            ofi_strength=ofi_strength,
+            exchange_safe_direction=result.get("exchange_safe_direction", "NEUTRAL"),
+            agg_json=agg_json_val,
+            up_energy=up_energy_val,
+            long_liq=long_liq
+        )
+        if massive_dist["override"]:
+            result["bias"] = massive_dist["bias"]
+            result["reason"] = f"[MASSIVE DISTRIBUTION] {massive_dist['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = massive_dist["priority"]
+            result["entry_allowed"] = True
+            return result
+
+        # ===== PRIORITY -27990: WEAK BUY PRESSURE FAKE SQUEEZE (BLESSUSDT FIX) =====
+        weak_buy_fake = WeakBuyPressureFakeSqueeze.detect(
+            short_liq=short_liq,
+            down_energy=down_energy_val,
+            up_energy=up_energy_val,
+            volume_ratio=volume_ratio,
+            obv_trend=obv_trend,
+            change_5m=change_5m_val,
+            long_liq=long_liq
+        )
+        if weak_buy_fake["override"]:
+            result["bias"] = weak_buy_fake["bias"]
+            result["reason"] = f"[WEAK BUY FAKE SQUEEZE] {weak_buy_fake['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = weak_buy_fake["priority"]
             result["entry_allowed"] = True
             return result
 
