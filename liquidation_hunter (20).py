@@ -741,6 +741,63 @@ class RSI5mBaitTrapShortOverride:
         return {"override": False}
 
 
+class GenuineSqueezeBreakoutOverride:
+    """
+    🔥 PRIORITY -29100: PIEVERSEUSDT 17:00 FIX
+    Mengatasi MANIPULATION+BAIT hard block pada genuine squeeze breakout.
+    Jika terjadi breakout dengan konsensus LONG dan kondisi squeeze terpenuhi,
+    batalkan hard block dan paksa LONG.
+    """
+    @staticmethod
+    def detect(market_phase: str, market_regime: str,
+               change_5m: float, volume_ratio: float,
+               down_energy: float, up_energy: float,
+               hft_bias: str, algo_bias: str,
+               short_liq: float, rsi14: float) -> dict:
+        
+        # Harus dalam kondisi yang biasanya di-block
+        if market_phase != "BAIT" or market_regime != "MANIPULATION":
+            return {"override": False}
+        
+        # Sudah breakout
+        if change_5m <= 2.5:
+            return {"override": False}
+        
+        # Volume rendah (ciri squeeze tipis)
+        if volume_ratio >= 0.5:
+            return {"override": False}
+        
+        # Tidak ada seller, ada buyer
+        if not (down_energy < 0.01 and up_energy > 1.0):
+            return {"override": False}
+        
+        # Konsensus internal LONG
+        if hft_bias != "LONG" or algo_bias != "LONG":
+            return {"override": False}
+        
+        # Target squeeze dekat
+        if short_liq >= 3.0:
+            return {"override": False}
+        
+        # RSI14 masih aman
+        if rsi14 >= 70:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "LONG",
+            "unblock": True,  # batalkan hard block
+            "reason": (
+                f"GENUINE SQUEEZE BREAKOUT OVERRIDE: "
+                f"BAIT+MANIPULATION regime, tapi price breakout {change_5m:.1f}%, "
+                f"vol={volume_ratio:.2f}x (thin), down_energy=0, up_energy={up_energy:.2f}, "
+                f"HFT/Algo consensus LONG, short_liq={short_liq:.2f}%, RSI14={rsi14:.1f} → "
+                f"ini genuine short squeeze, batalkan hard block. Force LONG."
+            ),
+            "priority": -29100
+        }
+
+
 class RSI5mAccumulationLongOverride:
     """
     🔥 PRIORITY -26350: RSI5M ACCUMULATION -> FORCE LONG
@@ -21775,6 +21832,29 @@ class BinanceAnalyzer:
             result["entry_allowed"] = True
             return result
         
+        # ===== PRIORITY -29100: GENUINE SQUEEZE BREAKOUT OVERRIDE (PIEVERSEUSDT FIX) =====
+        genuine_breakout = GenuineSqueezeBreakoutOverride.detect(
+            market_phase=market_phase,
+            market_regime=result.get("market_regime", "UNKNOWN"),
+            change_5m=change_5m_val,
+            volume_ratio=volume_ratio,
+            down_energy=down_energy_val,
+            up_energy=up_energy_val,
+            hft_bias=result.get("hft_6pct_bias", "NEUTRAL"),
+            algo_bias=result.get("algo_type_bias", "NEUTRAL"),
+            short_liq=short_liq,
+            rsi14=rsi14_val
+        )
+        if genuine_breakout["override"]:
+            result["bias"] = genuine_breakout["bias"]
+            result["reason"] = f"[GENUINE BREAKOUT] {genuine_breakout['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = genuine_breakout["priority"]
+            result["entry_allowed"] = True
+            # Batalkan flag regime_skip jika ada
+            result["regime_skip"] = False
+            return result
+        
         # ===== PRIORITY -28050: STRONG BULLISH CONSENSUS LOCK (PIEVERSEUSDT FIX) =====
         strong_bullish_lock = StrongBullishConsensusLock.detect(
             ofi_bias=ofi_bias,
@@ -22284,7 +22364,12 @@ class BinanceAnalyzer:
             # Update juga ofi jika perlu (tapi ofi dari result sudah pakai json)
         
         
-        if result.get("market_regime") == "MANIPULATION" and result.get("market_phase") == "BAIT":
+        # Cek apakah genuine breakout override sudah aktif (priority -29100 > -29000)
+        # Jika ya, jangan apply hard block ini
+        if result.get("priority_level", 0) == -29100 and result.get("entry_allowed", False):
+            # Genuine breakout override sudah aktif, skip hard block
+            pass
+        elif result.get("market_regime") == "MANIPULATION" and result.get("market_phase") == "BAIT":
             result["bias"] = "NEUTRAL"
             result["confidence"] = "BLOCK"
             result["entry_allowed"] = False
@@ -26565,7 +26650,12 @@ class BinanceAnalyzer:
             result["confidence"] = "ABSOLUTE"
             result["entry_allowed"] = False
 
-        if result.get("market_regime") == "MANIPULATION" and result.get("market_phase") == "BAIT":
+        # Cek apakah genuine breakout override sudah aktif (priority -29100 > -29000)
+        # Jika ya, jangan apply hard block ini
+        if result.get("priority_level", 0) == -29100 and result.get("entry_allowed", False):
+            # Genuine breakout override sudah aktif, skip hard block
+            pass
+        elif result.get("market_regime") == "MANIPULATION" and result.get("market_phase") == "BAIT":
             result["bias"] = "NEUTRAL"
             result["confidence"] = "BLOCK"
             result["entry_allowed"] = False
