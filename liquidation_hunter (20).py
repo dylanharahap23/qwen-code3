@@ -4997,6 +4997,67 @@ class ExtremeShortLiqNoSellerSqueezeGuard:
         return {"override": False}
 
 
+class UltraLowVolumeFakeSqueezeTrap:
+    """
+    🔥 PRIORITY -27520: GENIUSUSDT FIX
+    Deteksi jebakan squeeze di volume ultra-rendah.
+    short_liq dekat + down_energy=0 TAPI volume kering + Greeks/Exchange SHORT.
+    HFT memancing LONG untuk kemudian dump di pasar tipis.
+    Force SHORT.
+    """
+    @staticmethod
+    def detect(volume_ratio: float, short_liq: float,
+               greeks_kill_direction: str, exchange_safe_direction: str,
+               funding_rate: float, up_energy: float, down_energy: float,
+               rsi6_5m: float, change_5m: float,
+               greeks_who_dies_first: str = "") -> dict:
+        # Volume harus ultra rendah
+        if volume_ratio >= 0.5:
+            return {"override": False}
+        
+        # short_liq harus dekat (umpan)
+        if short_liq >= 2.0:
+            return {"override": False}
+        
+        # Greeks harus SHORT (long yang akan mati)
+        if greeks_kill_direction != "SHORT":
+            return {"override": False}
+        
+        # Konfirmasi bearish: Exchange safe SHORT ATAU funding positif (crowded long)
+        bearish_confirmed = (exchange_safe_direction == "SHORT" or 
+                             (funding_rate is not None and funding_rate > 0.0002))
+        if not bearish_confirmed:
+            return {"override": False}
+        
+        # Ilusi no seller: down_energy=0, up_energy ada
+        if down_energy >= 0.05 or up_energy <= 0.0:
+            return {"override": False}
+        
+        # RSI 5m tidak oversold (tidak ada alasan teknis untuk bounce)
+        if rsi6_5m >= 55:
+            return {"override": False}
+        
+        # Harga belum pump signifikan (masih dalam fase jebakan)
+        if not (-1.0 <= change_5m <= 2.0):
+            return {"override": False}
+        
+        # Opsional: who_dies_first belum jelas atau sudah LONG_TRADERS
+        if greeks_who_dies_first not in ("BOTH_POSSIBLE", "LONG_TRADERS", ""):
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"ULTRA LOW VOLUME FAKE SQUEEZE TRAP: vol={volume_ratio:.2f}x ultra dry, "
+                f"short_liq={short_liq:.2f}% (umpan), greeks_kill=SHORT, "
+                f"exchange_safe={exchange_safe_direction}, down_energy=0 ilusi, "
+                f"RSI5m={rsi6_5m:.1f} → HFT jebak LONG, dump di pasar tipis. Force SHORT."
+            ),
+            "priority": -27520
+        }
+
+
 class TrueShortSqueezeValidator:
     """
     🔥 PRIORITY -27450 (antara ExtremeShortLiqNoSeller -27400 dan ReverseSqueezeBait -27300):
@@ -22597,6 +22658,27 @@ class BinanceAnalyzer:
             result["reason"] = f"[EXTREME SHORT LIQ SQUEEZE] {extreme_short_guard['reason']} | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = extreme_short_guard["priority"]
+            result["entry_allowed"] = True
+            return result
+        
+        # ===== PRIORITY -27520: ULTRA LOW VOLUME FAKE SQUEEZE TRAP (GENIUSUSDT FIX) =====
+        ultra_low_fake_sqz = UltraLowVolumeFakeSqueezeTrap.detect(
+            volume_ratio=volume_ratio,
+            short_liq=short_liq,
+            greeks_kill_direction=result.get("greeks_kill_direction", ""),
+            exchange_safe_direction=result.get("exchange_safe_direction", "NEUTRAL"),
+            funding_rate=funding_rate_val,
+            up_energy=up_energy_val,
+            down_energy=down_energy_val,
+            rsi6_5m=rsi6_5m_val,
+            change_5m=change_5m_val,
+            greeks_who_dies_first=result.get("greeks_who_dies_first", "")
+        )
+        if ultra_low_fake_sqz["override"]:
+            result["bias"] = ultra_low_fake_sqz["bias"]
+            result["reason"] = f"[ULTRA LOW VOL FAKE SQZ] {ultra_low_fake_sqz['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = ultra_low_fake_sqz["priority"]
             result["entry_allowed"] = True
             return result
         
