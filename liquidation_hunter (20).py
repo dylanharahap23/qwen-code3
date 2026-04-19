@@ -21392,6 +21392,89 @@ class ShortLiqCloseStrongBuyPressure:
         return {"override": False}
 
 
+class FundingNegativeShortCrowdedFade:
+    """
+    🔥 PRIORITY -27600: PHBUSDT FIX
+    short_liq dekat + down_energy=0 + up_energy>0 TAPI funding negatif + Greeks delta SHORT.
+    Semua orang sudah SHORT, tidak ada yang bisa di-squeeze. HFT akan dump untuk buru long_liq.
+    Force SHORT.
+    """
+    @staticmethod
+    def detect(short_liq: float, down_energy: float, up_energy: float,
+               funding_rate: float, greeks_delta_crowded: str,
+               greeks_kill_direction: str, volume_ratio: float) -> dict:
+        
+        # Kondisi squeeze permukaan
+        if not (short_liq < 3.0 and down_energy < 0.01 and up_energy > 0.1):
+            return {"override": False}
+        
+        # Kontradiksi fatal
+        if funding_rate is None or funding_rate >= -0.0005:
+            return {"override": False}
+        if greeks_delta_crowded != "SHORT":
+            return {"override": False}
+        if greeks_kill_direction != "SHORT":
+            return {"override": False}
+        if volume_ratio >= 0.6:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"FUNDING NEGATIVE SHORT CROWDED FADE: "
+                f"short_liq={short_liq:.2f}% dekat, down_energy=0, up_energy={up_energy:.2f} "
+                f"TAPI funding={funding_rate:.6f} (crowded SHORT), "
+                f"greeks_delta={greeks_delta_crowded}, kill={greeks_kill_direction}, "
+                f"vol={volume_ratio:.2f}x → semua sudah SHORT, HFT akan dump. Force SHORT."
+            ),
+            "priority": -27600
+        }
+
+
+class StrongBullishConsensusLock:
+    """
+    🔥 PRIORITY -28050: PIEVERSEUSDT FIX
+    Ketika OFI, AGG, Energy, dan Greeks semuanya sepakat LONG dengan kekuatan penuh,
+    kunci bias ke LONG dan batalkan semua sinyal SHORT.
+    """
+    @staticmethod
+    def detect(ofi_bias: str, ofi_strength: float, agg: float,
+               up_energy: float, down_energy: float,
+               greeks_kill_direction: str, volume_ratio: float,
+               rsi6_5m: float, short_liq: float) -> dict:
+        
+        # Konsensus bullish sempurna
+        if not (ofi_bias == "LONG" and ofi_strength > 0.8):
+            return {"override": False}
+        if agg <= 0.7:
+            return {"override": False}
+        if not (up_energy > 2.0 and down_energy < 0.1):
+            return {"override": False}
+        if greeks_kill_direction != "LONG":
+            return {"override": False}
+        if volume_ratio <= 0.5:
+            return {"override": False}
+        if rsi6_5m >= 75:
+            return {"override": False}
+        if short_liq >= 5.0:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "LONG",
+            "lock": True,  # tandai bahwa tidak boleh di-override
+            "reason": (
+                f"STRONG BULLISH CONSENSUS LOCK: "
+                f"OFI LONG {ofi_strength:.2f}, agg={agg:.2f}, up_energy={up_energy:.2f}, "
+                f"down_energy={down_energy:.2f}, greeks_kill=LONG, vol={volume_ratio:.2f}x, RSI5m={rsi6_5m:.1f}, "
+                f"short_liq={short_liq:.2f}% → konsensus bullish sempurna. "
+                f"Batalkan semua sinyal SHORT. Force LONG."
+            ),
+            "priority": -28050
+        }
+
+
 class BinanceAnalyzer:
     def __init__(self, symbol: str):
         self.symbol = symbol.upper()
@@ -21637,6 +21720,44 @@ class BinanceAnalyzer:
             result["reason"] = f"[SHORT LIQ BUY PRESSURE] {short_liq_buy_pressure['reason']} | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = short_liq_buy_pressure["priority"]
+            result["entry_allowed"] = True
+            return result
+        
+        # ===== PRIORITY -28050: STRONG BULLISH CONSENSUS LOCK (PIEVERSEUSDT FIX) =====
+        strong_bullish_lock = StrongBullishConsensusLock.detect(
+            ofi_bias=ofi_bias,
+            ofi_strength=ofi_strength,
+            agg=agg_val,
+            up_energy=up_energy_val,
+            down_energy=down_energy_val,
+            greeks_kill_direction=result.get("greeks_kill_direction", ""),
+            volume_ratio=volume_ratio,
+            rsi6_5m=rsi6_5m_val,
+            short_liq=short_liq
+        )
+        if strong_bullish_lock["override"]:
+            result["bias"] = strong_bullish_lock["bias"]
+            result["reason"] = f"[STRONG BULLISH LOCK] {strong_bullish_lock['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = strong_bullish_lock["priority"]
+            result["entry_allowed"] = True
+            return result
+
+        # ===== PRIORITY -27600: FUNDING NEGATIVE SHORT CROWDED FADE (PHBUSDT FIX) =====
+        funding_short_fade = FundingNegativeShortCrowdedFade.detect(
+            short_liq=short_liq,
+            down_energy=down_energy_val,
+            up_energy=up_energy_val,
+            funding_rate=funding_rate_val,
+            greeks_delta_crowded=result.get("greeks_delta_crowded", ""),
+            greeks_kill_direction=result.get("greeks_kill_direction", ""),
+            volume_ratio=volume_ratio
+        )
+        if funding_short_fade["override"]:
+            result["bias"] = funding_short_fade["bias"]
+            result["reason"] = f"[FUNDING SHORT FADE] {funding_short_fade['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = funding_short_fade["priority"]
             result["entry_allowed"] = True
             return result
         
