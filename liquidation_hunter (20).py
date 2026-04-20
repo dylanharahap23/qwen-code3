@@ -22096,6 +22096,13 @@ class BinanceAnalyzer:
         self.last_agg_update = 0
         self.bait_start_time = None   # untuk Time-Weighted Patience Detector (Fix 4)
 
+        # ========== BIAS PERSISTENCE FILTER STATE ==========
+        self.last_executed_bias = None          # bias terakhir yang benar-benar diizinkan entry
+        self.last_executed_time = None          # timestamp eksekusi terakhir
+        self.last_flip_time = None              # timestamp flip terakhir
+        self.flip_count = 0                     # hitungan flip dalam window
+        self.last_signal_bias = None            # bias sinyal terakhir (untuk deteksi flip)
+
     def __del__(self):
         if hasattr(self, 'ws') and self.ws is not None:
             self.ws.stop()
@@ -22182,6 +22189,117 @@ class BinanceAnalyzer:
             }
 
         return {"valid": True, "reason": "Gamma execution valid", "new_bias": result.get("bias")}
+
+    def _apply_persistence_filter(self, result: dict) -> dict:
+        """
+        Menerapkan filter persistensi berdasarkan saran dosen + position holding.
+        Mengubah result['bias'], result['entry_allowed'], dll.
+        """
+        now = time.time()
+        current_bias = result.get("bias")
+        current_phase = result.get("market_phase", "UNKNOWN")
+        regime_age = result.get("regime_age_minutes", 0)
+        price = result.get("price", 0)
+        change_5m = result.get("change_5m", 0)
+        volume_ratio = result.get("volume_ratio", 1.0)
+        priority = result.get("priority_level", 0)
+        floating_pnl = self.state_mgr.get_floating_pnl_pct(price)
+        has_position = (self.state_mgr.last_bias is not None and self.state_mgr.last_bias != "NEUTRAL")
+
+        # ────────────────────────────────────────────────────────────
+        # RULE 1: Position Holding (floating PnL kecil & harga belum gerak signifikan)
+        # ────────────────────────────────────────────────────────────
+        if has_position and current_bias != self.state_mgr.last_bias:
+            # Floating loss < 2% atau profit < 3%
+            if abs(floating_pnl) < 2.0:
+                # Harga belum bergerak > 3% berlawanan arah
+                price_moved_against = (
+                    (self.state_mgr.last_bias == "LONG" and change_5m < -3.0) or
+                    (self.state_mgr.last_bias == "SHORT" and change_5m > 3.0)
+                )
+                if not price_moved_against:
+                    # Sinyal baru tidak memiliki prioritas sangat tinggi (< -10000)
+                    if priority >= -10000:
+                        result["bias"] = self.state_mgr.last_bias
+                        result["confidence"] = "HIGH"
+                        result["entry_allowed"] = False
+                        result["priority_level"] = -5000
+                        result["reason"] = f"[POSITION HOLD] Floating PnL {floating_pnl:.2f}%, menahan bias {self.state_mgr.last_bias} | " + result.get("reason", "")
+                        return result
+
+        # ────────────────────────────────────────────────────────────
+        # RULE 2: Deteksi flip (untuk tracking, bukan langsung blokir)
+        # ────────────────────────────────────────────────────────────
+        is_flip = (self.last_signal_bias is not None and 
+                   self.last_signal_bias != current_bias and 
+                   current_bias in ("LONG", "SHORT"))
+        
+        if is_flip:
+            if self.last_flip_time:
+                time_since_last_flip = (now - self.last_flip_time) / 60.0  # menit
+                if time_since_last_flip < 10:
+                    self.flip_count += 1
+                else:
+                    self.flip_count = 1
+            else:
+                self.flip_count = 1
+            self.last_flip_time = now
+        else:
+            # Reset flip count jika tidak flip
+            if self.last_flip_time and (now - self.last_flip_time) / 60.0 > 10:
+                self.flip_count = 0
+
+        # ────────────────────────────────────────────────────────────
+        # RULE 3: Choppy market (terlalu banyak flip)
+        # ────────────────────────────────────────────────────────────
+        if self.flip_count >= 2:
+            # Market choppy, jangan entry baru
+            result["entry_allowed"] = False
+            result["confidence"] = "BLOCK"
+            result["reason"] = f"[CHOPPY MARKET] {self.flip_count} flips in 10 menit, NO TRADE | " + result.get("reason", "")
+            # Jika ada posisi, tahan
+            if has_position:
+                result["bias"] = self.state_mgr.last_bias
+            else:
+                result["bias"] = "NEUTRAL"
+            return result
+
+        # ────────────────────────────────────────────────────────────
+        # RULE 4: Regime age terlalu muda → block entry baru
+        # ────────────────────────────────────────────────────────────
+        if not has_position and regime_age < 0.5:
+            result["entry_allowed"] = False
+            result["confidence"] = "BLOCK"
+            result["reason"] = f"[REGIME TOO YOUNG] regime_age={regime_age:.2f}m < 0.5m, NO ENTRY | " + result.get("reason", "")
+            # Jangan ubah bias, tapi entry tidak diizinkan
+            return result
+
+        # ────────────────────────────────────────────────────────────
+        # RULE 5: PREP/BAIT phase → block entry baru (kecuali sudah ada posisi)
+        # ────────────────────────────────────────────────────────────
+        if not has_position and current_phase in ("PREP", "BAIT"):
+            result["entry_allowed"] = False
+            result["confidence"] = "BLOCK"
+            result["reason"] = f"[PHASE BLOCK] {current_phase} phase, tunggu KILL phase | " + result.get("reason", "")
+            return result
+
+        # ────────────────────────────────────────────────────────────
+        # RULE 6: Minimum hold time (jangan flip sebelum 3 menit)
+        # ────────────────────────────────────────────────────────────
+        if has_position and self.last_executed_time:
+            hold_minutes = (now - self.last_executed_time) / 60.0
+            if hold_minutes < 3.0 and current_bias != self.state_mgr.last_bias:
+                result["bias"] = self.state_mgr.last_bias
+                result["confidence"] = "HIGH"
+                result["entry_allowed"] = False
+                result["reason"] = f"[MIN HOLD] Baru {hold_minutes:.1f}m sejak entry, tahan {self.state_mgr.last_bias} | " + result.get("reason", "")
+                return result
+
+        # ────────────────────────────────────────────────────────────
+        # Lolos semua filter
+        # ────────────────────────────────────────────────────────────
+        self.last_signal_bias = current_bias
+        return result
 
     def _apply_stability_filters(self, result: dict, phase_result, greeks_dict: dict) -> dict:
         """
@@ -27345,6 +27463,14 @@ class BinanceAnalyzer:
             result["priority_level"] = -29000
             result["reason"] = f"[MANIPULATION+BAIT HARD BLOCK] Regime MANIPULATION + BAIT phase -> NO TRADE | " + result.get("reason", "")
 
+        # ========== PERSISTENCE FILTER (GABUNGAN DOSEN + POSITION HOLDING) ==========
+        result = self._apply_persistence_filter(result)
+        
+        # Jika sinyal diizinkan entry dan bias bukan NEUTRAL, update state eksekusi
+        if result.get("entry_allowed") and result.get("bias") in ("LONG", "SHORT"):
+            self.last_executed_bias = result["bias"]
+            self.last_executed_time = time.time()
+        
         return result
 
     def analyze(self) -> Optional[Dict]:
