@@ -19,55 +19,55 @@ __pycache__/
 *.pyo
 *.pyd
 .Python
-env/
-venv/
-.venv/
-pip-log.txt
-pip-delete-this-directory.txt
-.tox/
+*.so
 .coverage
+htmlcov/
 .coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.log
-.git/
-.mypy_cache/
-.pytest_cache/
-.hypothesis/
+.python-version
 
-# Build and distribution artifacts
+# Build directories
 dist/
 build/
 *.egg-info/
-.eggs/
-.installed.cfg
-lib/
-lib64/
-parts/
-sdist/
-develop-eggs/
-downloads/
-eggs/
-.eggs/
-parts/
-var/
-*.fusebox/
-*.harmony-cache/
-.coverage/
-.nyc_output/
-coverage/
-junit.xml
-doc/
+
+# Virtual environments
+venv/
+.venv/
+env/
+.ENV/
+
+# Dependencies
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 
 # OS generated files
 .DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
 Thumbs.db
+ehthumbs.db
 Icon?
+.directory
+.Trashes
+
+# Testing
+.coverage*
+nosetests.xml
+coverage.xml
+*.cover
+*.gcda
+*.gcno
+*.gcov
+coverage/
+htmlcov/
+
+# IDE specific
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+*.tmproj
+nbproject/
 ```
