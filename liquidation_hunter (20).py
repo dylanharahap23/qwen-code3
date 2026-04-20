@@ -6,6 +6,7 @@
 🎯 Golden Rule: LONG UNTIL SHORT LIQ SWEPT / SHORT UNTIL LONG LIQ SWEPT
 🎯 Market Phase Detector: PREP (no trade) | BAIT (caution) | KILL (trade ok)
 🎯 Greeks Final Screener: Theta (Prep) | Vega (Bait) | Delta+Gamma (Kill) — 7% Rule
+🎯 LECTURER FIX v10: Atomic JSON Execution Lock, Analysis ID Binding, Signal Consistency Validation
 """
 
 import requests
@@ -20,6 +21,7 @@ import websocket
 import os
 from collections import deque
 from dataclasses import dataclass, field
+import uuid  # NEW: For generating unique analysis_id
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -66,6 +68,56 @@ _kill_direction_history: Dict[str, List[Tuple[float, str]]] = {}
 # ================= TIME DECAY GLOBAL =================
 LAST_SIGNAL = None
 LAST_SIGNAL_TIME = 0
+
+# ================= LECTURER FIX v10: SIGNAL CONSISTENCY VALIDATION =================
+def validate_signal_consistency(result: dict) -> bool:
+    """
+    Pastikan sinyal tidak mengandung kontradiksi internal sebelum eksekusi.
+    Rule:
+      1. Jika confidence BLOCK atau entry_allowed False, jangan pernah entry.
+      2. Jika bias NEUTRAL, jangan entry.
+      3. Jika priority_level sangat rendah (< -28000) dan ada tanda CONFLICT, block.
+      4. Jika dual_liq_trap aktif, block.
+      5. Jika bias_kill_conflict aktif, block.
+    
+    Returns:
+        bool: True jika sinyal konsisten dan aman untuk entry, False jika harus diblokir.
+    """
+    bias = result.get("bias")
+    entry_allowed = result.get("entry_allowed")
+    confidence = result.get("confidence")
+    priority = result.get("priority_level", 0)
+    reason = result.get("reason", "")
+    
+    # Rule 1: Jika confidence BLOCK atau entry_allowed False, jangan pernah entry.
+    if confidence == "BLOCK" or not entry_allowed:
+        return False
+    
+    # Rule 2: Jika bias NEUTRAL, jangan entry.
+    if bias == "NEUTRAL":
+        return False
+    
+    # Rule 3: Cek apakah priority_level sangat rendah (< -28000) tapi ada konflik internal
+    if priority < -28000 and "CONFLICT" in reason.upper():
+        return False
+    
+    # Rule 4: Dual Liq Trap detection (jika tersedia di result)
+    dual_liq_trap = result.get("dual_liq_trap", {})
+    if isinstance(dual_liq_trap, dict) and dual_liq_trap.get("dual_liq_trap", False):
+        return False
+    
+    # Rule 5: Bias-Kill Conflict detection (jika tersedia di result)
+    bias_kill_conflict = result.get("bias_kill_conflict", {})
+    if isinstance(bias_kill_conflict, dict) and bias_kill_conflict.get("has_conflict", False):
+        return False
+    
+    # Rule 6: Kill direction stability check (jika tersedia)
+    kill_direction_stability = result.get("kill_direction_stability", {})
+    if isinstance(kill_direction_stability, dict) and kill_direction_stability.get("danger", False):
+        return False
+    
+    return True
+
 
 # ================= MARKET PHASE DETECTOR =================
 
@@ -29582,8 +29634,13 @@ class BinanceAnalyzer:
                 volume_ratio, change_5m, oi_delta
             )
             
+            # LECTURER FIX v10: Generate unique analysis_id untuk tracking
+            analysis_id = str(uuid.uuid4())
+            timestamp_str = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            
             result = {
-                "timestamp": datetime.now().strftime("%H:%M:%S.%f")[:-3],
+                "analysis_id": analysis_id,  # NEW: Unique ID untuk setiap analisis
+                "timestamp": timestamp_str,
                 "symbol": self.symbol,
                 "price": round(price, 4),
                 "rsi6": round(rsi6, 1),
@@ -29896,8 +29953,13 @@ class BinanceAnalyzer:
         return result
 
     def _build_latency_result(self):
+        # LECTURER FIX v10: Generate unique analysis_id untuk tracking
+        analysis_id = str(uuid.uuid4())
+        timestamp_str = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        
         result = {
-            "timestamp": datetime.now().strftime("%H:%M:%S.%f")[:-3],
+            "analysis_id": analysis_id,  # NEW: Unique ID untuk setiap analisis
+            "timestamp": timestamp_str,
             "symbol": self.symbol,
             "price": 0.0,
             "bias": "WAIT",
@@ -29958,9 +30020,13 @@ class OutputFormatter:
 
     @staticmethod
     def print_signal(result: Dict):
+        # LECTURER FIX v10: Tampilkan analysis_id untuk tracking
+        analysis_id = result.get('analysis_id', 'N/A')
+        
         print("="*80)
         print(f"🔥 {result.get('symbol', 'UNKNOWN')} @ {result.get('timestamp', '')}")
         print(f"💰 Price: ${result.get('price', 0):.4f}")
+        print(f"🆔 Analysis ID: {analysis_id}")  # NEW: Display analysis_id
         print("="*80)
 
         print(f"\n{'='*40}")
@@ -29977,6 +30043,12 @@ class OutputFormatter:
         if result.get('entry_allowed') is not None:
             entry_status = "✅ ALLOWED" if result['entry_allowed'] else "⛔ WAIT"
             print(f"🚦 ENTRY STATUS: {entry_status} - {result.get('entry_reason', '')}")
+            
+            # LECTURER FIX v10: Tampilkan hasil validasi konsistensi sinyal
+            is_consistent = validate_signal_consistency(result)
+            consistency_icon = "✅ CONSISTENT" if is_consistent else "⚠️ INCONSISTENT - BLOCKED"
+            print(f"   └─ Signal Consistency: {consistency_icon}")
+            
             if result.get('entry_reason_delayed'):
                 print(f"   └─ Delayed Entry: {result.get('entry_reason_delayed')}")
             if result.get('kill_confirmation'):
@@ -30061,32 +30133,80 @@ def main():
     OutputFormatter.print_header()
 
     print(f"\n🔍 Analyzing {symbol}...")
+    
+    # LECTURER FIX v10: Atomic JSON Execution Lock
+    # Pastikan result yang digunakan untuk eksekusi adalah dictionary yang sama
+    # yang baru saja di-return oleh analyze(), bukan dari cache atau variabel lama
     result = analyzer.analyze()
 
     if result:
+        # Simpan analysis_id dan timestamp untuk logging
+        analysis_id = result.get("analysis_id")
+        timestamp = result.get("timestamp")
+        
+        # LECTURER FIX v10: Validasi konsistensi sinyal sebelum menampilkan/display
+        is_consistent = validate_signal_consistency(result)
+        
+        # Log decision dengan analysis_id untuk tracking
+        bias = result.get("bias", "NEUTRAL")
+        entry_allowed = result.get("entry_allowed", False)
+        confidence = result.get("confidence", "MEDIUM")
+        
+        print(f"\n📊 DECISION LOG:")
+        print(f"   Analysis ID: {analysis_id}")
+        print(f"   Timestamp: {timestamp}")
+        print(f"   Bias: {bias}")
+        print(f"   Entry Allowed: {entry_allowed}")
+        print(f"   Confidence: {confidence}")
+        print(f"   Consistency Check: {'✅ PASS' if is_consistent else '⚠️ FAIL'}")
+        
+        # Tampilkan display HANYA SETELAH validasi
         OutputFormatter.print_signal(result)
         print_greeks_section(result)
+        
+        # LECTURER FIX v10: Jika sinyal tidak konsisten, jangan lanjut ke eksekusi
+        if not is_consistent:
+            print("\n⛔ TRADING BLOCKED: Signal inconsistency detected!")
+            print("   Reason: Internal contradiction in signal data.")
+            print("   Action: Wait for next analysis cycle.")
 
     if len(sys.argv) > 2 and sys.argv[2] == "--loop":
         print("\n🔄 Auto-refresh every 10 seconds. Press Ctrl+C to stop.\n")
         try:
             while True:
                 time.sleep(10)
+                
+                # LECTURER FIX v10: Setiap loop, dapatkan result BARU dari analyze()
                 result = analyzer.analyze()
                 if result:
+                    # Validasi setiap iterasi
+                    is_consistent = validate_signal_consistency(result)
+                    analysis_id = result.get("analysis_id")
+                    
                     print("\n" + "="*80)
                     print(f"🔄 UPDATE @ {result['timestamp']}")
+                    print(f"🆔 Analysis ID: {analysis_id}")
                     print(f"🎯 Bias: {result['bias']} ({result['confidence']})")
                     print(f"📌 {result['reason']}")
+                    print(f"🚦 Entry: {'✅ ALLOWED' if result.get('entry_allowed') else '⛔ BLOCKED'}")
+                    print(f"✅ Consistency: {'PASS' if is_consistent else 'FAIL - NO TRADE'}")
+                    
+                    if not is_consistent:
+                        print("⛔ NO TRADE: Signal inconsistency detected!")
+                        
         except KeyboardInterrupt:
             print("\n\n👋 Stopped by user")
     else:
-        print(f"❌ Failed to analyze {symbol}")
+        if not result:
+            print(f"❌ Failed to analyze {symbol}")
 
 def api_mode(symbol: str) -> str:
     analyzer = BinanceAnalyzer(symbol)
     result = analyzer.analyze()
     if result:
+        # LECTURER FIX v10: Validasi konsistensi sebelum return JSON
+        is_consistent = validate_signal_consistency(result)
+        result["signal_consistent"] = is_consistent  # Tambahkan field validasi ke JSON
         return json.dumps(result, indent=2, default=str)
     return json.dumps({"error": f"Failed to analyze {symbol}"})
 
@@ -30105,11 +30225,18 @@ def batch_mode(symbols: List[str]):
         print(f"\n🔍 Analyzing {sym}...")
         result = analyzers[sym].analyze()
         if result:
+            # LECTURER FIX v10: Validasi konsistensi untuk setiap symbol
+            is_consistent = validate_signal_consistency(result)
+            result["signal_consistent"] = is_consistent
+            
             results.append(result)
             bias_icon = "🟢" if result['bias'] == "LONG" else "🔴" if result['bias'] == "SHORT" else "🟡"
             conf_icon = "⚡" if result['confidence'] == "ABSOLUTE" else "🔥" if result['confidence'] == "HIGH" else "📈"
-            print(f"{conf_icon} {bias_icon} {sym}: {result['bias']} ({result['confidence']})")
+            consistency_icon = "✅" if is_consistent else "⚠️"
+            print(f"{conf_icon} {bias_icon} {sym}: {result['bias']} ({result['confidence']}) {consistency_icon}")
             print(f" 📌 {result['reason']}")
+            if not is_consistent:
+                print(f"   └─ ⛔ SIGNAL INCONSISTENT - NO TRADE")
         else:
             print(f"❌ {sym}: Failed")
 
