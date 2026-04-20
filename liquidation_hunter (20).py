@@ -21441,6 +21441,57 @@ class LongLiqCloserButZeroSellers:
         return {"override": False}
 
 
+class CapitulationExhaustionBounce:
+    """
+    🔥 PRIORITY -28020: ORDIUSDT FIX
+    Deteksi capitulation ekstrem dengan buy pressure kuat di pasar tipis.
+    RSI < 12 + up_energy > 2.0 + down_energy = 0 + volume rendah.
+    Force LONG.
+    """
+    @staticmethod
+    def detect(rsi6: float, up_energy: float, down_energy: float,
+               volume_ratio: float, change_5m: float, rsi6_5m: float,
+               long_liq: float) -> dict:
+        
+        # Capitulation ekstrem
+        if rsi6 >= 12:
+            return {"override": False}
+        
+        # Buy pressure nyata
+        if up_energy <= 2.0:
+            return {"override": False}
+        if down_energy >= 0.05:
+            return {"override": False}
+        
+        # Pasar tipis (mudah bounce)
+        if volume_ratio >= 0.5:
+            return {"override": False}
+        
+        # Harga masih di bottom (belum rebound)
+        if change_5m >= 0.5:
+            return {"override": False}
+        
+        # RSI 5m tidak terlalu overbought
+        if rsi6_5m >= 75:
+            return {"override": False}
+        
+        # Ada target bounce (long_liq tidak terlalu jauh)
+        if long_liq >= 10.0:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "LONG",
+            "reason": (
+                f"CAPITULATION EXHAUSTION BOUNCE: RSI1m={rsi6:.1f} (<12), "
+                f"up_energy={up_energy:.2f}, down_energy={down_energy:.2f}, "
+                f"vol={volume_ratio:.2f}x, change={change_5m:.1f}%, RSI5m={rsi6_5m:.1f} → "
+                f"buyer masuk di bottom, bounce imminent. Force LONG."
+            ),
+            "priority": -28020
+        }
+
+
 class ExtremeOverboughtPostSqueezeReversal:
     """
     🔥 PRIORITY -27970: SIRENUSDT FIX
@@ -21914,6 +21965,24 @@ class BinanceAnalyzer:
             result["reason"] = f"[LONG LIQ ZERO SELLER] {long_liq_zero_seller['reason']} | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = long_liq_zero_seller["priority"]
+            result["entry_allowed"] = True
+            return result
+
+        # ===== PRIORITY -28020: CAPITULATION EXHAUSTION BOUNCE (ORDIUSDT FIX) =====
+        cap_exhaustion = CapitulationExhaustionBounce.detect(
+            rsi6=rsi6_val,
+            up_energy=up_energy_val,
+            down_energy=down_energy_val,
+            volume_ratio=volume_ratio,
+            change_5m=change_5m_val,
+            rsi6_5m=rsi6_5m_val,
+            long_liq=long_liq
+        )
+        if cap_exhaustion["override"]:
+            result["bias"] = cap_exhaustion["bias"]
+            result["reason"] = f"[CAPITULATION EXHAUSTION] {cap_exhaustion['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = cap_exhaustion["priority"]
             result["entry_allowed"] = True
             return result
 
