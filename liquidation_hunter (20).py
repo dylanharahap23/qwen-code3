@@ -7232,6 +7232,91 @@ class DipThenRipSweep:
         return {"override": False}
 
 
+class SymmetricLiquidityBaitTrap:
+    """
+    🔥 PRIORITY -27480 (LEBIH TINGGI DARI TRUE SQUEEZE VALIDATOR -27450)
+    
+    Membatalkan sinyal squeeze ketika short_liq dan long_liq hampir sama,
+    dan ada indikasi jebakan (Vega aktif, OFI berlawanan).
+    """
+    @staticmethod
+    def detect(
+        short_liq: float,
+        long_liq: float,
+        market_phase: str,
+        vega_active: bool,
+        ofi_bias: str,
+        ofi_strength: float,
+        agg: float,
+        volume_ratio: float,
+        current_bias: str  # bias yang akan dihasilkan oleh sistem (LONG/SHORT)
+    ) -> dict:
+        
+        # 1. Selisih likuiditas sangat kecil
+        if abs(short_liq - long_liq) >= 0.5:
+            return {"override": False}
+        
+        # 2. Harus ada indikasi jebakan (BAIT phase atau Vega aktif)
+        if not (market_phase == "BAIT" or vega_active):
+            return {"override": False}
+        
+        # 3. Volume rendah (likuiditas tipis)
+        if volume_ratio >= 1.0:
+            return {"override": False}
+        
+        # 4. Cek apakah OFI atau agg bertentangan dengan bias squeeze
+        #    (squeeze akan memaksa LONG jika short_liq < long_liq)
+        squeeze_direction = "LONG" if short_liq < long_liq else "SHORT"
+        
+        # Jika sistem akan output LONG, tapi OFI SHORT kuat → jebakan
+        if squeeze_direction == "LONG" and current_bias == "LONG":
+            if ofi_bias == "SHORT" and ofi_strength > 0.7:
+                return {
+                    "override": True,
+                    "bias": "NEUTRAL",
+                    "reason": (
+                        f"SYMMETRIC LIQUIDITY BAIT: short_liq={short_liq:.2f}% vs long_liq={long_liq:.2f}% "
+                        f"(selisih {abs(short_liq-long_liq):.2f}%), BAIT phase, OFI SHORT {ofi_strength:.2f} → "
+                        f"squeeze signal palsu, jangan LONG"
+                    ),
+                    "priority": -27480
+                }
+            if agg < 0.45 and ofi_bias == "SHORT":
+                return {
+                    "override": True,
+                    "bias": "NEUTRAL",
+                    "reason": (
+                        f"SYMMETRIC LIQUIDITY BAIT: agg={agg:.2f} (sell dominant) + OFI SHORT → "
+                        f"squeeze tidak valid, NO TRADE"
+                    ),
+                    "priority": -27480
+                }
+        
+        # Mirror untuk SHORT
+        if squeeze_direction == "SHORT" and current_bias == "SHORT":
+            if ofi_bias == "LONG" and ofi_strength > 0.7:
+                return {
+                    "override": True,
+                    "bias": "NEUTRAL",
+                    "reason": (
+                        f"SYMMETRIC LIQUIDITY BAIT: OFI LONG kuat, jangan SHORT"
+                    ),
+                    "priority": -27480
+                }
+            if agg > 0.55 and ofi_bias == "LONG":
+                return {
+                    "override": True,
+                    "bias": "NEUTRAL",
+                    "reason": (
+                        f"SYMMETRIC LIQUIDITY BAIT: agg={agg:.2f} (buy dominant) + OFI LONG → "
+                        f"dump signal tidak valid, NO TRADE"
+                    ),
+                    "priority": -27480
+                }
+        
+        return {"override": False}
+
+
 class AggSpoofDumpGuardValidator:
     """
     AggSpoofingActiveDumpGuard sering salah ketika:
@@ -23670,6 +23755,27 @@ class BinanceAnalyzer:
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = rsi_tf_divergence["priority"]
             result["entry_allowed"] = True
+            return result
+        
+        # ===== PRIORITY -27480: SYMMETRIC LIQUIDITY BAIT TRAP ==========
+        # Cegah false squeeze saat kedua liq hampir sama
+        symmetric_bait = SymmetricLiquidityBaitTrap.detect(
+            short_liq=short_liq,
+            long_liq=long_liq,
+            market_phase=market_phase,
+            vega_active=result.get("greeks_vega_active", False),
+            ofi_bias=ofi_bias,
+            ofi_strength=ofi_strength,
+            agg=agg_val,
+            volume_ratio=volume_ratio,
+            current_bias=result.get("bias", "NEUTRAL")
+        )
+        if symmetric_bait["override"]:
+            result["bias"] = symmetric_bait["bias"]
+            result["reason"] = f"[SYMMETRIC BAIT] {symmetric_bait['reason']} | " + result.get("reason", "")
+            result["confidence"] = "BLOCK"
+            result["entry_allowed"] = False
+            result["priority_level"] = symmetric_bait["priority"]
             return result
         
         # ===== PRIORITY -27500: MAXIMUM CROWDING ABSOLUTE BLOCK (TERTINGGI ABSOLUT BARU) =====
