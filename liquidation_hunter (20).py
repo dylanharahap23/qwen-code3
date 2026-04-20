@@ -21608,6 +21608,55 @@ class MaxCrowdingMicroSweepThenDump:
         }
 
 
+class ExtendedMicroSweepThenDump:
+    """
+    🔥 PRIORITY -28005: ORDIUSDT 05:53 FIX (NEW CLASS)
+    Versi lebih longgar dari MaxCrowdingMicroSweepThenDump.
+    short_liq < 1.0% sebagai umpan + delta_exposure > 92% + sinyal blow-off.
+    Force SHORT.
+    """
+    @staticmethod
+    def detect(short_liq: float, long_liq: float,
+               delta_exposure: float, stoch_j: float, rsi6_5m: float,
+               exchange_risk_score: int, exchange_safe_direction: str,
+               volume_ratio: float, funding_rate: float = 0.0) -> dict:
+        
+        # 1. Umpan dekat (threshold 1.0%)
+        if short_liq >= 1.0:
+            return {"override": False}
+        if long_liq <= short_liq * 5:
+            return {"override": False}
+        
+        # 2. Pasar jenuh LONG
+        if delta_exposure < 0.92:
+            return {"override": False}
+        
+        # 3. Sinyal blow-off (prioritaskan RSI 5m > 75)
+        if rsi6_5m <= 75:
+            return {"override": False}
+        
+        # 4. Konfirmasi risiko Exchange
+        if exchange_risk_score < 5 and exchange_safe_direction != "SHORT":
+            return {"override": False}
+        
+        # 5. Volume rendah
+        if volume_ratio >= 0.6:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"EXTENDED MICRO-SWEEP THEN DUMP: "
+                f"short_liq={short_liq:.2f}% (umpan, <1.0%), long_liq={long_liq:.2f}% (target, ratio {long_liq/short_liq:.1f}x), "
+                f"delta_exposure={delta_exposure:.3f} (>0.92), RSI5m={rsi6_5m:.1f} (>75, blow-off), "
+                f"exchange_risk={exchange_risk_score}/10, safe_dir={exchange_safe_direction}, "
+                f"vol={volume_ratio:.2f}x → HFT jebak LONG dengan micro-sweep, dump besar. Force SHORT."
+            ),
+            "priority": -28005
+        }
+
+
 class ShortLiqCloseStrongBuyPressure:
     """
     🔥 PRIORITY -27950: GWEIUSDT FIX
@@ -22164,6 +22213,26 @@ class BinanceAnalyzer:
             result["reason"] = f"[MAX CROWDING SWEEP-DUMP] {max_crowding_sweep['reason']} | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = max_crowding_sweep["priority"]
+            result["entry_allowed"] = True
+            return result
+        
+        # ===== PRIORITY -28005: EXTENDED MICRO-SWEEP THEN DUMP (ORDIUSDT 05:53 FIX) =====
+        extended_micro_sweep = ExtendedMicroSweepThenDump.detect(
+            short_liq=short_liq,
+            long_liq=long_liq,
+            delta_exposure=result.get("greeks_delta_exposure", 0),
+            stoch_j=stoch_j_val,
+            rsi6_5m=rsi6_5m_val,
+            exchange_risk_score=result.get("exchange_risk_score", 0),
+            exchange_safe_direction=result.get("exchange_safe_direction", "NEUTRAL"),
+            volume_ratio=volume_ratio,
+            funding_rate=funding_rate_val
+        )
+        if extended_micro_sweep["override"]:
+            result["bias"] = extended_micro_sweep["bias"]
+            result["reason"] = f"[EXTENDED MICRO-SWEEP] {extended_micro_sweep['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = extended_micro_sweep["priority"]
             result["entry_allowed"] = True
             return result
         
