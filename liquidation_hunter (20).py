@@ -4419,6 +4419,49 @@ class FakeRSIDivergenceSqueezeOverride:
         }
 
 
+class ExtremeOversoldBounceOverride:
+    """
+    🔥 PRIORITY -28200: ORDIUSDT FIX
+    RSI 1m < 10极度超卖 + down_energy=0 + up_energy强劲。
+    这是恐慌性抛售衰竭的反弹信号，覆盖RSI背离陷阱。强制 LONG。
+    
+    Detection Conditions:
+      • rsi6 < 10 (1m extreme oversold)
+      • change_5m < 0 (recent price decline)
+      • down_energy < 0.1 (almost no selling pressure)
+      • up_energy > 2.0 (strong buying pressure present)
+      • volume_ratio < 0.8 (not panic volume)
+      • long_liq exists but not extremely close (avoid confusion with cascade)
+    """
+    @staticmethod
+    def detect(rsi6: float, change_5m: float, down_energy: float,
+               up_energy: float, volume_ratio: float, long_liq: float,
+               greeks_kill_direction: str = "") -> dict:
+        if rsi6 >= 10:
+            return {"override": False}
+        if change_5m >= 0:
+            return {"override": False}
+        if down_energy >= 0.1:
+            return {"override": False}
+        if up_energy <= 2.0:
+            return {"override": False}
+        if volume_ratio >= 0.8:
+            return {"override": False}
+        # Avoid misjudgment during cascade dump (long_liq very close and greeks confirms SHORT)
+        if long_liq < 1.0 and greeks_kill_direction == "SHORT":
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "LONG",
+            "reason": (
+                f"EXTREME OVERSOLD BOUNCE: RSI1m={rsi6:.1f} (<10), price down {change_5m:.1f}%, "
+                f"down_energy=0, up_energy={up_energy:.2f} → 卖压衰竭，买盘介入，强制 LONG。"
+            ),
+            "priority": -28200
+        }
+
+
 class QuietAccumulationLongOverride:
     """
     PRIORITY -28070: Quiet Accumulation in BAIT Phase → Force LONG
@@ -23237,6 +23280,26 @@ class BinanceAnalyzer:
             result["reason"] = f"[OBV-GREEKS BOUNCE] {obv_greeks_override['reason']} | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = obv_greeks_override["priority"]
+            result["entry_allowed"] = True
+            return result
+
+        # ===== PRIORITY -28200: EXTREME OVERSOLD BOUNCE OVERRIDE (ORDIUSDT FIX) =====
+        # RSI 1m < 10极度超卖 + down_energy=0 + up_energy强劲 → 恐慌性抛售衰竭的反弹信号
+        # This must be called BEFORE RSI TF Divergence Trap (-27955) to override bearish divergence traps
+        extreme_oversold_bounce = ExtremeOversoldBounceOverride.detect(
+            rsi6=rsi6_val,
+            change_5m=change_5m_val,
+            down_energy=down_energy_val,
+            up_energy=up_energy_val,
+            volume_ratio=volume_ratio,
+            long_liq=long_liq,
+            greeks_kill_direction=result.get("greeks_kill_direction", "")
+        )
+        if extreme_oversold_bounce["override"]:
+            result["bias"] = extreme_oversold_bounce["bias"]
+            result["reason"] = f"[EXTREME OVERSOLD BOUNCE] {extreme_oversold_bounce['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = extreme_oversold_bounce["priority"]
             result["entry_allowed"] = True
             return result
 
