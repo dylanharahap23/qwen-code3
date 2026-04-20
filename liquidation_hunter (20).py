@@ -6076,6 +6076,42 @@ class RSI5mOverboughtAskWallNoSellerTrap:
         return {"override": False}
 
 
+class VegaFadeOverride:
+    """
+    🔥 PRIORITY -10050 (TERTINGGI): VEGA FADE DI BAIT PHASE
+    
+    Jika market_phase == BAIT, Vega aktif (score >=5), dan volume rendah,
+    maka gerakan harga 5 menit terakhir adalah PALSU.
+    Arah yang benar adalah LAWAN dari gerakan tersebut (fade).
+    
+    Kondisi:
+    - market_phase == "BAIT"
+    - greeks_vega_active == True
+    - greeks_vega_score >= 5
+    - volume_ratio < 0.7
+    """
+    @staticmethod
+    def detect(market_phase: str, vega_active: bool, vega_score: int,
+               volume_ratio: float, change_5m: float) -> dict:
+        if (market_phase == "BAIT" and 
+            vega_active and 
+            vega_score >= 5 and 
+            volume_ratio < 0.7):
+            
+            fade_direction = "SHORT" if change_5m > 0 else "LONG"
+            return {
+                "override": True,
+                "bias": fade_direction,
+                "reason": (
+                    f"VEGA FADE OVERRIDE: BAIT phase + Vega active (score={vega_score}/6), "
+                    f"volume={volume_ratio:.2f}x → fake {('UP' if change_5m>0 else 'DOWN')} move, "
+                    f"fade to {fade_direction}"
+                ),
+                "priority": -10050
+            }
+        return {"override": False}
+
+
 class NoSellerNoBuyerOverride:
     """
     🔥 PRIORITY -20000: Jika down_energy == 0 → TIDAK ADA SELLER → LONG.
@@ -22000,6 +22036,77 @@ class BinanceAnalyzer:
         # Jika algo 显示与 JSON 矛盾，采用 JSON
         if result.get("algo_type_bias", "NEUTRAL") != json_algo:
             result["algo_type_bias"] = json_algo
+        
+        # ========== STEP 1: VEGA FADE OVERRIDE (PRIORITY -10050) ==========
+        vega_fade = VegaFadeOverride.detect(
+            market_phase=market_phase,
+            vega_active=result.get("greeks_vega_active", False),
+            vega_score=result.get("greeks_vega_score", 0),
+            volume_ratio=volume_ratio,
+            change_5m=change_5m_val
+        )
+        if vega_fade["override"]:
+            result["bias"] = vega_fade["bias"]
+            result["reason"] = f"[VEGA FADE] {vega_fade['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = vega_fade["priority"]
+            result["entry_allowed"] = True
+            return result  # Keluar lebih awal, tidak perlu filter lain
+        
+        # ========== STEP 2: CONFLICT DETECTION (GREEKS vs FINAL BIAS) ==========
+        greeks_bias = result.get("greeks_bias", "NEUTRAL")
+        final_bias_current = result.get("bias", "NEUTRAL")
+        greeks_override_active = result.get("greeks_override", False)
+        gamma_executing = result.get("greeks_gamma_executing", False)
+
+        if (greeks_bias in ("LONG", "SHORT") and 
+            final_bias_current in ("LONG", "SHORT") and
+            greeks_bias != final_bias_current and
+            not gamma_executing):
+            # Konflik terdeteksi dan gamma belum jalan → BLOCK
+            result["bias"] = "NEUTRAL"
+            result["confidence"] = "BLOCK"
+            result["entry_allowed"] = False
+            result["priority_level"] = -10040
+            result["reason"] = (
+                f"[CONFLICT BLOCK] Greeks={greeks_bias} vs Final={final_bias_current}, "
+                f"gamma_executing=False → arah tidak jelas, NO TRADE | " + result.get("reason", "")
+            )
+            return result
+        
+        # ========== STEP 3: BAIT PHASE HARD BLOCK (3 SINYAL + VOLUME < 0.7) ==========
+        phase_sub = result.get("phase_sub_signals", {})
+        if (market_phase == "BAIT" and
+            phase_sub.get("low_volume") and
+            phase_sub.get("obv_not_confirming") and
+            phase_sub.get("one_sided_energy") and
+            volume_ratio < 0.7):
+        
+            result["bias"] = "NEUTRAL"
+            result["confidence"] = "BLOCK"
+            result["entry_allowed"] = False
+            result["priority_level"] = -10030
+            result["reason"] = (
+                f"[BAIT HARD BLOCK] BAIT phase dengan 3/3 sinyal + volume {volume_ratio:.2f}x < 0.7 → "
+                f"gerakan palsu, NO TRADE | " + result.get("reason", "")
+            )
+            return result
+        
+        # ========== STEP 4: PRE-KILL READINESS CHECK ==========
+        pre_kill = result.get("greeks_pre_kill", {})
+        if pre_kill.get("override"):
+            kill_speed = result.get("greeks_kill_speed", 0.0)
+            gamma_executing = result.get("greeks_gamma_executing", False)
+            if kill_speed < 6.0 and not gamma_executing:
+                result["bias"] = "NEUTRAL"
+                result["confidence"] = "BLOCK"
+                result["entry_allowed"] = False
+                result["priority_level"] = -10020
+                result["reason"] = (
+                    f"[PRE-KILL NOT READY] kill_speed={kill_speed:.1f} < 6.0, gamma_executing=False → "
+                    f"tunggu eksekusi nyata | " + result.get("reason", "")
+                )
+                return result
         
         # ===== NEW DETECTORS (LECTURER'S SARAN: TAUSDT, SIRENUSDT, AIOTUSDT, GWEIUSDT) =====
 
