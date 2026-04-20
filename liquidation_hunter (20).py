@@ -14002,28 +14002,52 @@ class OverboughtFalseBounceTrap:
 
 class ExtremeOversoldBounceOverride:
     """
-    🔥 Memaksa LONG pada oversold ekstrem dengan OFI LONG kuat.
-    Priority -150
+    🔥 PRIORITY -28020 (ditingkatkan dari -150 untuk ORDIUSDT)
+    Memaksa LONG pada capitulation ekstrem.
+    Dua jalur:
+    1. Drop besar (>5%) + OFI LONG kuat.
+    2. RSI < 10 + up_energy kuat + no seller + volume rendah.
     """
     @staticmethod
     def detect(rsi6: float, volume_ratio: float, change_5m: float,
-               ofi_bias: str, ofi_strength: float, long_liq: float) -> Dict:
-        if (rsi6 < 25
-                and volume_ratio < 0.8
-                and change_5m < -5.0
-                and ofi_bias == "LONG"
-                and ofi_strength > 0.7):
+               ofi_bias: str, ofi_strength: float, long_liq: float,
+               up_energy: float = 0.0, down_energy: float = 0.0,
+               rsi6_5m: float = 50.0) -> Dict:
+        
+        # === JALUR 1: Drop besar + OFI LONG ===
+        if (rsi6 < 25 and volume_ratio < 0.8 and change_5m < -5.0
+                and ofi_bias == "LONG" and ofi_strength > 0.7):
             if long_liq < 1.5:
                 return {"override": False}
             return {
                 "override": True,
                 "bias": "LONG",
                 "reason": (
-                    f"Extreme oversold with strong OFI LONG: price down {change_5m:.1f}%, "
+                    f"EXTREME OVERSOLD BOUNCE (DROP): price down {change_5m:.1f}%, "
                     f"RSI {rsi6:.1f}, volume {volume_ratio:.2f}x → bounce imminent"
                 ),
-                "priority": -150
+                "priority": -28020  # tingkatkan prioritas
             }
+        
+        # === JALUR 2 (BARU): Capitulation ekstrem dengan buy pressure kuat ===
+        # ORDIUSDT: RSI 5.4, up_energy 3.23, down_energy 0, vol 0.34x
+        if (rsi6 < 10 and up_energy > 2.0 and down_energy < 0.01
+                and volume_ratio < 0.5 and change_5m < 0):  # harga masih turun/flat
+            # Jangan trigger jika RSI 5m sudah overbought (>75) dan ada divergensi besar
+            if rsi6_5m > 75:
+                return {"override": False}
+            
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": (
+                    f"EXTREME CAPITULATION EXHAUSTION: RSI1m={rsi6:.1f} (<10), "
+                    f"up_energy={up_energy:.2f}, down_energy=0, vol={volume_ratio:.2f}x → "
+                    f"buyer masuk di bottom, bounce imminent. Force LONG."
+                ),
+                "priority": -28020
+            }
+        
         return {"override": False}
 
 
@@ -28725,7 +28749,8 @@ class BinanceAnalyzer:
 
             # ========== EXTREME OVERSOLD/OVERBOUGHT BOUNCE/DUMP OVERRIDE ==========
             extreme_oversold_bounce = ExtremeOversoldBounceOverride.detect(
-                rsi6, volume_ratio, change_5m, ofi["bias"], ofi["strength"], liq["long_dist"]
+                rsi6, volume_ratio, change_5m, ofi["bias"], ofi["strength"], liq["long_dist"],
+                up_energy=up_energy_val, down_energy=down_energy_val, rsi6_5m=rsi6_5m_val
             )
             if extreme_oversold_bounce["override"]:
                 final_bias = extreme_oversold_bounce["bias"]
