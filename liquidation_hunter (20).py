@@ -21558,10 +21558,8 @@ class UltraLowVolumeOBVExtremeReversal:
 
 class MaxCrowdingMicroSweepThenDump:
     """
-    🔥 PRIORITY -28000: GRIFFAINUSDT FIX
-    short_liq < 0.5% sebagai umpan + delta_exposure > 92% (jenuh) + sinyal blow-off.
-    Ini adalah jebakan "Sweep then Dump". HFT akan naikkan harga sedikit untuk menyapu short stop,
-    lalu menjatuhkan harga ke long_liq yang jauh lebih besar.
+    🔥 PRIORITY -28000: ORDIUSDT 05:53 FIX (threshold diperlonggar)
+    short_liq < 1.0% sebagai umpan + delta_exposure > 92% + sinyal blow-off.
     Force SHORT.
     """
     @staticmethod
@@ -21570,8 +21568,8 @@ class MaxCrowdingMicroSweepThenDump:
                exchange_risk_score: int, exchange_safe_direction: str,
                volume_ratio: float, funding_rate: float = 0.0) -> dict:
         
-        # 1. Umpan dekat, target jauh
-        if short_liq >= 0.5 or long_liq <= short_liq * 5:
+        # 1. Umpan dekat (threshold diperlonggar ke 1.0)
+        if short_liq >= 1.0 or long_liq <= short_liq * 5:
             return {"override": False}
         
         # 2. Pasar jenuh LONG
@@ -21598,11 +21596,11 @@ class MaxCrowdingMicroSweepThenDump:
             "reason": (
                 f"MAX CROWDING MICRO-SWEEP THEN DUMP: "
                 f"short_liq={short_liq:.2f}% (umpan), long_liq={long_liq:.2f}% (target, ratio {long_liq/short_liq:.1f}x), "
-                f"delta_exposure={delta_exposure:.3f} (>{0.92}, pasar jenuh LONG), "
+                f"delta_exposure={delta_exposure:.3f} (>0.92, pasar jenuh LONG), "
                 f"stoch_j={stoch_j:.1f}, RSI5m={rsi6_5m:.1f} (blow-off), "
                 f"exchange_risk={exchange_risk_score}/10, safe_dir={exchange_safe_direction}, "
                 f"vol={volume_ratio:.2f}x → "
-                f"HFT naikkan harga sedikit untuk jebak LONG, lalu dump besar ke long_liq. Force SHORT."
+                f"HFT naikkan harga sedikit untuk jebak LONG, lalu dump besar. Force SHORT."
             ),
             "priority": -28000
         }
@@ -22014,7 +22012,27 @@ class BinanceAnalyzer:
             result["entry_allowed"] = True
             return result
 
-        # 4. GWEIUSDT Pattern: Short liq close + strong buy pressure → force LONG
+        # ===== PRIORITY -28000: MAX CROWDING MICRO-SWEEP THEN DUMP (ORDIUSDT FIX) =====
+        max_crowding_sweep = MaxCrowdingMicroSweepThenDump.detect(
+            short_liq=short_liq,
+            long_liq=long_liq,
+            delta_exposure=result.get("greeks_delta_exposure", 0),
+            stoch_j=stoch_j_val,
+            rsi6_5m=rsi6_5m_val,
+            exchange_risk_score=result.get("exchange_risk_score", 0),
+            exchange_safe_direction=result.get("exchange_safe_direction", "NEUTRAL"),
+            volume_ratio=volume_ratio,
+            funding_rate=funding_rate_val
+        )
+        if max_crowding_sweep["override"]:
+            result["bias"] = max_crowding_sweep["bias"]
+            result["reason"] = f"[MAX CROWDING SWEEP-DUMP] {max_crowding_sweep['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = max_crowding_sweep["priority"]
+            result["entry_allowed"] = True
+            return result
+        
+        # ===== PRIORITY -27950: SHORT LIQ CLOSE + STRONG BUY PRESSURE =====
         short_liq_buy_pressure = ShortLiqCloseStrongBuyPressure.detect(
             short_liq=short_liq, long_liq=long_liq,
             agg=agg_val, up_energy=up_energy_val, down_energy=down_energy_val,
@@ -22144,26 +22162,6 @@ class BinanceAnalyzer:
             result["reason"] = f"[FUNDING SHORT FADE] {funding_short_fade['reason']} | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = funding_short_fade["priority"]
-            result["entry_allowed"] = True
-            return result
-        
-        # ===== PRIORITY -28000: MAX CROWDING MICRO-SWEEP THEN DUMP (GRIFFAINUSDT FIX) =====
-        max_crowding_sweep = MaxCrowdingMicroSweepThenDump.detect(
-            short_liq=short_liq,
-            long_liq=long_liq,
-            delta_exposure=result.get("greeks_delta_exposure", 0),
-            stoch_j=stoch_j_val,
-            rsi6_5m=rsi6_5m_val,
-            exchange_risk_score=result.get("exchange_risk_score", 0),
-            exchange_safe_direction=result.get("exchange_safe_direction", "NEUTRAL"),
-            volume_ratio=volume_ratio,
-            funding_rate=funding_rate_val
-        )
-        if max_crowding_sweep["override"]:
-            result["bias"] = max_crowding_sweep["bias"]
-            result["reason"] = f"[MAX CROWDING SWEEP-DUMP] {max_crowding_sweep['reason']} | " + result.get("reason", "")
-            result["confidence"] = "ABSOLUTE"
-            result["priority_level"] = max_crowding_sweep["priority"]
             result["entry_allowed"] = True
             return result
         
