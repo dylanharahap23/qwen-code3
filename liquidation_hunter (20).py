@@ -6201,6 +6201,73 @@ class GenuineShortSqueezeAbsolute:
         return {"override": False}
 
 
+class AskWallRSI5mOverboughtTrap:
+    """
+    🔥 PRIORITY -10055 (LEBIH TINGGI DARI VEGA FADE -10050)
+    
+    Membatalkan sinyal LONG dari Vega Fade atau reversal ketika:
+    - Ask wall sangat dominan (ask/bid > 10x)
+    - RSI 5m masih overbought (>70) → trend turun belum selesai
+    - Likuiditas jauh (>5%) → tidak ada magnet bounce dekat
+    - Volume rendah (<0.7x) → tidak ada kekuatan beli nyata
+    
+    Dalam kondisi ini, "fake down move" sebenarnya adalah KELANJUTAN TREND TURUN.
+    """
+    @staticmethod
+    def detect(
+        ask_slope: float,
+        bid_slope: float,
+        rsi6_5m: float,
+        short_liq: float,
+        long_liq: float,
+        volume_ratio: float,
+        change_5m: float,
+        ofi_bias: str,
+        agg: float
+    ) -> dict:
+        
+        if bid_slope <= 0:
+            return {"override": False}
+        
+        ask_bid_ratio = ask_slope / bid_slope
+        
+        # Syarat utama: ask wall ekstrem + RSI 5m overbought
+        if not (ask_bid_ratio > 10.0 and rsi6_5m > 70):
+            return {"override": False}
+        
+        # Likuiditas jauh (tidak ada target dekat)
+        if short_liq < 5.0 or long_liq < 5.0:
+            return {"override": False}
+        
+        # Volume rendah
+        if volume_ratio > 0.7:
+            return {"override": False}
+        
+        # Harga sedang turun (konsisten dengan ask wall)
+        if change_5m > 0:
+            return {"override": False}
+        
+        # Konfirmasi tambahan: OFI tidak LONG kuat, agg tidak bullish
+        bullish_orderflow = (ofi_bias == "LONG" and agg > 0.7)
+        if bullish_orderflow:
+            # Jika order flow benar-benar bullish, mungkin ini genuine bounce
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"ASK WALL + RSI5m OVERBOUGHT TRAP: "
+                f"ask/bid={ask_bid_ratio:.1f}x (sell wall dominan), "
+                f"RSI5m={rsi6_5m:.1f} (>70), "
+                f"likuiditas jauh (short={short_liq:.1f}%, long={long_liq:.1f}%), "
+                f"volume={volume_ratio:.2f}x → "
+                f"ini bukan fake down move, tapi kelanjutan tren turun. Force SHORT."
+            ),
+            "priority": -10055
+        }
+
+
 class VegaFadeOverride:
     """
     🔥 PRIORITY -10050 (TERTINGGI): VEGA FADE DI BAIT PHASE
@@ -22387,6 +22454,26 @@ class BinanceAnalyzer:
             result["entry_allowed"] = True
             return result
         
+        # ========== PRIORITY -10055: ASK WALL + RSI5M OVERBOUGHT TRAP ==========
+        ask_wall_trap = AskWallRSI5mOverboughtTrap.detect(
+            ask_slope=result.get("ask_slope", 0),
+            bid_slope=result.get("bid_slope", 1),
+            rsi6_5m=rsi6_5m_val,
+            short_liq=short_liq,
+            long_liq=long_liq,
+            volume_ratio=volume_ratio,
+            change_5m=change_5m_val,
+            ofi_bias=ofi_bias,
+            agg=agg_val
+        )
+        if ask_wall_trap["override"]:
+            result["bias"] = ask_wall_trap["bias"]
+            result["reason"] = f"[ASK WALL TRAP] {ask_wall_trap['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = ask_wall_trap["priority"]
+            result["entry_allowed"] = True
+            return result
+        
         # ========== STEP 2: VEGA FADE OVERRIDE (PRIORITY -10050) ==========
         vega_fade = VegaFadeOverride.detect(
             market_phase=market_phase,
@@ -23211,6 +23298,18 @@ class BinanceAnalyzer:
             result["priority_level"] = acc_guard["priority"]
             result["entry_allowed"] = False
             return result
+
+        # ========== ACCUMULATION HARD BLOCK (PRIORITY -10100) ==========
+        regime = result.get("market_regime")
+        if regime == "ACCUMULATION":
+            if result.get("bias") in ("LONG", "SHORT"):
+                result["bias"] = "NEUTRAL"
+                result["confidence"] = "BLOCK"
+                result["entry_allowed"] = False
+                result["priority_level"] = -10100
+                result["reason"] = f"[ACCUMULATION BLOCK] Regime ACCUMULATION (HIGH RISK) blocks any entry | " + result.get("reason", "")
+                return result
+
 
         # ========== PRIORITY -29800: FAKE PUMP THEN DUMP TRAP =====
         fake_pump = FakePumpThenDumpTrap.detect(
