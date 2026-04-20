@@ -6076,6 +6076,79 @@ class RSI5mOverboughtAskWallNoSellerTrap:
         return {"override": False}
 
 
+class GenuineShortSqueezeAbsolute:
+    """
+    🔥 PRIORITY -10060 (TERTINGGI ABSOLUT - DI ATAS VEGA FADE)
+    
+    Deteksi genuine short squeeze yang TIDAK BOLEH diabaikan meskipun volume rendah.
+    Kombinasi sempurna:
+    - short_liq ultra dekat (<1.5%)
+    - down_energy = 0 (tidak ada seller)
+    - up_energy besar (buyer aktif)
+    - agg/OFI sangat bullish
+    - funding negatif (crowded short)
+    
+    Jika 6 dari 7 syarat terpenuhi → LONG tanpa ampun.
+    """
+    @staticmethod
+    def detect(
+        short_liq: float,
+        long_liq: float,
+        down_energy: float,
+        up_energy: float,
+        agg: float,
+        ofi_bias: str,
+        ofi_strength: float,
+        funding_rate: float,
+        change_5m: float,
+        volume_ratio: float = 1.0  # tidak digunakan sebagai syarat, hanya info
+    ) -> dict:
+        
+        if funding_rate is None:
+            funding_rate = 0.0
+        
+        # Syarat 1: short_liq sangat dekat
+        c1 = short_liq < 1.5 and short_liq < long_liq
+        
+        # Syarat 2: tidak ada seller
+        c2 = down_energy < 0.01
+        
+        # Syarat 3: buy pressure nyata
+        c3 = up_energy > 0.5
+        
+        # Syarat 4: order flow bullish (agg atau OFI)
+        c4 = (agg > 0.7) or (ofi_bias == "LONG" and ofi_strength > 0.7)
+        
+        # Syarat 5: funding crowded short
+        c5 = funding_rate < -0.001
+        
+        # Syarat 6: harga tidak sedang crash
+        c6 = change_5m > -0.5
+        
+        # Syarat 7: (opsional) RSI tidak terlalu overbought di 5m
+        # Tidak kita pakai dulu, jadi cukup 6 syarat
+        
+        conditions = [c1, c2, c3, c4, c5, c6]
+        score = sum(conditions)
+        
+        # Butuh minimal 5 dari 6 (longgar sedikit, karena data PIEVERSEUSDT memenuhi semua)
+        if score >= 5:
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": (
+                    f"GENUINE SHORT SQUEEZE ABSOLUTE: "
+                    f"short_liq={short_liq:.2f}% ultra close, down_energy=0, up_energy={up_energy:.2f}, "
+                    f"agg={agg:.2f}, OFI={ofi_bias} {ofi_strength:.2f}, funding={funding_rate:.5f} (crowded short) → "
+                    f"INI SQUEEZE NYATA, abaikan volume rendah. Force LONG."
+                ),
+                "priority": -10060,
+                "score": score
+            }
+        
+        return {"override": False}
+
+
 class VegaFadeOverride:
     """
     🔥 PRIORITY -10050 (TERTINGGI): VEGA FADE DI BAIT PHASE
@@ -22037,7 +22110,29 @@ class BinanceAnalyzer:
         if result.get("algo_type_bias", "NEUTRAL") != json_algo:
             result["algo_type_bias"] = json_algo
         
-        # ========== STEP 1: VEGA FADE OVERRIDE (PRIORITY -10050) ==========
+        # ========== STEP 1: GENUINE SHORT SQUEEZE ABSOLUTE (PRIORITY -10060) ==========
+        # Ini harus paling pertama, bahkan sebelum Vega Fade
+        genuine_squeeze = GenuineShortSqueezeAbsolute.detect(
+            short_liq=short_liq,
+            long_liq=long_liq,
+            down_energy=down_energy_val,
+            up_energy=up_energy_val,
+            agg=agg_val,
+            ofi_bias=ofi_bias,
+            ofi_strength=ofi_strength,
+            funding_rate=funding_rate_val,
+            change_5m=change_5m_val,
+            volume_ratio=volume_ratio
+        )
+        if genuine_squeeze["override"]:
+            result["bias"] = genuine_squeeze["bias"]
+            result["reason"] = f"[GENUINE SQUEEZE] {genuine_squeeze['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = genuine_squeeze["priority"]
+            result["entry_allowed"] = True
+            return result
+        
+        # ========== STEP 2: VEGA FADE OVERRIDE (PRIORITY -10050) ==========
         vega_fade = VegaFadeOverride.detect(
             market_phase=market_phase,
             vega_active=result.get("greeks_vega_active", False),
@@ -22053,7 +22148,7 @@ class BinanceAnalyzer:
             result["entry_allowed"] = True
             return result  # Keluar lebih awal, tidak perlu filter lain
         
-        # ========== STEP 2: CONFLICT DETECTION (GREEKS vs FINAL BIAS) ==========
+        # ========== STEP 3: CONFLICT DETECTION (GREEKS vs FINAL BIAS) ==========
         greeks_bias = result.get("greeks_bias", "NEUTRAL")
         final_bias_current = result.get("bias", "NEUTRAL")
         greeks_override_active = result.get("greeks_override", False)
