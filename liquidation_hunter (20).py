@@ -6270,7 +6270,7 @@ class AskWallRSI5mOverboughtTrap:
 
 class VegaFadeOverride:
     """
-    🔥 PRIORITY -10030 (TERTINGGI): VEGA FADE DI BAIT PHASE
+    🔥 PRIORITY -10050 (TERTINGGI): VEGA FADE DI BAIT PHASE
     
     Jika market_phase == BAIT, Vega aktif (score >=5), dan volume rendah,
     maka gerakan harga 5 menit terakhir adalah PALSU.
@@ -6299,7 +6299,7 @@ class VegaFadeOverride:
                     f"volume={volume_ratio:.2f}x → fake {('UP' if change_5m>0 else 'DOWN')} move, "
                     f"fade to {fade_direction}"
                 ),
-                "priority": -10030
+                "priority": -10050
             }
         return {"override": False}
 
@@ -21833,37 +21833,17 @@ class ExtremeOverboughtPostSqueezeReversal:
 
 class UltraLowVolumeOBVExtremeReversal:
     """
-    🔥 PRIORITY -27960: AIOTUSDT FIX (DIPERBAIKI UNTUK EDUUSDT)
+    🔥 PRIORITY -27960: AIOTUSDT FIX
     Volume ultra rendah (<0.4x), OBV ekstrem, pergerakan kecil → OBV stale, arah kebalikan.
-    TAPI JANGAN SHORT jika ada sinyal akumulasi kuat (Funding Negatif + Greeks LONG).
     """
     @staticmethod
     def detect(volume_ratio: float, obv_trend: str,
                change_5m: float, agg: float,
-               short_liq: float, long_liq: float,
-               funding_rate: float = 0.0,
-               greeks_kill_direction: str = "",
-               ofi_bias: str = "NEUTRAL") -> dict:
-        
+               short_liq: float, long_liq: float) -> dict:
         if volume_ratio >= 0.4:
             return {"override": False}
         if abs(change_5m) > 2.5:
-            return {"override": False}
-
-        # ===== GUARD EDUUSDT: JANGAN SHORT JIKA INI ADALAH QUIET ACCUMULATION =====
-        # Tanda-tanda akumulasi diam-diam:
-        # 1. OBV positif (sudah terpenuhi)
-        # 2. Funding negatif (crowded short = banyak yang salah posisi)
-        # 3. Greeks kill_direction = LONG
-        # 4. OFI = LONG (buy order flow)
-        is_quiet_accumulation = (
-            obv_trend == "POSITIVE_EXTREME" and
-            funding_rate < -0.0005 and
-            greeks_kill_direction == "LONG" and
-            ofi_bias == "LONG"
-        )
-        if is_quiet_accumulation:
-            return {"override": False}  # Jangan ganggu, biarkan sinyal LONG bekerja
+            return {"override": False}  # sudah ada pergerakan signifikan, OBV mungkin valid
 
         if obv_trend == "POSITIVE_EXTREME":
             # OBV bilang akumulasi tapi volume kering → sebenarnya distribusi → SHORT
@@ -22494,32 +22474,21 @@ class BinanceAnalyzer:
             result["entry_allowed"] = True
             return result
         
-        # ========== GUARD: JANGAN FADE JIKA LIQUIDITY SUPER DEKAT (<1.5%) ==========
-        # Ini mencegah Vega Fade membunuh sinyal squeeze yang sudah jelas (Kasus GUNUSDT)
-        ultra_close_liq = (short_liq < 1.5 or long_liq < 1.5)
-        if ultra_close_liq:
-            # Nonaktifkan sementara Vega Fade untuk sinyal ini
-            result["_block_vega_fade"] = True
-        
-        # ========== STEP 1: VEGA FADE OVERRIDE (DENGAN GUARD) ==========
-        # Cek apakah PRE-KILL sedang aktif
-        pre_kill_active = result.get("greeks_pre_kill", {}).get("override", False)
-        
-        if not result.get("_block_vega_fade") and not pre_kill_active:
-            vega_fade = VegaFadeOverride.detect(
-                market_phase=market_phase,
-                vega_active=result.get("greeks_vega_active", False),
-                vega_score=result.get("greeks_vega_score", 0),
-                volume_ratio=volume_ratio,
-                change_5m=change_5m_val
-            )
-            if vega_fade["override"]:
-                result["bias"] = vega_fade["bias"]
-                result["reason"] = f"[VEGA FADE] {vega_fade['reason']} | " + result.get("reason", "")
-                result["confidence"] = "ABSOLUTE"
-                result["priority_level"] = vega_fade["priority"]
-                result["entry_allowed"] = True
-                return result  # Keluar lebih awal, tidak perlu filter lain
+        # ========== STEP 2: VEGA FADE OVERRIDE (PRIORITY -10050) ==========
+        vega_fade = VegaFadeOverride.detect(
+            market_phase=market_phase,
+            vega_active=result.get("greeks_vega_active", False),
+            vega_score=result.get("greeks_vega_score", 0),
+            volume_ratio=volume_ratio,
+            change_5m=change_5m_val
+        )
+        if vega_fade["override"]:
+            result["bias"] = vega_fade["bias"]
+            result["reason"] = f"[VEGA FADE] {vega_fade['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = vega_fade["priority"]
+            result["entry_allowed"] = True
+            return result  # Keluar lebih awal, tidak perlu filter lain
         
         # ========== STEP 3: CONFLICT DETECTION (GREEKS vs FINAL BIAS) ==========
         greeks_bias = result.get("greeks_bias", "NEUTRAL")
@@ -22628,10 +22597,7 @@ class BinanceAnalyzer:
         ultra_low_obv_rev = UltraLowVolumeOBVExtremeReversal.detect(
             volume_ratio=volume_ratio, obv_trend=obv_trend,
             change_5m=change_5m_val, agg=agg_val,
-            short_liq=short_liq, long_liq=long_liq,
-            funding_rate=funding_rate_val,
-            greeks_kill_direction=kill_direction,
-            ofi_bias=ofi_bias
+            short_liq=short_liq, long_liq=long_liq
         )
         if ultra_low_obv_rev["override"]:
             result["bias"] = ultra_low_obv_rev["bias"]
