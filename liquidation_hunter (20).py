@@ -22638,6 +22638,34 @@ class BinanceAnalyzer:
                     result["entry_allowed"] = True
                     return result
         
+        # ========== PRIORITY -10160: EXCHANGE WARNING BLOW-OFF TOP ==========
+        # Jika exchange_safe = SHORT, funding positif (>0.0005), short_liq dekat TAPI
+        # delta_exposure tinggi (crowded LONG) dan who_dies_first = LONG_TRADERS,
+        # maka short_liq adalah umpan. Ini adalah distribusi puncak, bukan squeeze.
+        exchange_safe = result.get("exchange_safe_direction", "NEUTRAL")
+        funding_rate_val = result.get("funding_rate", 0.0)
+        delta_exposure = result.get("greeks_delta_exposure", 0.0)
+        who_dies = result.get("greeks_who_dies_first", "")
+        
+        if (exchange_safe == "SHORT" and 
+            funding_rate_val > 0.0005 and 
+            delta_exposure > 0.8 and
+            who_dies == "LONG_TRADERS" and
+            short_liq < 2.0 and
+            change_5m_val > 3.0):  # harga sudah naik signifikan
+            
+            result["bias"] = "SHORT"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = -10160
+            result["reason"] = (
+                f"[EXCHANGE WARNING BLOW-OFF] exchange_safe=SHORT, funding={funding_rate_val:.6f} (crowded LONG), "
+                f"delta_exposure={delta_exposure:.3f}, who_dies={who_dies}, short_liq={short_liq:.2f}% (umpan). "
+                f"Harga sudah naik {change_5m_val:.1f}% → ini distribusi puncak, bukan squeeze. Force SHORT. | "
+                + result.get("reason", "")
+            )
+            result["entry_allowed"] = True
+            return result
+        
         # ========== PRIORITY -10150: CROWDED SHORT SQUEEZE ACTIVE (BAIT PROOF) ==========
         # Jika short_liq sangat dekat (<1.5%), pasar sangat crowded LONG (delta_exposure > 0.85),
         # dan harga sudah mulai naik, maka ini adalah SHORT SQUEEZE AKTIF.
