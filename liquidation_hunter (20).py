@@ -6270,38 +6270,51 @@ class AskWallRSI5mOverboughtTrap:
 
 class VegaFadeOverride:
     """
-    🔥 PRIORITY -10030 (TERTINGGI): VEGA FADE DI BAIT PHASE
+    🔥 PRIORITY -10030: VEGA FADE DI BAIT PHASE (DENGAN GUARD RSI EKSTREM)
     
     Jika market_phase == BAIT, Vega aktif (score >=5), dan volume rendah,
     maka gerakan harga 5 menit terakhir adalah PALSU.
     Arah yang benar adalah LAWAN dari gerakan tersebut (fade).
     
-    Kondisi:
-    - market_phase == "BAIT"
-    - greeks_vega_active == True
-    - greeks_vega_score >= 5
-    - volume_ratio < 0.7
+    🛡️ GUARD: Jangan fade jika RSI 5m sudah ekstrem oversold (<20) dan harga naik,
+              atau RSI 5m ekstrem overbought (>80) dan harga turun.
+              Ini adalah tanda reversal nyata, bukan fake move.
     """
     @staticmethod
     def detect(market_phase: str, vega_active: bool, vega_score: int,
-               volume_ratio: float, change_5m: float) -> dict:
-        if (market_phase == "BAIT" and 
-            vega_active and 
-            vega_score >= 5 and 
-            volume_ratio < 0.7):
-            
-            fade_direction = "SHORT" if change_5m > 0 else "LONG"
-            return {
-                "override": True,
-                "bias": fade_direction,
-                "reason": (
-                    f"VEGA FADE OVERRIDE: BAIT phase + Vega active (score={vega_score}/6), "
-                    f"volume={volume_ratio:.2f}x → fake {('UP' if change_5m>0 else 'DOWN')} move, "
-                    f"fade to {fade_direction}"
-                ),
-                "priority": -10030
-            }
-        return {"override": False}
+               volume_ratio: float, change_5m: float,
+               rsi6_5m: float = 50.0,
+               exchange_safe: str = "NEUTRAL") -> dict:
+        
+        if not (market_phase == "BAIT" and vega_active and vega_score >= 5 and volume_ratio < 0.7):
+            return {"override": False}
+        
+        fade_direction = "SHORT" if change_5m > 0 else "LONG"
+        
+        # ===== GUARD: JANGAN FADE JIKA RSI 5M SUDAH EKSTREM DAN SEARAH DENGAN FADE =====
+        # Jika harga naik (fade SHORT) tapi RSI 5m < 20 (extreme oversold) -> ini reversal nyata ke LONG
+        if fade_direction == "SHORT" and rsi6_5m < 20:
+            return {"override": False}
+        # Jika harga turun (fade LONG) tapi RSI 5m > 80 (extreme overbought) -> ini reversal nyata ke SHORT
+        if fade_direction == "LONG" and rsi6_5m > 80:
+            return {"override": False}
+        
+        # ===== GUARD: JANGAN FADE JIKA EXCHANGE SAFE BERTENTANGAN DENGAN FADE =====
+        if exchange_safe == "LONG" and fade_direction == "SHORT":
+            return {"override": False}
+        if exchange_safe == "SHORT" and fade_direction == "LONG":
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": fade_direction,
+            "reason": (
+                f"VEGA FADE OVERRIDE: BAIT phase + Vega active (score={vega_score}/6), "
+                f"volume={volume_ratio:.2f}x → fake {('UP' if change_5m>0 else 'DOWN')} move, "
+                f"fade to {fade_direction}"
+            ),
+            "priority": -10030
+        }
 
 
 class NoSellerNoBuyerOverride:
@@ -22630,7 +22643,9 @@ class BinanceAnalyzer:
                 vega_active=result.get("greeks_vega_active", False),
                 vega_score=result.get("greeks_vega_score", 0),
                 volume_ratio=volume_ratio,
-                change_5m=change_5m_val
+                change_5m=change_5m_val,
+                rsi6_5m=result.get("rsi6_5m", 50.0),           # <-- tambahkan
+                exchange_safe=result.get("exchange_safe_direction", "NEUTRAL")  # <-- tambahkan
             )
             if vega_fade["override"]:
                 result["bias"] = vega_fade["bias"]
