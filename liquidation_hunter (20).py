@@ -9203,7 +9203,71 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
         return result
 
     # -----------------------------------------------------------------
-    # 6. KEPUTUSAN AKHIR (VOTING)
+    # 6. DETECTOR FLAGS DARI analyze() (POST-KILL, PRE-SWEEP, GAMMA SPOOF, dll)
+    # -----------------------------------------------------------------
+    # Sekarang kita proses flag yang disimpan oleh detector di analyze()
+    # Ini menggantikan direct bias modification yang dilakukan sebelumnya
+    
+    # Priority ladder untuk detector flags:
+    # - Pre-Kill Sweep (-10500): liquidity sangat dekat, harus sweep dulu
+    # - Post-Kill Follow (-10400): gamma executing, ikuti kill direction
+    # - Gamma Spoof (-10300): gamma alignment terdeteksi
+    # - Reverse Bait (-10200): reverse squeeze bait detected
+    
+    # Cek Pre-Kill Sweep (priority -10500)
+    if result.get("_pre_kill_sweep_detected"):
+        sweep_bias = result.get("_pre_kill_sweep_bias")
+        sweep_reason = result.get("_pre_kill_sweep_reason", "")
+        entry_allowed = result.get("_pre_kill_sweep_entry_allowed", False)
+        
+        result["bias"] = sweep_bias
+        result["confidence"] = "ABSOLUTE"
+        result["priority_level"] = -10500
+        result["reason"] = f"[PRE-KILL SWEEP] {sweep_reason} | " + context.get("reason", "")
+        result["entry_allowed"] = entry_allowed
+        result["aggregator_reasons"] = reasons + [f"PRE-KILL SWEEP: {sweep_bias} because {sweep_reason}"]
+        return result
+    
+    # Cek Reverse Bait (priority -10200)
+    if result.get("_reverse_bait_detected"):
+        reverse_bias = result.get("_reverse_bait_bias", "SHORT")
+        reverse_reason = result.get("_reverse_bait_reason", "")
+        
+        result["bias"] = reverse_bias
+        result["confidence"] = "ABSOLUTE"
+        result["priority_level"] = -10200
+        result["reason"] = f"[REVERSE BAIT] {reverse_reason} | " + context.get("reason", "")
+        result["entry_allowed"] = True
+        result["aggregator_reasons"] = reasons + [f"REVERSE BAIT: {reverse_bias} because {reverse_reason}"]
+        return result
+    
+    # Cek Post-Kill Follow (priority -10400)
+    if result.get("_post_kill_follow"):
+        post_kill_bias = result.get("_post_kill_bias")
+        post_kill_reason = result.get("_post_kill_reason", "")
+        
+        result["bias"] = post_kill_bias
+        result["confidence"] = "ABSOLUTE"
+        result["priority_level"] = -10400
+        result["reason"] = f"[POST-KILL FOLLOW] {post_kill_reason} | " + context.get("reason", "")
+        result["aggregator_reasons"] = reasons + [f"POST-KILL FOLLOW: {post_kill_bias} because {post_kill_reason}"]
+        return result
+    
+    # Cek Gamma Spoof (priority -10300)
+    if result.get("_gamma_spoof_detected"):
+        spoof_bias = result.get("_gamma_spoof_bias")
+        spoof_reason = result.get("_gamma_spoof_reason", "")
+        spoof_priority = result.get("_gamma_spoof_priority", -10300)
+        
+        result["bias"] = spoof_bias
+        result["confidence"] = "ABSOLUTE"
+        result["priority_level"] = spoof_priority
+        result["reason"] = f"[GAMMA SPOOF] {spoof_reason} | " + context.get("reason", "")
+        result["aggregator_reasons"] = reasons + [f"GAMMA SPOOF: {spoof_bias} because {spoof_reason}"]
+        return result
+
+    # -----------------------------------------------------------------
+    # 7. KEPUTUSAN AKHIR (VOTING)
     # -----------------------------------------------------------------
     if votes["LONG"] > votes["SHORT"]:
         result["bias"] = "LONG"
@@ -30607,6 +30671,8 @@ class BinanceAnalyzer:
             result = greeks_final_screen(result)
 
             # ========== GAMMA SPOOFING DETECTOR (setelah Greeks) ==========
+            # CATATAN: Detector ini sekarang HANYA menambah flag, tidak mengubah bias langsung
+            # Bias akan ditentukan oleh arbitrate_final_decision berdasarkan flag ini
             gamma_spoof = GammaLiquidityAlignment.detect(
                 result.get("greeks_gamma_intensity", "LOW"),
                 result.get("greeks_kill_direction", "NEUTRAL"),
@@ -30614,22 +30680,17 @@ class BinanceAnalyzer:
                 result.get("greeks_gamma_executing", False),
                 volume_ratio,
                 result.get("market_phase", "UNKNOWN"),
-                kill_speed=result.get("greeks_kill_speed", 0.0)  # TAMBAHAN: kill_speed untuk validasi spoofing
+                kill_speed=result.get("greeks_kill_speed", 0.0)
             )
             if gamma_spoof["override"]:
-                # Override hasil Greeks dengan priority -10000
-                result["bias"] = gamma_spoof["bias"]
-                result["reason"] = f"[GAMMA SPOOFING] {gamma_spoof['reason']} | Original: {result.get('reason', '')}"
-                result["confidence"] = "ABSOLUTE"
-                result["phase"] = "GAMMA_LIQUIDITY_ALIGNMENT"
-                result["priority_level"] = gamma_spoof["priority"]
-                result["greeks_override"] = True  # tandai bahwa Greeks di-override
+                # SIMPAN INFORMASI SAJA, JANGAN UBAH BIAS LANGSUNG
+                result["_gamma_spoof_detected"] = True
+                result["_gamma_spoof_bias"] = gamma_spoof["bias"]
+                result["_gamma_spoof_reason"] = gamma_spoof['reason']
+                result["_gamma_spoof_priority"] = gamma_spoof["priority"]
 
             # ========== POST-KILL BEHAVIOR DETECTOR ==========
-            # Jika gamma sudah executing dan kill_speed > 0, maka arah akhir = kill_direction.
-            # Namun jika long_liq atau short_liq masih sangat dekat (<1.5%) dan belum tersapu,
-            # maka harga akan bergerak ke arah kebalikan terlebih dahulu (sweep).
-
+            # CATATAN: Sekarang hanya menyimpan informasi untuk aggregator
             kill_speed = result.get("greeks_kill_speed", 0)
             gamma_exec = result.get("greeks_gamma_executing", False)
             long_liq_val = result.get("long_liq", 99.0)
@@ -30637,16 +30698,13 @@ class BinanceAnalyzer:
             kill_dir = result.get("greeks_kill_direction", "")
 
             # ===== GUARD: CAPITULATION OVERRIDE BLOCKS POST-KILL FOLLOW =====
-            # Jika CapitulationExtremeLong sudah fire (priority -28200), 
-            # PostKillFollow TIDAK BOLEH override balik ke SHORT
             if result.get("_capitulation_override") or result.get("priority_level", 0) <= -28000:
-                # Sudah ada capitulation signal dengan priority sangat tinggi
-                # Skip PostKillFollow dan PreKillSweep
                 pass
             elif gamma_exec and kill_speed > 0.5 and kill_dir in ("LONG", "SHORT"):
-                result["bias"] = kill_dir
-                result["reason"] = f"[POST-KILL FOLLOW] kill_direction={kill_dir}, gamma_executing=True → {kill_dir} | " + result.get("reason", "")
-                result["confidence"] = "ABSOLUTE"
+                # SIMPAN INFORMASI UNTUK AGGREGATOR
+                result["_post_kill_follow"] = True
+                result["_post_kill_bias"] = kill_dir
+                result["_post_kill_reason"] = f"kill_direction={kill_dir}, gamma_executing=True"
             else:
                 # 🔥 LECTURER PATCH: Cek REVERSE SQUEEZE BAIT sebelum PRE-KILL SWEEP
                 prekill_seq_sweep = SequentialSweepOrderDetector.detect(
@@ -30674,21 +30732,22 @@ class BinanceAnalyzer:
                 )
                 
                 if reverse_bait_check["override"]:
-                    # Ini adalah jebakan reverse squeeze bait
-                    result["bias"] = "SHORT"
-                    result["reason"] = f"{reverse_bait_check['reason']} | " + result.get("reason", "")
-                    result["confidence"] = "ABSOLUTE"
-                    result["entry_allowed"] = True
+                    # SIMPAN INFORMASI UNTUK AGGREGATOR
+                    result["_reverse_bait_detected"] = True
+                    result["_reverse_bait_bias"] = "SHORT"
+                    result["_reverse_bait_reason"] = reverse_bait_check['reason']
                 # Jika belum executing, cek apakah ada liquidity yang sangat dekat (pre-sweep)
                 elif long_liq_val < 1.5 and long_liq_val < short_liq_val:
                     # Long liq lebih dekat → harga akan turun dulu (sweep long)
-                    result["bias"] = "SHORT"
-                    result["reason"] = f"[PRE-KILL SWEEP] long_liq={long_liq_val:.2f}% sangat dekat → harga turun dulu, jangan LONG | " + result.get("reason", "")
-                    result["entry_allowed"] = False
+                    result["_pre_kill_sweep_detected"] = True
+                    result["_pre_kill_sweep_bias"] = "SHORT"
+                    result["_pre_kill_sweep_reason"] = f"long_liq={long_liq_val:.2f}% sangat dekat"
+                    result["_pre_kill_sweep_entry_allowed"] = False
                 elif short_liq_val < 1.5 and short_liq_val < long_liq_val:
-                    result["bias"] = "LONG"
-                    result["reason"] = f"[PRE-KILL SWEEP] short_liq={short_liq_val:.2f}% sangat dekat → harga naik dulu, jangan SHORT | " + result.get("reason", "")
-                    result["entry_allowed"] = False
+                    result["_pre_kill_sweep_detected"] = True
+                    result["_pre_kill_sweep_bias"] = "LONG"
+                    result["_pre_kill_sweep_reason"] = f"short_liq={short_liq_val:.2f}% sangat dekat"
+                    result["_pre_kill_sweep_entry_allowed"] = False
 
             # ========== STABILITY FILTERS (Flip Cooldown, Phase Lock, Confirmation, Gamma Delay, Entry) ==========
             # Simpan flag extreme override ke result sebelum stability filter
@@ -30750,7 +30809,22 @@ class BinanceAnalyzer:
 
             # ========== DECISION AGGREGATOR: Evidence-Based Voting with Arbitration ==========
             # Ini adalah langkah terakhir sebelum return, menggantikan priority-based override chaos
+            # PENTING: arbitrate_final_decision HARUS jadi keputusan FINAL - tidak boleh ada perubahan bias setelah ini
             result = arbitrate_final_decision(result)
+            
+            # ========== FINAL BIAS LOCK ==========
+            # Setelah aggregator, bias TIDAK BOLEH diubah lagi
+            # Simpan final_bias untuk validasi konsistensi
+            final_bias_after_aggregator = result.get("bias", "NEUTRAL")
+            result["_final_bias_locked"] = final_bias_after_aggregator
+            
+            # Validasi: pastikan tidak ada kontradiksi internal
+            if not validate_signal_consistency(result):
+                # Jika tidak konsisten, force NEUTRAL dengan confidence BLOCK
+                result["bias"] = "NEUTRAL"
+                result["confidence"] = "BLOCK"
+                result["reason"] = "[CONSISTENCY CHECK FAILED] Internal signal contradiction detected. Forcing NEUTRAL. | " + result.get("reason", "")
+                result["entry_allowed"] = False
 
             return result
 
