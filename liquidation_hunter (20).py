@@ -22678,6 +22678,31 @@ class BinanceAnalyzer:
             result["entry_allowed"] = True
             return result
         
+        # ========== PRIORITY -10170: BLOW-OFF TOP SHORT LIQ BAIT ==========
+        # Jika short_liq super dekat TAPI harga sudah pump besar (>8%), RSI5m >90,
+        # dan exchange_safe/funding mengonfirmasi crowded long → ini adalah distribusi puncak.
+        # Batalkan semua sinyal LONG, force SHORT.
+        if (short_liq < 1.5 and 
+            abs(change_5m_val) > 8.0 and 
+            rsi6_5m_val > 90 and
+            delta_exposure > 0.85):
+            
+            # Konfirmasi tambahan: exchange warning atau funding positif
+            exchange_safe = result.get("exchange_safe_direction", "NEUTRAL")
+            if exchange_safe == "SHORT" or funding_rate_val > 0.0005:
+                result["bias"] = "SHORT"
+                result["confidence"] = "ABSOLUTE"
+                result["priority_level"] = -10170
+                result["reason"] = (
+                    f"[BLOW-OFF TOP BAIT] short_liq={short_liq:.2f}% (umpan), "
+                    f"pump {change_5m_val:.1f}%, RSI5m={rsi6_5m_val:.1f} (>90), "
+                    f"delta_exposure={delta_exposure:.3f}, exchange_safe={exchange_safe}, "
+                    f"funding={funding_rate_val:.6f} → tidak ada ruang naik, distribusi puncak. "
+                    f"Batalkan semua sinyal LONG, force SHORT. | " + result.get("reason", "")
+                )
+                result["entry_allowed"] = True
+                return result
+        
         # ========== PRIORITY -10150: CROWDED SHORT SQUEEZE ACTIVE (BAIT PROOF) ==========
         # Jika short_liq sangat dekat (<1.5%), pasar sangat crowded LONG (delta_exposure > 0.85),
         # dan harga sudah mulai naik, maka ini adalah SHORT SQUEEZE AKTIF.
