@@ -22553,6 +22553,50 @@ class BinanceAnalyzer:
             # Nonaktifkan sementara Vega Fade untuk sinyal ini
             result["_block_vega_fade"] = True
         
+        # ========== PRIORITY -10180: SYMMETRIC LIQUIDITY + STRONG ORDER FLOW ==========
+        # Jika short_liq dan long_liq hampir simetris (<1% beda), dan order flow
+        # sangat dominan ke satu arah (agg ekstrem + OFI + no opposite energy),
+        # maka abaikan konsensus Algo/HFT, ikuti order flow.
+        liq_diff = abs(short_liq - long_liq)
+        ofi_bias = result.get("ofi_bias", "NEUTRAL")
+        ofi_strength = result.get("ofi_strength", 0.0)
+        agg_val = result.get("agg", 0.5)
+        
+        if liq_diff < 1.0:  # likuiditas hampir simetris
+            # Kasus 1: Order flow sangat bullish -> paksa LONG (abaikan SHORT)
+            if (agg_val > 0.85 and 
+                ofi_bias == "LONG" and ofi_strength > 0.7 and 
+                down_energy_val < 0.01 and up_energy_val > 0.1):
+                
+                result["bias"] = "LONG"
+                result["confidence"] = "ABSOLUTE"
+                result["priority_level"] = -10180
+                result["reason"] = (
+                    f"[SYMMETRIC LIQ + STRONG BUY] short_liq={short_liq:.2f}% vs long_liq={long_liq:.2f}% "
+                    f"(diff {liq_diff:.2f}%), agg={agg_val:.2f} (100% buy), OFI LONG {ofi_strength:.2f}, "
+                    f"down_energy=0 → HFT akumulasi, ignore Algo/HFT SHORT, force LONG. | "
+                    + result.get("reason", "")
+                )
+                result["entry_allowed"] = True
+                return result
+                
+            # Kasus 2: Order flow sangat bearish -> paksa SHORT (abaikan LONG)
+            if (agg_val < 0.15 and 
+                ofi_bias == "SHORT" and ofi_strength > 0.7 and 
+                up_energy_val < 0.01 and down_energy_val > 0.1):
+                
+                result["bias"] = "SHORT"
+                result["confidence"] = "ABSOLUTE"
+                result["priority_level"] = -10180
+                result["reason"] = (
+                    f"[SYMMETRIC LIQ + STRONG SELL] short_liq={short_liq:.2f}% vs long_liq={long_liq:.2f}% "
+                    f"(diff {liq_diff:.2f}%), agg={agg_val:.2f} (100% sell), OFI SHORT {ofi_strength:.2f}, "
+                    f"up_energy=0 → HFT distribusi, ignore Algo/HFT LONG, force SHORT. | "
+                    + result.get("reason", "")
+                )
+                result["entry_allowed"] = True
+                return result
+        
         # ========== PRIORITY -10100: ALGO+HFT CONSENSUS OVERRIDE (BATALKAN VEGA FADE) ==========
         # Jika Algo dan HFT keduanya sepakat LONG/SHORT, dan ada target likuiditas di bawah 3%,
         # maka abaikan semua sinyal fade (termasuk Vega) dan ikuti konsensus.
