@@ -9175,10 +9175,21 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
     )
     
     if basic_trap_conditions:
-        # GATE 1: Validasi Energi Pasar
+        # GATE 1: Validasi Energi Pasar (dengan pengecualian Thin Ask Wall)
         if up_energy > 2.0 and down_energy < 0.1:
-            reasons.append(f"TRAP OVERRIDE BLOCKED (Energy Gate): up_energy={up_energy:.2f} >> down_energy={down_energy:.2f}")
-            basic_trap_conditions = False
+            # Pengecualian: Jika ask_slope sangat tipis dibanding bid_slope (rasio > 5x)
+            # dan Vega score >= 5, maka ini adalah jebakan "Fake Buy Pressure". Jangan blokir.
+            if bid_slope > 0 and ask_slope > 0:
+                bid_ask_ratio = bid_slope / ask_slope
+            else:
+                bid_ask_ratio = 0
+            
+            if bid_ask_ratio > 5.0 and vega_score >= 5:
+                reasons.append(f"TRAP OVERRIDE ENERGY GATE BYPASSED: Thin ask wall (bid/ask={bid_ask_ratio:.1f}x) + Vega={vega_score}/6 → buy pressure is fake.")
+                # Jangan set basic_trap_conditions = False, biarkan TRAP OVERRIDE lanjut
+            else:
+                reasons.append(f"TRAP OVERRIDE BLOCKED (Energy Gate): up_energy={up_energy:.2f} >> down_energy={down_energy:.2f}")
+                basic_trap_conditions = False
             
         # GATE 2: Validasi Exchange Safe Direction
         if basic_trap_conditions and exchange_safe != "NEUTRAL" and exchange_safe != greeks_bias:
