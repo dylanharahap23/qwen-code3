@@ -9245,6 +9245,22 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
                     reasons.append(f"TRAP OVERRIDE BLOCKED (OBV/OFI Gate): OBV POSITIVE_EXTREME ({obv_value:,.0f}) + OFI LONG {ofi_strength:.2f}")
                     basic_trap_conditions = False
 
+        # GATE 8: OBV 极端积累否决（针对 SHORT 诱空陷阱）
+        # Jika OBV出现极端正积累（POSITIVE_EXTREME）且short_liq极近（<0.5%）时，
+        # 即便交易所发出SHORT警告，也应该视为真实挤压前的最后诱空，而不是真正的派发。
+        if basic_trap_conditions and greeks_bias == "SHORT":
+            obv_trend = context.get("obv_trend", "NEUTRAL")
+            obv_value = context.get("obv_value", 0.0)
+            short_liq = data.get("short_liq", 99.0)
+            if (obv_trend == "POSITIVE_EXTREME" and 
+                obv_value > 30_000_000 and 
+                short_liq < 0.5):
+                reasons.append(
+                    f"TRAP OVERRIDE BLOCKED (OBV Accumulation Gate): "
+                    f"OBV POSITIVE_EXTREME ({obv_value:,.0f}) + short_liq={short_liq:.2f}%"
+                )
+                basic_trap_conditions = False
+
     # EKSEKUSI TRAP OVERRIDE JIKA MASIH LOLOS
     if basic_trap_conditions:
         previous_bias = "LONG" if votes["LONG"] > votes["SHORT"] else "SHORT" if votes["SHORT"] > votes["LONG"] else "NEUTRAL"
