@@ -9217,6 +9217,23 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
                 reasons.append(f"TRAP OVERRIDE BLOCKED (RSI Overbought Gate): RSI14={rsi14_val:.1f} > 70")
                 basic_trap_conditions = False
 
+        # GATE 7: Validasi Konsistensi OBV & OFI (Distribusi/Akumulasi Historis)
+        if basic_trap_conditions:
+            obv_trend = context.get("obv_trend", "NEUTRAL")
+            obv_value = context.get("obv_value", 0.0)
+            # Jika greeks_bias = LONG, tapi OBV negatif ekstrem dan OFI SHORT kuat → jangan LONG
+            if greeks_bias == "LONG":
+                if (obv_trend == "NEGATIVE_EXTREME" and obv_value < -50_000_000 and
+                    ofi_bias == "SHORT" and ofi_strength > 0.8):
+                    reasons.append(f"TRAP OVERRIDE BLOCKED (OBV/OFI Gate): OBV NEGATIVE_EXTREME ({obv_value:,.0f}) + OFI SHORT {ofi_strength:.2f}")
+                    basic_trap_conditions = False
+            # Jika greeks_bias = SHORT, tapi OBV positif ekstrem dan OFI LONG kuat → jangan SHORT
+            elif greeks_bias == "SHORT":
+                if (obv_trend == "POSITIVE_EXTREME" and obv_value > 50_000_000 and
+                    ofi_bias == "LONG" and ofi_strength > 0.8):
+                    reasons.append(f"TRAP OVERRIDE BLOCKED (OBV/OFI Gate): OBV POSITIVE_EXTREME ({obv_value:,.0f}) + OFI LONG {ofi_strength:.2f}")
+                    basic_trap_conditions = False
+
     # EKSEKUSI TRAP OVERRIDE JIKA MASIH LOLOS
     if basic_trap_conditions:
         previous_bias = "LONG" if votes["LONG"] > votes["SHORT"] else "SHORT" if votes["SHORT"] > votes["LONG"] else "NEUTRAL"
