@@ -9017,6 +9017,104 @@ def _greeks_absolute_score(
     }
 
 
+# ========== DECISION AGGREGATOR (Menggantikan Priority Chaos) ==========
+def arbitrate_final_decision(result: dict) -> dict:
+    """
+    Menggantikan sistem priority-based override.
+    Mengumpulkan suara dari semua detector yang aktif dan memutuskan
+    berdasarkan bobot dan hirarki kepercayaan.
+    
+    Hirarki Kebenaran (Source of Truth):
+    - Tier 1 (Fisika Pasar): liquidity proximity, down_energy = 0 (hukum supply-demand). Bobot Maks: 10.0
+    - Tier 2 (Jejak HFT): agg, OFI, bid/ask slope. Bobot Maks: 8.0
+    - Tier 3 (Matematis): Greeks Gamma, RSI ekstrem. Bobot Maks: 7.0
+    - Tier 4 (Psikologi): OBV lagging, Funding Rate, Vega Fade. Bobot Maks: 5.0
+    """
+    votes = {"LONG": 0.0, "SHORT": 0.0}
+    reasons = []
+    context = result  # semua data ada di sini
+    
+    # -----------------------------------------------------------------
+    # 1. TIER 1: HUKUM FISIKA PASAR (Bobot 10.0)
+    # -----------------------------------------------------------------
+    liq_bias = "LONG" if context.get("short_liq", 99) < context.get("long_liq", 99) else "SHORT"
+    liq_diff = abs(context.get("short_liq", 0) - context.get("long_liq", 0))
+    
+    if liq_diff > 1.0:  # Hanya suara jika target likuiditas tidak simetris
+        if context.get("short_liq", 99) < 1.5:
+            votes["LONG"] += 10.0
+            reasons.append("LIQUIDITY LAW: short_liq ultra close")
+        elif context.get("long_liq", 99) < 1.5:
+            votes["SHORT"] += 10.0
+            reasons.append("LIQUIDITY LAW: long_liq ultra close")
+    
+    # Zero Sellers / Buyers (Vacuum)
+    if context.get("down_energy", 1.0) < 0.01 and context.get("up_energy", 0) > 0.5:
+        votes["LONG"] += 8.0
+        reasons.append("VACUUM: No sellers + active buyers")
+    if context.get("up_energy", 1.0) < 0.01 and context.get("down_energy", 0) > 0.5:
+        votes["SHORT"] += 8.0
+        reasons.append("VACUUM: No buyers + active sellers")
+
+    # -----------------------------------------------------------------
+    # 2. TIER 2: JEJAK HFT (Bobot 8.0)
+    # -----------------------------------------------------------------
+    agg_val = context.get("agg", 0.5)
+    ofi_bias = context.get("ofi_bias", "NEUTRAL")
+    ofi_strength = context.get("ofi_strength", 0.0)
+    
+    # Agg & OFI Consensus
+    if agg_val > 0.85 and ofi_bias == "LONG" and ofi_strength > 0.7:
+        votes["LONG"] += 8.0
+        reasons.append("HFT TRACE: Aggressive buying consensus")
+    elif agg_val < 0.15 and ofi_bias == "SHORT" and ofi_strength > 0.7:
+        votes["SHORT"] += 8.0
+        reasons.append("HFT TRACE: Aggressive selling consensus")
+
+    # -----------------------------------------------------------------
+    # 3. TIER 3: SINYAL MATEMATIS EKSTREM (Bobot 7.0)
+    # -----------------------------------------------------------------
+    rsi_val = context.get("rsi6_5m", 50.0)
+    if rsi_val < 15 and context.get("change_5m", 0) < -2.0:
+        votes["LONG"] += 7.0
+        reasons.append("MATH: Extreme capitulation (RSI<15)")
+    elif rsi_val > 85 and context.get("change_5m", 0) > 2.0:
+        votes["SHORT"] += 7.0
+        reasons.append("MATH: Extreme blow-off (RSI>85)")
+
+    # -----------------------------------------------------------------
+    # 4. PENGECUALIAN KHUSUS: BATALKAN KEPUTUSAN JIKA ADA TRAP KRITIS
+    # -----------------------------------------------------------------
+    # Ini menggantikan fungsi "Hard Block" dengan lebih elegan
+    if context.get("exchange_risk_score", 0) >= 8 and votes["LONG"] > votes["SHORT"]:
+        reasons.append("VETO: Exchange Risk Score Critical, overriding LONG to SHORT")
+        votes["SHORT"] = votes["LONG"] + 1  # Paksa SHORT menang
+    
+    # Jika Vega Fade konflik dengan Liquidity (contoh GUNUSDT), prioritaskan Liquidity
+    if context.get("greeks_vega_active") and liq_diff > 0.5:
+        reasons.append("ARBITRATION: Liquidity overrides Vega Fade")
+        # Kita tidak ubah votes, tapi kita beri tahu di log
+
+    # -----------------------------------------------------------------
+    # 5. KEPUTUSAN AKHIR
+    # -----------------------------------------------------------------
+    if votes["LONG"] > votes["SHORT"]:
+        result["bias"] = "LONG"
+        result["confidence"] = "ABSOLUTE" if votes["LONG"] >= 15 else "HIGH"
+    elif votes["SHORT"] > votes["LONG"]:
+        result["bias"] = "SHORT"
+        result["confidence"] = "ABSOLUTE" if votes["SHORT"] >= 15 else "HIGH"
+    else:
+        result["bias"] = "NEUTRAL"
+        result["confidence"] = "BLOCK"
+        reasons.append("DEADLOCK: Equal votes, skipping trade")
+
+    result["reason"] = f"[AGGREGATOR] {' | '.join(reasons)} | Original: {result.get('reason', '')}"
+    result["aggregator_votes"] = votes
+    result["aggregator_reasons"] = reasons
+    return result
+
+
 def greeks_final_screen(result: dict) -> dict:
     """
     Layer terakhir — dipanggil setelah semua logika selesai.
@@ -30542,6 +30640,10 @@ class BinanceAnalyzer:
                     result["position_multiplier"] = result.get("position_multiplier", 1.0) * (1 - rotation["discount"])
                     result["position_multiplier"] = max(0.3, result["position_multiplier"])
                     result["reason"] += f" | Rotation risk: {rotation.get('reason', '')}"
+
+            # ========== DECISION AGGREGATOR: Evidence-Based Voting with Arbitration ==========
+            # Ini adalah langkah terakhir sebelum return, menggantikan priority-based override chaos
+            result = arbitrate_final_decision(result)
 
             return result
 
