@@ -22694,6 +22694,32 @@ class BinanceAnalyzer:
                     result["entry_allowed"] = True
                     return result
         
+        # ========== PRIORITY -10165: ADVERSARIAL SHORT SQUEEZE CONTINUATION ==========
+        # Jika short_liq masih dekat (<2.5%), harga sudah naik (>3%), RSI5m belum overbought
+        # ekstrem (<85), dan buy pressure masih kuat (up_energy > 1.0, agg > 0.55),
+        # maka ini adalah KELANJUTAN SQUEEZE, abaikan exchange_safe dan funding warning.
+        delta_exposure = result.get("greeks_delta_exposure", 0.0)
+        
+        if (short_liq < 2.5 and 
+            change_5m_val > 3.0 and 
+            rsi6_5m_val < 85 and
+            up_energy_val > 1.0 and          # threshold minimal untuk buy pressure nyata
+            agg_val > 0.55 and               # sedikit dinaikkan dari 0.5
+            delta_exposure > 0.8):           # crowded LONG sebagai bahan bakar
+            
+            result["bias"] = "LONG"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = -10165
+            result["reason"] = (
+                f"[ADVERSARIAL SQUEEZE CONT] short_liq={short_liq:.2f}% masih dekat, "
+                f"price up {change_5m_val:.1f}%, RSI5m={rsi6_5m_val:.1f} (<85), "
+                f"up_energy={up_energy_val:.2f}, agg={agg_val:.2f}, delta_exposure={delta_exposure:.3f} → "
+                f"squeeze masih aktif. Abaikan exchange_safe SHORT, force LONG. | "
+                + result.get("reason", "")
+            )
+            result["entry_allowed"] = True
+            return result
+        
         # ========== PRIORITY -10160: EXCHANGE WARNING BLOW-OFF TOP ==========
         # Jika exchange_safe = SHORT, funding positif (>0.0005), short_liq dekat TAPI
         # delta_exposure tinggi (crowded LONG) dan who_dies_first = LONG_TRADERS,
