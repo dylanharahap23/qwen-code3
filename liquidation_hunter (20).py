@@ -9100,9 +9100,12 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
     if agg_val > 0.85 and ofi_bias == "LONG" and ofi_strength > 0.7:
         votes["LONG"] += 8.0
         reasons.append("HFT TRACE: Aggressive buying consensus")
-    elif agg_val < 0.15 and ofi_bias == "SHORT" and ofi_strength > 0.7:
+    if agg_val < 0.15 and ofi_bias == "SHORT" and ofi_strength > 0.7:
         votes["SHORT"] += 8.0
         reasons.append("HFT TRACE: Aggressive selling consensus")
+    
+    # Debug print untuk memastikan suara masuk
+    print(f"[DEBUG VOTES] After Tier 2 (HFT): LONG={votes['LONG']}, SHORT={votes['SHORT']}, agg={agg_val:.2f}, ofi={ofi_bias}, strength={ofi_strength:.2f}")
 
     # -----------------------------------------------------------------
     # 4. TIER 3: SINYAL MATEMATIS EKSTREM (Bobot 7.0)
@@ -9127,6 +9130,41 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
     
     bid_slope = context.get("bid_slope", 0.0)
     ask_slope = context.get("ask_slope", 0.0)
+    
+    # ========== GATE: BAIT SELL DOMINANCE FORCE SHORT (Prioritas -25000) ==========
+    # Gate ini khusus menangkap skenario di mana Binance sendiri sudah memberi peringatan SHORT,
+    # pasar dalam fase jebakan, volume rendah, dan data real-time (agg, OFI, order book) 
+    # mengonfirmasi tekanan jual. Ini adalah pola distribusi diam-diam sebelum dump.
+    exchange_safe = context.get("exchange_safe_direction", "NEUTRAL")
+    short_liq_val = context.get("short_liq", 99.0)
+    
+    if (market_phase == "BAIT" and 
+        volume_ratio < 0.7 and 
+        exchange_safe == "SHORT" and
+        long_liq < short_liq_val and long_liq < 5.0):
+        
+        # Hitung skor sinyal jual
+        sell_score = 0
+        if agg_val < 0.3: sell_score += 1
+        if ofi_bias == "SHORT" and ofi_strength > 0.7: sell_score += 1
+        if ask_slope > bid_slope * 2.0: sell_score += 1
+        
+        if sell_score >= 2:
+            result["bias"] = "SHORT"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = -25000
+            result["entry_allowed"] = True
+            result["reason"] = (
+                f"[BAIT SELL DOMINANCE] market_phase=BAIT, vol={volume_ratio:.2f}x, "
+                f"exchange_safe=SHORT, sell_score={sell_score}/3, long_liq={long_liq:.2f}%. "
+                f"Force SHORT, override all."
+            )
+            result["aggregator_reasons"] = ["BAIT SELL DOMINANCE FORCE SHORT"]
+            result["aggregator_votes"] = {"HARD_OVERRIDE": "SHORT"}
+            # Clear potential conflict fields
+            result["bias_kill_conflict"] = {"has_conflict": False}
+            result["dual_liq_trap"] = {"dual_liq_trap": False}
+            return result
     
     basic_trap_conditions = (
         market_phase == "BAIT" and 
