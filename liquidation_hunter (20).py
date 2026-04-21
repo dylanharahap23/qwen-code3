@@ -9113,84 +9113,103 @@ def arbitrate_final_decision(result: dict) -> dict:
     result["aggregator_votes"] = votes
     result["aggregator_reasons"] = reasons
     
-    # ========== TRAP OVERRIDE: BAIT + VEGA ACTIVE + GREEKS OVERRIDE ==========
-    # Pola paling licik HFT: pump/dump palsu di BAIT phase dengan Vega aktif.
-    # Meskipun Aggregator memberikan suara kuat ke satu arah, kita harus mengabaikannya
-    # dan mengikuti arah Greeks (yang biasanya SHORT pada kasus yang diberikan).
+    # ========== TRAP OVERRIDE DENGAN ENERGY VALIDATION GATE ==========
     market_phase = result.get("market_phase", "UNKNOWN")
     greeks_override = result.get("greeks_override", False)
     vega_score = result.get("greeks_vega_score", 0)
     volume_ratio = result.get("volume_ratio", 1.0)
     greeks_bias = result.get("greeks_bias", "NEUTRAL")
     
-    # Kondisi Trap: BAIT + Greeks override aktif + Vega score >= 4 + volume rendah
-    if (market_phase == "BAIT" and 
+    # Data fisik untuk validasi
+    up_energy = result.get("up_energy", 0.0)
+    down_energy = result.get("down_energy", 0.0)
+    exchange_safe = result.get("exchange_safe_direction", "NEUTRAL")
+    rsi6 = result.get("rsi6", 50.0)
+    agg_val = result.get("agg", 0.5)
+    ofi_bias = result.get("ofi_bias", "NEUTRAL")
+    ofi_strength = result.get("ofi_strength", 0.0)
+    bid_slope = result.get("bid_slope", 0.0)
+    ask_slope = result.get("ask_slope", 0.0)
+    
+    # Kondisi dasar Trap
+    basic_trap_conditions = (
+        market_phase == "BAIT" and 
         greeks_override and 
         vega_score >= 4 and 
         volume_ratio < 0.7 and
-        greeks_bias in ("LONG", "SHORT")):
+        greeks_bias in ("LONG", "SHORT")
+    )
+    
+    if basic_trap_conditions:
+        # --- GATE 1: Validasi Energi Pasar (Fisika Pasar Tidak Bisa Dispoof) ---
+        # Jika up_energy sangat dominan (>2.0) dan tidak ada seller, ini adalah real buying.
+        # Jangan pernah SHORT dalam kondisi ini.
+        if up_energy > 2.0 and down_energy < 0.1:
+            result["aggregator_reasons"].append(
+                f"TRAP OVERRIDE BLOCKED (Energy Gate): up_energy={up_energy:.2f} >> down_energy={down_energy:.2f}. Real buyers present."
+            )
+            # Lanjutkan ke keputusan normal (Aggregator)
+            basic_trap_conditions = False  # Batalkan trap
         
-        # === GUARD: Jangan override jika ada akumulasi jelas (Agg, OFI, Order Book) ===
-        agg_val = result.get("agg", 0.5)
-        ofi_bias = result.get("ofi_bias", "NEUTRAL")
-        ofi_strength = result.get("ofi_strength", 0.0)
-        bid_slope = result.get("bid_slope", 0.0)
-        ask_slope = result.get("ask_slope", 0.0)
+        # --- GATE 2: Validasi Exchange Safe Direction ---
+        # Jika exchange sendiri merekomendasikan arah yang berlawanan dengan greeks_bias,
+        # maka trap ini kemungkinan besar adalah jebakan untuk melawan exchange.
+        if basic_trap_conditions and exchange_safe != "NEUTRAL" and exchange_safe != greeks_bias:
+            result["aggregator_reasons"].append(
+                f"TRAP OVERRIDE BLOCKED (Exchange Gate): exchange_safe={exchange_safe} conflicts with greeks_bias={greeks_bias}."
+            )
+            basic_trap_conditions = False
         
-        # Kondisi akumulasi kuat: semua sinyal real-time bullish
+        # --- GATE 3: Validasi Extreme Capitulation (RSI < 10) ---
+        # RSI di bawah 10 adalah kondisi ekstrem yang hampir selalu memantul.
+        if basic_trap_conditions and rsi6 < 10:
+            result["aggregator_reasons"].append(
+                f"TRAP OVERRIDE BLOCKED (RSI Gate): RSI6={rsi6:.1f} is extreme capitulation, bounce imminent."
+            )
+            basic_trap_conditions = False
+            
+        # --- GATE 4: Validasi Akumulasi Kuat (Agg + OFI + Order Book) ---
+        # Jika real-time order flow menunjukkan akumulasi jelas, jangan dilawan.
         strong_accumulation = (
             agg_val > 0.8 and
             ofi_bias == "LONG" and ofi_strength > 0.7 and
-            bid_slope > ask_slope * 1.2  # buy wall dominan
+            bid_slope > ask_slope * 1.2
         )
-        
-        # Kondisi distribusi kuat (mirror)
         strong_distribution = (
             agg_val < 0.2 and
             ofi_bias == "SHORT" and ofi_strength > 0.7 and
             ask_slope > bid_slope * 1.2
         )
-        
-        if strong_accumulation and greeks_bias == "SHORT":
-            # Jangan override, biarkan Aggregator (yang kemungkinan sudah LONG)
-            if "aggregator_reasons" in result:
-                result["aggregator_reasons"].append("TRAP OVERRIDE BLOCKED: Strong accumulation detected (agg>0.8, OFI LONG, bid wall dominant)")
-            else:
-                result["aggregator_reasons"] = ["TRAP OVERRIDE BLOCKED: Strong accumulation detected (agg>0.8, OFI LONG, bid wall dominant)"]
-            # Jangan ubah bias, langsung return
-            return result
-        
-        if strong_distribution and greeks_bias == "LONG":
-            if "aggregator_reasons" in result:
-                result["aggregator_reasons"].append("TRAP OVERRIDE BLOCKED: Strong distribution detected")
-            else:
-                result["aggregator_reasons"] = ["TRAP OVERRIDE BLOCKED: Strong distribution detected"]
-            return result
-        
-        # Jika lolos guard, lakukan override
-        # Simpan bias sebelumnya untuk logging
+        if basic_trap_conditions and strong_accumulation and greeks_bias == "SHORT":
+            result["aggregator_reasons"].append(
+                "TRAP OVERRIDE BLOCKED (Accumulation Gate): Strong accumulation detected."
+            )
+            basic_trap_conditions = False
+        if basic_trap_conditions and strong_distribution and greeks_bias == "LONG":
+            result["aggregator_reasons"].append(
+                "TRAP OVERRIDE BLOCKED (Distribution Gate): Strong distribution detected."
+            )
+            basic_trap_conditions = False
+
+    # --- EKSEKUSI TRAP OVERRIDE JIKA MASIH LOLOS ---
+    if basic_trap_conditions:
         previous_bias = result.get("bias", "NEUTRAL")
-        # Terapkan paksa bias mengikuti Greeks
         result["bias"] = greeks_bias
         result["confidence"] = "ABSOLUTE"
-        result["priority_level"] = -20000  # Beri prioritas tertinggi
+        result["priority_level"] = -20000
         
-        # Catat alasan override
         trap_reason = (
             f"[TRAP OVERRIDE] BAIT phase + Vega active (score={vega_score}/6) + "
             f"Greeks override + volume={volume_ratio:.2f}x → Pola jebakan HFT terdeteksi. "
             f"Abaikan Aggregator (bias {previous_bias}), paksa ke {greeks_bias}."
         )
-        # Gabungkan dengan reason yang sudah ada
         result["reason"] = trap_reason + " | " + result.get("reason", "")
         
-        # Tambahkan juga ke aggregator_reasons untuk transparansi
         if "aggregator_reasons" in result:
             result["aggregator_reasons"].append("TRAP OVERRIDE ACTIVATED: " + trap_reason)
         else:
             result["aggregator_reasons"] = ["TRAP OVERRIDE ACTIVATED: " + trap_reason]
             
-        # Update aggregator_votes (opsional, untuk debugging)
         if "aggregator_votes" in result:
             result["aggregator_votes"]["TRAP_OVERRIDE"] = {
                 "forced_bias": greeks_bias,
