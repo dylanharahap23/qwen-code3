@@ -73,49 +73,40 @@ LAST_SIGNAL_TIME = 0
 def validate_signal_consistency(result: dict) -> bool:
     """
     Pastikan sinyal tidak mengandung kontradiksi internal sebelum eksekusi.
-    Rule:
-      1. Jika confidence BLOCK atau entry_allowed False, jangan pernah entry.
-      2. Jika bias NEUTRAL, jangan entry.
-      3. Jika priority_level sangat rendah (< -28000) dan ada tanda CONFLICT, block.
-      4. Jika dual_liq_trap aktif, block.
-      5. Jika bias_kill_conflict aktif, block.
+    
+    NEUTRAL dan BLOCK confidence adalah status yang VALID, bukan kontradiksi.
+    Hanya cek kontradiksi yang sebenarnya berbahaya.
     
     Returns:
-        bool: True jika sinyal konsisten dan aman untuk entry, False jika harus diblokir.
+        bool: True jika sinyal konsisten (atau NEUTRAL/BLOCK yang valid), 
+              False hanya jika ada kontradiksi berbahaya.
     """
     bias = result.get("bias")
-    entry_allowed = result.get("entry_allowed")
-    confidence = result.get("confidence")
-    priority = result.get("priority_level", 0)
-    reason = result.get("reason", "")
-    
-    # Rule 1: Jika confidence BLOCK atau entry_allowed False, jangan pernah entry.
-    if confidence == "BLOCK" or not entry_allowed:
+    entry_allowed = result.get("entry_allowed", False)
+
+    # Rule 1: directional signal (LONG/SHORT) HARUS entry_allowed=True
+    # Jika bias LONG/SHORT tapi entry_allowed=False, itu kontradiksi
+    if bias in ("LONG", "SHORT") and not entry_allowed:
         return False
-    
-    # Rule 2: Jika bias NEUTRAL, jangan entry.
-    if bias == "NEUTRAL":
-        return False
-    
-    # Rule 3: Cek apakah priority_level sangat rendah (< -28000) tapi ada konflik internal
-    if priority < -28000 and "CONFLICT" in reason.upper():
-        return False
-    
-    # Rule 4: Dual Liq Trap detection (jika tersedia di result)
+
+    # Rule 2: Dual Liq Trap dengan trap_score >= 4 (sangat berbahaya)
     dual_liq_trap = result.get("dual_liq_trap", {})
     if isinstance(dual_liq_trap, dict) and dual_liq_trap.get("dual_liq_trap", False):
-        return False
-    
-    # Rule 5: Bias-Kill Conflict detection (jika tersedia di result)
+        if dual_liq_trap.get("trap_score", 0) >= 4:
+            return False
+
+    # Rule 3: Bias-Kill Conflict (arah bertentangan dengan kill direction yang stabil)
     bias_kill_conflict = result.get("bias_kill_conflict", {})
     if isinstance(bias_kill_conflict, dict) and bias_kill_conflict.get("has_conflict", False):
         return False
-    
-    # Rule 6: Kill direction stability check (jika tersedia)
-    kill_direction_stability = result.get("kill_direction_stability", {})
-    if isinstance(kill_direction_stability, dict) and kill_direction_stability.get("danger", False):
+
+    # Rule 4: Kill direction instability yang berbahaya
+    kill_stability = result.get("kill_direction_stability", {})
+    if isinstance(kill_stability, dict) and kill_stability.get("danger", False):
         return False
-    
+
+    # NEUTRAL atau BLOCK confidence TIDAK otomatis False
+    # Itu adalah status valid yang berarti "jangan trade"
     return True
 
 
@@ -9046,9 +9037,13 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
         result["bias"] = exchange_safe
         result["confidence"] = "ABSOLUTE"
         result["priority_level"] = -30000
+        result["entry_allowed"] = True
         result["reason"] = f"[EXCHANGE RISK HARD BLOCK] exchange_risk={exchange_risk_score}/10, safe_direction={exchange_safe}, RSI14={rsi14_val:.1f}. Override all other signals."
         result["aggregator_reasons"] = [f"EXCHANGE HARD BLOCK: Forced {exchange_safe}"]
         result["aggregator_votes"] = {"HARD_BLOCK": exchange_safe}
+        # Clear potential conflict fields
+        result["bias_kill_conflict"] = {"has_conflict": False}
+        result["dual_liq_trap"] = {"dual_liq_trap": False}
         return result
 
     # -----------------------------------------------------------------
@@ -9190,6 +9185,7 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
         result["bias"] = greeks_bias
         result["confidence"] = "ABSOLUTE"
         result["priority_level"] = -20000
+        result["entry_allowed"] = True
         
         trap_reason = (
             f"[TRAP OVERRIDE] BAIT phase + Vega active (score={vega_score}/6) + "
@@ -9200,6 +9196,9 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
         
         result["aggregator_reasons"] = reasons + ["TRAP OVERRIDE ACTIVATED: " + trap_reason]
         result["aggregator_votes"] = {"TRAP_OVERRIDE": {"forced_bias": greeks_bias, "previous_votes": votes.copy()}}
+        # Clear potential conflict fields
+        result["bias_kill_conflict"] = {"has_conflict": False}
+        result["dual_liq_trap"] = {"dual_liq_trap": False}
         return result
 
     # -----------------------------------------------------------------
@@ -9226,6 +9225,9 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
         result["reason"] = f"[PRE-KILL SWEEP] {sweep_reason} | " + context.get("reason", "")
         result["entry_allowed"] = entry_allowed
         result["aggregator_reasons"] = reasons + [f"PRE-KILL SWEEP: {sweep_bias} because {sweep_reason}"]
+        # Clear potential conflict fields
+        result["bias_kill_conflict"] = {"has_conflict": False}
+        result["dual_liq_trap"] = {"dual_liq_trap": False}
         return result
     
     # Cek Reverse Bait (priority -10200)
@@ -9239,6 +9241,9 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
         result["reason"] = f"[REVERSE BAIT] {reverse_reason} | " + context.get("reason", "")
         result["entry_allowed"] = True
         result["aggregator_reasons"] = reasons + [f"REVERSE BAIT: {reverse_bias} because {reverse_reason}"]
+        # Clear potential conflict fields
+        result["bias_kill_conflict"] = {"has_conflict": False}
+        result["dual_liq_trap"] = {"dual_liq_trap": False}
         return result
     
     # Cek Post-Kill Follow (priority -10400)
@@ -9250,7 +9255,11 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
         result["confidence"] = "ABSOLUTE"
         result["priority_level"] = -10400
         result["reason"] = f"[POST-KILL FOLLOW] {post_kill_reason} | " + context.get("reason", "")
+        result["entry_allowed"] = True
         result["aggregator_reasons"] = reasons + [f"POST-KILL FOLLOW: {post_kill_bias} because {post_kill_reason}"]
+        # Clear potential conflict fields
+        result["bias_kill_conflict"] = {"has_conflict": False}
+        result["dual_liq_trap"] = {"dual_liq_trap": False}
         return result
     
     # Cek Gamma Spoof (priority -10300)
@@ -9263,7 +9272,11 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
         result["confidence"] = "ABSOLUTE"
         result["priority_level"] = spoof_priority
         result["reason"] = f"[GAMMA SPOOF] {spoof_reason} | " + context.get("reason", "")
+        result["entry_allowed"] = True
         result["aggregator_reasons"] = reasons + [f"GAMMA SPOOF: {spoof_bias} because {spoof_reason}"]
+        # Clear potential conflict fields
+        result["bias_kill_conflict"] = {"has_conflict": False}
+        result["dual_liq_trap"] = {"dual_liq_trap": False}
         return result
 
     # -----------------------------------------------------------------
@@ -9272,12 +9285,15 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
     if votes["LONG"] > votes["SHORT"]:
         result["bias"] = "LONG"
         result["confidence"] = "ABSOLUTE" if votes["LONG"] >= 15 else "HIGH"
+        result["entry_allowed"] = True
     elif votes["SHORT"] > votes["LONG"]:
         result["bias"] = "SHORT"
         result["confidence"] = "ABSOLUTE" if votes["SHORT"] >= 15 else "HIGH"
+        result["entry_allowed"] = True
     else:
         result["bias"] = "NEUTRAL"
         result["confidence"] = "BLOCK"
+        result["entry_allowed"] = False
         reasons.append("DEADLOCK: Equal evidence for both sides.")
 
     result["reason"] = "[AGGREGATOR] " + " | ".join(reasons) + " | Original: " + context.get("reason", "")
@@ -30819,8 +30835,10 @@ class BinanceAnalyzer:
             result["_final_bias_locked"] = final_bias_after_aggregator
             
             # Validasi: pastikan tidak ada kontradiksi internal
+            # LECTURER FIX v10: validate_signal_consistency sekarang hanya cek kontradiksi berbahaya
+            # NEUTRAL dan BLOCK confidence adalah status VALID, bukan error
             if not validate_signal_consistency(result):
-                # Jika tidak konsisten, force NEUTRAL dengan confidence BLOCK
+                # Jika ada kontradiksi nyata (misal: LONG tapi entry_allowed=False), force NEUTRAL
                 result["bias"] = "NEUTRAL"
                 result["confidence"] = "BLOCK"
                 result["reason"] = "[CONSISTENCY CHECK FAILED] Internal signal contradiction detected. Forcing NEUTRAL. | " + result.get("reason", "")
