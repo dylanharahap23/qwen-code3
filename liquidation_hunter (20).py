@@ -21859,9 +21859,8 @@ class ExtremeOverboughtPostSqueezeReversal:
 
 class UltraLowVolumeOBVExtremeReversal:
     """
-    🔥 PRIORITY -27960: AIOTUSDT FIX (DIPERBAIKI UNTUK PTBUSDT)
-    Volume ultra rendah (<0.4x), OBV ekstrem, pergerakan kecil → OBV stale, arah kebalikan.
-    TAPI JANGAN LONG jika momentum turun masih kuat (RSI5m < 15, OFI SHORT, price falling).
+    🔥 PRIORITY -27960: Volume ultra rendah (<0.4x), OBV ekstrem, pergerakan kecil → OBV stale, arah kebalikan.
+    🛡️ GUARD ABSOLUT: JANGAN override jika OFI dan Agg konsisten ekstrem ke satu arah.
     """
     @staticmethod
     def detect(volume_ratio: float, obv_trend: str,
@@ -21878,14 +21877,20 @@ class UltraLowVolumeOBVExtremeReversal:
         if abs(change_5m) > 2.5:
             return {"override": False}
 
-        # ===== GUARD PTBUSDT: JANGAN LONG JIKA MASIH FALLING KNIFE =====
-        # Kondisi: harga turun, RSI5m sangat oversold (<15), OFI SHORT kuat
+        # ===== GUARD ABSOLUT: JANGAN LAWAN KONSENSUS OFI + AGG =====
+        # Jika OFI dan Agg sama-sama ekstrem bullish atau bearish, OBV tidak relevan.
+        if ofi_bias == "LONG" and ofi_strength > 0.8 and agg > 0.8:
+            return {"override": False}
+        if ofi_bias == "SHORT" and ofi_strength > 0.8 and agg < 0.2:
+            return {"override": False}
+
+        # ===== GUARD FALLING KNIFE (PTBUSDT) =====
         if obv_trend == "NEGATIVE_EXTREME":
             if (change_5m < -0.2 and rsi6_5m < 15 and 
                 ofi_bias == "SHORT" and ofi_strength > 0.6):
-                return {"override": False}  # Falling knife, jangan paksa LONG
+                return {"override": False}
 
-        # ===== GUARD EDUUSDT: JANGAN SHORT JIKA INI ADALAH QUIET ACCUMULATION =====
+        # ===== GUARD QUIET ACCUMULATION (EDUUSDT) =====
         if obv_trend == "POSITIVE_EXTREME":
             is_quiet_accumulation = (
                 funding_rate < -0.0005 and
@@ -21895,6 +21900,7 @@ class UltraLowVolumeOBVExtremeReversal:
             if is_quiet_accumulation:
                 return {"override": False}
 
+        # ===== EKSEKUSI OVERRIDE =====
         if obv_trend == "POSITIVE_EXTREME":
             return {
                 "override": True,
