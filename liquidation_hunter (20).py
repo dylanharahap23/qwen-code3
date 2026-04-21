@@ -22450,6 +22450,35 @@ class BinanceAnalyzer:
         if result.get("algo_type_bias", "NEUTRAL") != json_algo:
             result["algo_type_bias"] = json_algo
         
+        # ========== PRIORITY -10070: ASK WALL DOMINANT FAKE SQUEEZE (BATALKAN LONG) ==========
+        # Jika short_liq super dekat (<1.5%) TAPI ada ask wall dominan (>5x bid) 
+        # dan long_liq juga dalam jangkauan (<5%), maka short_liq adalah UMPAN.
+        # Ini adalah fake squeeze, paksa SHORT.
+        ask_slope_val = result.get("ask_slope", 0.0)
+        bid_slope_val = result.get("bid_slope", 1.0)
+        if bid_slope_val > 0:
+            ask_bid_ratio = ask_slope_val / bid_slope_val
+        else:
+            ask_bid_ratio = 999.0
+
+        if (short_liq < 1.5 and 
+            ask_bid_ratio > 5.0 and 
+            long_liq < 5.0 and
+            result.get("exchange_safe_direction") == "SHORT"):
+            
+            result["bias"] = "SHORT"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = -10070
+            result["reason"] = (
+                f"[ASK WALL FAKE SQUEEZE] short_liq={short_liq:.2f}% (umpan), "
+                f"ask/bid ratio={ask_bid_ratio:.1f}x (sell wall raksasa), "
+                f"long_liq={long_liq:.2f}% (target dump), "
+                f"exchange_safe=SHORT → batalkan semua sinyal LONG, force SHORT. | "
+                + result.get("reason", "")
+            )
+            result["entry_allowed"] = True
+            return result
+        
         # ========== STEP 1: GENUINE SHORT SQUEEZE ABSOLUTE (PRIORITY -10060) ==========
         # Ini harus paling pertama, bahkan sebelum Vega Fade
         genuine_squeeze = GenuineShortSqueezeAbsolute.detect(
