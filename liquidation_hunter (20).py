@@ -6279,12 +6279,18 @@ class VegaFadeOverride:
     🛡️ GUARD: Jangan fade jika RSI 5m sudah ekstrem oversold (<20) dan harga naik,
               atau RSI 5m ekstrem overbought (>80) dan harga turun.
               Ini adalah tanda reversal nyata, bukan fake move.
+    
+    🛡️ GUARD ONUSDT: Jangan fade ke SHORT jika RSI5m oversold (<30), OFI LONG kuat, dan Agg > 0.7.
+                      Ini adalah real recovery, bukan fake move.
     """
     @staticmethod
     def detect(market_phase: str, vega_active: bool, vega_score: int,
                volume_ratio: float, change_5m: float,
                rsi6_5m: float = 50.0,
-               exchange_safe: str = "NEUTRAL") -> dict:
+               exchange_safe: str = "NEUTRAL",
+               ofi_bias: str = "NEUTRAL",
+               ofi_strength: float = 0.0,
+               agg: float = 0.5) -> dict:
         
         if not (market_phase == "BAIT" and vega_active and vega_score >= 5 and volume_ratio < 0.7):
             return {"override": False}
@@ -6304,6 +6310,13 @@ class VegaFadeOverride:
             return {"override": False}
         if exchange_safe == "SHORT" and fade_direction == "LONG":
             return {"override": False}
+        
+        # ===== GUARD ONUSDT: JANGAN FADE KE SHORT JIKA RSI5M OVERSOLD & OFI/AGG BULLISH =====
+        if fade_direction == "SHORT":
+            if (rsi6_5m < 30 and 
+                ofi_bias == "LONG" and ofi_strength > 0.6 and 
+                agg > 0.7):
+                return {"override": False}  # Real recovery, jangan fade
         
         return {
             "override": True,
@@ -21846,9 +21859,9 @@ class ExtremeOverboughtPostSqueezeReversal:
 
 class UltraLowVolumeOBVExtremeReversal:
     """
-    🔥 PRIORITY -27960: AIOTUSDT FIX (DIPERBAIKI UNTUK EDUUSDT)
+    🔥 PRIORITY -27960: AIOTUSDT FIX (DIPERBAIKI UNTUK PTBUSDT)
     Volume ultra rendah (<0.4x), OBV ekstrem, pergerakan kecil → OBV stale, arah kebalikan.
-    TAPI JANGAN SHORT jika ada sinyal akumulasi kuat (Funding Negatif + Greeks LONG).
+    TAPI JANGAN LONG jika momentum turun masih kuat (RSI5m < 15, OFI SHORT, price falling).
     """
     @staticmethod
     def detect(volume_ratio: float, obv_trend: str,
@@ -21856,45 +21869,44 @@ class UltraLowVolumeOBVExtremeReversal:
                short_liq: float, long_liq: float,
                funding_rate: float = 0.0,
                greeks_kill_direction: str = "",
-               ofi_bias: str = "NEUTRAL") -> dict:
+               ofi_bias: str = "NEUTRAL",
+               ofi_strength: float = 0.0,
+               rsi6_5m: float = 50.0) -> dict:
         
         if volume_ratio >= 0.4:
             return {"override": False}
         if abs(change_5m) > 2.5:
             return {"override": False}
 
+        # ===== GUARD PTBUSDT: JANGAN LONG JIKA MASIH FALLING KNIFE =====
+        # Kondisi: harga turun, RSI5m sangat oversold (<15), OFI SHORT kuat
+        if obv_trend == "NEGATIVE_EXTREME":
+            if (change_5m < -0.2 and rsi6_5m < 15 and 
+                ofi_bias == "SHORT" and ofi_strength > 0.6):
+                return {"override": False}  # Falling knife, jangan paksa LONG
+
         # ===== GUARD EDUUSDT: JANGAN SHORT JIKA INI ADALAH QUIET ACCUMULATION =====
-        # Tanda-tanda akumulasi diam-diam:
-        # 1. OBV positif (sudah terpenuhi)
-        # 2. Funding negatif (crowded short = banyak yang salah posisi)
-        # 3. Greeks kill_direction = LONG
-        # 4. OFI = LONG (buy order flow)
-        is_quiet_accumulation = (
-            obv_trend == "POSITIVE_EXTREME" and
-            funding_rate < -0.0005 and
-            greeks_kill_direction == "LONG" and
-            ofi_bias == "LONG"
-        )
-        if is_quiet_accumulation:
-            return {"override": False}  # Jangan ganggu, biarkan sinyal LONG bekerja
+        if obv_trend == "POSITIVE_EXTREME":
+            is_quiet_accumulation = (
+                funding_rate < -0.0005 and
+                greeks_kill_direction == "LONG" and
+                ofi_bias == "LONG"
+            )
+            if is_quiet_accumulation:
+                return {"override": False}
 
         if obv_trend == "POSITIVE_EXTREME":
             return {
                 "override": True,
                 "bias": "SHORT",
-                "reason": (
-                    f"ULTRA LOW VOL OBV EXTREME: vol={volume_ratio:.2f}x, OBV={obv_trend} (stale), "
-                    f"price move {change_5m:.1f}% → OBV tidak mencerminkan kondisi sekarang, force SHORT."
-                ),
+                "reason": f"ULTRA LOW VOL OBV EXTREME: vol={volume_ratio:.2f}x, OBV={obv_trend} (stale), force SHORT.",
                 "priority": -27960
             }
         elif obv_trend == "NEGATIVE_EXTREME":
             return {
                 "override": True,
                 "bias": "LONG",
-                "reason": (
-                    f"ULTRA LOW VOL OBV EXTREME: vol={volume_ratio:.2f}x, OBV={obv_trend} (stale), force LONG."
-                ),
+                "reason": f"ULTRA LOW VOL OBV EXTREME: vol={volume_ratio:.2f}x, OBV={obv_trend} (stale), force LONG.",
                 "priority": -27960
             }
         return {"override": False}
@@ -22696,8 +22708,11 @@ class BinanceAnalyzer:
                 vega_score=result.get("greeks_vega_score", 0),
                 volume_ratio=volume_ratio,
                 change_5m=change_5m_val,
-                rsi6_5m=result.get("rsi6_5m", 50.0),           # <-- tambahkan
-                exchange_safe=result.get("exchange_safe_direction", "NEUTRAL")  # <-- tambahkan
+                rsi6_5m=result.get("rsi6_5m", 50.0),
+                exchange_safe=result.get("exchange_safe_direction", "NEUTRAL"),
+                ofi_bias=result.get("ofi_bias", "NEUTRAL"),
+                ofi_strength=result.get("ofi_strength", 0.0),
+                agg=result.get("agg", 0.5)
             )
             if vega_fade["override"]:
                 result["bias"] = vega_fade["bias"]
@@ -22817,7 +22832,9 @@ class BinanceAnalyzer:
             short_liq=short_liq, long_liq=long_liq,
             funding_rate=funding_rate_val,
             greeks_kill_direction=kill_direction,
-            ofi_bias=ofi_bias
+            ofi_bias=ofi_bias,
+            ofi_strength=result.get("ofi_strength", 0.0),
+            rsi6_5m=result.get("rsi6_5m", 50.0)
         )
         if ultra_low_obv_rev["override"]:
             result["bias"] = ultra_low_obv_rev["bias"]
