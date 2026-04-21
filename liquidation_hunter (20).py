@@ -9018,87 +9018,52 @@ def _greeks_absolute_score(
 
 
 # ========== DECISION AGGREGATOR (Menggantikan Priority Chaos) ==========
-def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict:
+def arbitrate_final_decision(result: dict) -> dict:
     """
     Menggantikan sistem priority-based override.
     Mengumpulkan suara dari semua detector yang aktif dan memutuskan
     berdasarkan bobot dan hirarki kepercayaan.
+    
+    Hirarki Kebenaran (Source of Truth):
+    - Tier 1 (Fisika Pasar): liquidity proximity, down_energy = 0 (hukum supply-demand). Bobot Maks: 10.0
+    - Tier 2 (Jejak HFT): agg, OFI, bid/ask slope. Bobot Maks: 8.0
+    - Tier 3 (Matematis): Greeks Gamma, RSI ekstrem. Bobot Maks: 7.0
+    - Tier 4 (Psikologi): OBV lagging, Funding Rate, Vega Fade. Bobot Maks: 5.0
     """
-    # -----------------------------------------------------------------
-    # 0. EXCHANGE RISK HARD BLOCK (Prioritas Tertinggi, -30000)
-    # -----------------------------------------------------------------
-    exchange_risk_score = result.get("exchange_risk_score", 0)
-    exchange_safe = result.get("exchange_safe_direction", "NEUTRAL")
-    rsi14_val = result.get("rsi14", 50.0)
-    rsi6_val = result.get("rsi6", 50.0)
-    short_liq = result.get("short_liq", 99.0)
-    
-    # Kondisi pengecualian: jika ini adalah genuine short squeeze (RSI rendah + short_liq dekat + exchange_safe = LONG)
-    is_genuine_squeeze = (rsi6_val < 40 and short_liq < 3.0 and exchange_safe == "LONG")
-    
-    if (exchange_risk_score >= 6 and 
-        exchange_safe in ("LONG", "SHORT") and 
-        not is_genuine_squeeze):
-        
-        result["bias"] = exchange_safe
-        result["confidence"] = "ABSOLUTE"
-        result["priority_level"] = -30000
-        result["reason"] = f"[EXCHANGE RISK HARD BLOCK] exchange_risk={exchange_risk_score}/10, safe_direction={exchange_safe}, RSI14={rsi14_val:.1f}. Override all other signals."
-        result["aggregator_reasons"] = [f"EXCHANGE HARD BLOCK: Forced {exchange_safe}"]
-        result["aggregator_votes"] = {"HARD_BLOCK": exchange_safe}
-        return result
-
-    # -----------------------------------------------------------------
-    # 1. INISIALISASI VOTING
-    # -----------------------------------------------------------------
     votes = {"LONG": 0.0, "SHORT": 0.0}
     reasons = []
-    context = result
-
+    context = result  # semua data ada di sini
+    
     # -----------------------------------------------------------------
-    # 2. TIER 1: HUKUM FISIKA PASAR (Bobot 10.0)
+    # 1. TIER 1: HUKUM FISIKA PASAR (Bobot 10.0)
     # -----------------------------------------------------------------
     liq_bias = "LONG" if context.get("short_liq", 99) < context.get("long_liq", 99) else "SHORT"
     liq_diff = abs(context.get("short_liq", 0) - context.get("long_liq", 0))
-    long_liq = context.get("long_liq", 99.0)
     
-    # LIQUIDITY LAW dengan bobot dinamis
-    if short_liq < 1.5 and short_liq < long_liq:
-        liq_weight = 10.0
-        # Jika exchange risk HIGH dan merekomendasikan SHORT, turunkan bobot
-        if exchange_risk_score >= 6 and exchange_safe == "SHORT":
-            liq_weight = 3.0
-            reasons.append(f"LIQUIDITY LAW: short_liq ultra close but EXCHANGE WARNING reduces weight to {liq_weight}")
-        else:
+    if liq_diff > 1.0:  # Hanya suara jika target likuiditas tidak simetris
+        if context.get("short_liq", 99) < 1.5:
+            votes["LONG"] += 10.0
             reasons.append("LIQUIDITY LAW: short_liq ultra close")
-        votes["LONG"] += liq_weight
-        
-    elif long_liq < 1.5 and long_liq < short_liq:
-        liq_weight = 10.0
-        if exchange_risk_score >= 6 and exchange_safe == "LONG":
-            liq_weight = 3.0
-            reasons.append(f"LIQUIDITY LAW: long_liq ultra close but EXCHANGE WARNING reduces weight to {liq_weight}")
-        else:
+        elif context.get("long_liq", 99) < 1.5:
+            votes["SHORT"] += 10.0
             reasons.append("LIQUIDITY LAW: long_liq ultra close")
-        votes["SHORT"] += liq_weight
-
+    
     # Zero Sellers / Buyers (Vacuum)
-    up_energy = context.get("up_energy", 0.0)
-    down_energy = context.get("down_energy", 0.0)
-    if down_energy < 0.01 and up_energy > 0.5:
+    if context.get("down_energy", 1.0) < 0.01 and context.get("up_energy", 0) > 0.5:
         votes["LONG"] += 8.0
         reasons.append("VACUUM: No sellers + active buyers")
-    if up_energy < 0.01 and down_energy > 0.5:
+    if context.get("up_energy", 1.0) < 0.01 and context.get("down_energy", 0) > 0.5:
         votes["SHORT"] += 8.0
         reasons.append("VACUUM: No buyers + active sellers")
 
     # -----------------------------------------------------------------
-    # 3. TIER 2: JEJAK HFT (Bobot 8.0)
+    # 2. TIER 2: JEJAK HFT (Bobot 8.0)
     # -----------------------------------------------------------------
     agg_val = context.get("agg", 0.5)
     ofi_bias = context.get("ofi_bias", "NEUTRAL")
     ofi_strength = context.get("ofi_strength", 0.0)
     
+    # Agg & OFI Consensus
     if agg_val > 0.85 and ofi_bias == "LONG" and ofi_strength > 0.7:
         votes["LONG"] += 8.0
         reasons.append("HFT TRACE: Aggressive buying consensus")
@@ -9107,100 +9072,31 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
         reasons.append("HFT TRACE: Aggressive selling consensus")
 
     # -----------------------------------------------------------------
-    # 4. TIER 3: SINYAL MATEMATIS EKSTREM (Bobot 7.0)
+    # 3. TIER 3: SINYAL MATEMATIS EKSTREM (Bobot 7.0)
     # -----------------------------------------------------------------
     rsi_val = context.get("rsi6_5m", 50.0)
-    change_5m = context.get("change_5m", 0.0)
-    if rsi_val < 15 and change_5m < -2.0:
+    if rsi_val < 15 and context.get("change_5m", 0) < -2.0:
         votes["LONG"] += 7.0
-        reasons.append("MATH: Extreme capitulation (RSI5m<15)")
-    elif rsi_val > 85 and change_5m > 2.0:
+        reasons.append("MATH: Extreme capitulation (RSI<15)")
+    elif rsi_val > 85 and context.get("change_5m", 0) > 2.0:
         votes["SHORT"] += 7.0
-        reasons.append("MATH: Extreme blow-off (RSI5m>85)")
+        reasons.append("MATH: Extreme blow-off (RSI>85)")
 
     # -----------------------------------------------------------------
-    # 5. TRAP OVERRIDE DENGAN 6 GATE VALIDASI
+    # 4. PENGECUALIAN KHUSUS: BATALKAN KEPUTUSAN JIKA ADA TRAP KRITIS
     # -----------------------------------------------------------------
-    market_phase = context.get("market_phase", "UNKNOWN")
-    greeks_override = context.get("greeks_override", False)
-    vega_score = context.get("greeks_vega_score", 0)
-    volume_ratio = context.get("volume_ratio", 1.0)
-    greeks_bias = context.get("greeks_bias", "NEUTRAL")
+    # Ini menggantikan fungsi "Hard Block" dengan lebih elegan
+    if context.get("exchange_risk_score", 0) >= 8 and votes["LONG"] > votes["SHORT"]:
+        reasons.append("VETO: Exchange Risk Score Critical, overriding LONG to SHORT")
+        votes["SHORT"] = votes["LONG"] + 1  # Paksa SHORT menang
     
-    bid_slope = context.get("bid_slope", 0.0)
-    ask_slope = context.get("ask_slope", 0.0)
-    
-    basic_trap_conditions = (
-        market_phase == "BAIT" and 
-        greeks_override and 
-        vega_score >= 4 and 
-        volume_ratio < 0.7 and
-        greeks_bias in ("LONG", "SHORT")
-    )
-    
-    if basic_trap_conditions:
-        # GATE 1: Validasi Energi Pasar
-        if up_energy > 2.0 and down_energy < 0.1:
-            reasons.append(f"TRAP OVERRIDE BLOCKED (Energy Gate): up_energy={up_energy:.2f} >> down_energy={down_energy:.2f}")
-            basic_trap_conditions = False
-            
-        # GATE 2: Validasi Exchange Safe Direction
-        if basic_trap_conditions and exchange_safe != "NEUTRAL" and exchange_safe != greeks_bias:
-            reasons.append(f"TRAP OVERRIDE BLOCKED (Exchange Gate): exchange_safe={exchange_safe} conflicts with greeks_bias={greeks_bias}")
-            basic_trap_conditions = False
-            
-        # GATE 3: Validasi Extreme Capitulation
-        if basic_trap_conditions and rsi6_val < 10:
-            reasons.append(f"TRAP OVERRIDE BLOCKED (RSI Gate): RSI6={rsi6_val:.1f} is extreme capitulation")
-            basic_trap_conditions = False
-            
-        # GATE 4: Validasi Akumulasi/Distribusi Kuat
-        strong_accumulation = (agg_val > 0.8 and ofi_bias == "LONG" and ofi_strength > 0.7 and bid_slope > ask_slope * 1.2)
-        strong_distribution = (agg_val < 0.2 and ofi_bias == "SHORT" and ofi_strength > 0.7 and ask_slope > bid_slope * 1.2)
-        if basic_trap_conditions and strong_accumulation and greeks_bias == "SHORT":
-            reasons.append("TRAP OVERRIDE BLOCKED (Accumulation Gate)")
-            basic_trap_conditions = False
-        if basic_trap_conditions and strong_distribution and greeks_bias == "LONG":
-            reasons.append("TRAP OVERRIDE BLOCKED (Distribution Gate)")
-            basic_trap_conditions = False
-            
-        # GATE 5: Validasi Ask/Bid Ratio Ekstrem
-        if basic_trap_conditions:
-            ask_bid_ratio = ask_slope / bid_slope if bid_slope > 0 else 999
-            bid_ask_ratio = bid_slope / ask_slope if ask_slope > 0 else 999
-            if greeks_bias == "LONG" and ask_bid_ratio > 5.0:
-                reasons.append(f"TRAP OVERRIDE BLOCKED (Ask Wall Gate): ask/bid ratio = {ask_bid_ratio:.1f}x > 5x")
-                basic_trap_conditions = False
-            if greeks_bias == "SHORT" and bid_ask_ratio > 5.0:
-                reasons.append(f"TRAP OVERRIDE BLOCKED (Bid Wall Gate): bid/ask ratio = {bid_ask_ratio:.1f}x > 5x")
-                basic_trap_conditions = False
-                
-        # GATE 6: BAIT Phase + Overbought Protection
-        if basic_trap_conditions:
-            if market_phase == "BAIT" and rsi14_val > 70 and greeks_bias == "LONG":
-                reasons.append(f"TRAP OVERRIDE BLOCKED (RSI Overbought Gate): RSI14={rsi14_val:.1f} > 70")
-                basic_trap_conditions = False
-
-    # EKSEKUSI TRAP OVERRIDE JIKA MASIH LOLOS
-    if basic_trap_conditions:
-        previous_bias = "LONG" if votes["LONG"] > votes["SHORT"] else "SHORT" if votes["SHORT"] > votes["LONG"] else "NEUTRAL"
-        result["bias"] = greeks_bias
-        result["confidence"] = "ABSOLUTE"
-        result["priority_level"] = -20000
-        
-        trap_reason = (
-            f"[TRAP OVERRIDE] BAIT phase + Vega active (score={vega_score}/6) + "
-            f"Greeks override + volume={volume_ratio:.2f}x → Pola jebakan HFT terdeteksi. "
-            f"Abaikan Aggregator (bias {previous_bias}), paksa ke {greeks_bias}."
-        )
-        result["reason"] = trap_reason + " | " + context.get("reason", "")
-        
-        result["aggregator_reasons"] = reasons + ["TRAP OVERRIDE ACTIVATED: " + trap_reason]
-        result["aggregator_votes"] = {"TRAP_OVERRIDE": {"forced_bias": greeks_bias, "previous_votes": votes.copy()}}
-        return result
+    # Jika Vega Fade konflik dengan Liquidity (contoh GUNUSDT), prioritaskan Liquidity
+    if context.get("greeks_vega_active") and liq_diff > 0.5:
+        reasons.append("ARBITRATION: Liquidity overrides Vega Fade")
+        # Kita tidak ubah votes, tapi kita beri tahu di log
 
     # -----------------------------------------------------------------
-    # 6. KEPUTUSAN AKHIR (VOTING)
+    # 5. KEPUTUSAN AKHIR
     # -----------------------------------------------------------------
     if votes["LONG"] > votes["SHORT"]:
         result["bias"] = "LONG"
@@ -9211,11 +9107,115 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
     else:
         result["bias"] = "NEUTRAL"
         result["confidence"] = "BLOCK"
-        reasons.append("DEADLOCK: Equal evidence for both sides.")
+        reasons.append("DEADLOCK: Equal votes, skipping trade")
 
-    result["reason"] = "[AGGREGATOR] " + " | ".join(reasons) + " | Original: " + context.get("reason", "")
-    result["aggregator_reasons"] = reasons
+    result["reason"] = f"[AGGREGATOR] {' | '.join(reasons)} | Original: {result.get('reason', '')}"
     result["aggregator_votes"] = votes
+    result["aggregator_reasons"] = reasons
+    
+    # ========== TRAP OVERRIDE DENGAN ENERGY VALIDATION GATE ==========
+    market_phase = result.get("market_phase", "UNKNOWN")
+    greeks_override = result.get("greeks_override", False)
+    vega_score = result.get("greeks_vega_score", 0)
+    volume_ratio = result.get("volume_ratio", 1.0)
+    greeks_bias = result.get("greeks_bias", "NEUTRAL")
+    
+    # Data fisik untuk validasi
+    up_energy = result.get("up_energy", 0.0)
+    down_energy = result.get("down_energy", 0.0)
+    exchange_safe = result.get("exchange_safe_direction", "NEUTRAL")
+    rsi6 = result.get("rsi6", 50.0)
+    agg_val = result.get("agg", 0.5)
+    ofi_bias = result.get("ofi_bias", "NEUTRAL")
+    ofi_strength = result.get("ofi_strength", 0.0)
+    bid_slope = result.get("bid_slope", 0.0)
+    ask_slope = result.get("ask_slope", 0.0)
+    
+    # Kondisi dasar Trap
+    basic_trap_conditions = (
+        market_phase == "BAIT" and 
+        greeks_override and 
+        vega_score >= 4 and 
+        volume_ratio < 0.7 and
+        greeks_bias in ("LONG", "SHORT")
+    )
+    
+    if basic_trap_conditions:
+        # --- GATE 1: Validasi Energi Pasar (Fisika Pasar Tidak Bisa Dispoof) ---
+        # Jika up_energy sangat dominan (>2.0) dan tidak ada seller, ini adalah real buying.
+        # Jangan pernah SHORT dalam kondisi ini.
+        if up_energy > 2.0 and down_energy < 0.1:
+            result["aggregator_reasons"].append(
+                f"TRAP OVERRIDE BLOCKED (Energy Gate): up_energy={up_energy:.2f} >> down_energy={down_energy:.2f}. Real buyers present."
+            )
+            # Lanjutkan ke keputusan normal (Aggregator)
+            basic_trap_conditions = False  # Batalkan trap
+        
+        # --- GATE 2: Validasi Exchange Safe Direction ---
+        # Jika exchange sendiri merekomendasikan arah yang berlawanan dengan greeks_bias,
+        # maka trap ini kemungkinan besar adalah jebakan untuk melawan exchange.
+        if basic_trap_conditions and exchange_safe != "NEUTRAL" and exchange_safe != greeks_bias:
+            result["aggregator_reasons"].append(
+                f"TRAP OVERRIDE BLOCKED (Exchange Gate): exchange_safe={exchange_safe} conflicts with greeks_bias={greeks_bias}."
+            )
+            basic_trap_conditions = False
+        
+        # --- GATE 3: Validasi Extreme Capitulation (RSI < 10) ---
+        # RSI di bawah 10 adalah kondisi ekstrem yang hampir selalu memantul.
+        if basic_trap_conditions and rsi6 < 10:
+            result["aggregator_reasons"].append(
+                f"TRAP OVERRIDE BLOCKED (RSI Gate): RSI6={rsi6:.1f} is extreme capitulation, bounce imminent."
+            )
+            basic_trap_conditions = False
+            
+        # --- GATE 4: Validasi Akumulasi Kuat (Agg + OFI + Order Book) ---
+        # Jika real-time order flow menunjukkan akumulasi jelas, jangan dilawan.
+        strong_accumulation = (
+            agg_val > 0.8 and
+            ofi_bias == "LONG" and ofi_strength > 0.7 and
+            bid_slope > ask_slope * 1.2
+        )
+        strong_distribution = (
+            agg_val < 0.2 and
+            ofi_bias == "SHORT" and ofi_strength > 0.7 and
+            ask_slope > bid_slope * 1.2
+        )
+        if basic_trap_conditions and strong_accumulation and greeks_bias == "SHORT":
+            result["aggregator_reasons"].append(
+                "TRAP OVERRIDE BLOCKED (Accumulation Gate): Strong accumulation detected."
+            )
+            basic_trap_conditions = False
+        if basic_trap_conditions and strong_distribution and greeks_bias == "LONG":
+            result["aggregator_reasons"].append(
+                "TRAP OVERRIDE BLOCKED (Distribution Gate): Strong distribution detected."
+            )
+            basic_trap_conditions = False
+
+    # --- EKSEKUSI TRAP OVERRIDE JIKA MASIH LOLOS ---
+    if basic_trap_conditions:
+        previous_bias = result.get("bias", "NEUTRAL")
+        result["bias"] = greeks_bias
+        result["confidence"] = "ABSOLUTE"
+        result["priority_level"] = -20000
+        
+        trap_reason = (
+            f"[TRAP OVERRIDE] BAIT phase + Vega active (score={vega_score}/6) + "
+            f"Greeks override + volume={volume_ratio:.2f}x → Pola jebakan HFT terdeteksi. "
+            f"Abaikan Aggregator (bias {previous_bias}), paksa ke {greeks_bias}."
+        )
+        result["reason"] = trap_reason + " | " + result.get("reason", "")
+        
+        if "aggregator_reasons" in result:
+            result["aggregator_reasons"].append("TRAP OVERRIDE ACTIVATED: " + trap_reason)
+        else:
+            result["aggregator_reasons"] = ["TRAP OVERRIDE ACTIVATED: " + trap_reason]
+            
+        if "aggregator_votes" in result:
+            result["aggregator_votes"]["TRAP_OVERRIDE"] = {
+                "forced_bias": greeks_bias,
+                "previous_votes": result["aggregator_votes"].copy()
+            }
+    
     return result
 
 
