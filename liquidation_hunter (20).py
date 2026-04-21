@@ -22575,6 +22575,30 @@ class BinanceAnalyzer:
                 result["entry_allowed"] = True
                 return result
         
+        # ========== PRIORITY -10130: EXTREME OVERBOUGHT SHORT LIQ TRAP ==========
+        # Jika short_liq super dekat TAPI RSI5m sudah overbought ekstrem (>85) 
+        # DAN exchange_safe = SHORT, maka short_liq adalah UMPAN.
+        # Batalkan semua sinyal LONG, force SHORT.
+        exchange_safe = result.get("exchange_safe_direction", "NEUTRAL")
+        
+        if (short_liq < 1.5 and 
+            rsi6_5m_val > 85 and 
+            exchange_safe == "SHORT" and
+            funding_rate_val > 0.0001):  # crowded long, bukan short squeeze
+            
+            result["bias"] = "SHORT"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = -10130
+            result["reason"] = (
+                f"[EXTREME OB SHORT LIQ TRAP] short_liq={short_liq:.2f}% (umpan), "
+                f"RSI5m={rsi6_5m_val:.1f} (>85 overbought), "
+                f"exchange_safe={exchange_safe}, stoch_j={stoch_j_val:.1f}, "
+                f"funding={funding_rate_val:.6f} → ini jebakan LONG sebelum dump. "
+                f"Batalkan semua sinyal LONG, force SHORT. | " + result.get("reason", "")
+            )
+            result["entry_allowed"] = True
+            return result
+        
         # ========== PRIORITY -10120: MOMENTUM CONTINUATION OVERRIDE (BATALKAN VEGA FADE) ==========
         # Jika harga sudah bergerak signifikan (>1.5%) dan OFI/Agg mengkonfirmasi arah,
         # serta ada target likuiditas yang mendukung, maka ikuti momentum (jangan fade).
