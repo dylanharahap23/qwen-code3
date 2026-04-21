@@ -22499,6 +22499,40 @@ class BinanceAnalyzer:
             # Nonaktifkan sementara Vega Fade untuk sinyal ini
             result["_block_vega_fade"] = True
         
+        # ========== PRIORITY -10100: ALGO+HFT CONSENSUS OVERRIDE (BATALKAN VEGA FADE) ==========
+        # Jika Algo dan HFT keduanya sepakat LONG/SHORT, dan ada target likuiditas di bawah 3%,
+        # maka abaikan semua sinyal fade (termasuk Vega) dan ikuti konsensus.
+        algo_bias = result.get("algo_type_bias", "NEUTRAL")
+        hft_bias = result.get("hft_6pct_bias", "NEUTRAL")
+        consensus_direction = None
+        if algo_bias == hft_bias and algo_bias in ("LONG", "SHORT"):
+            consensus_direction = algo_bias
+
+        if consensus_direction:
+            # Cek apakah ada target likuiditas yang mendukung
+            if consensus_direction == "LONG" and short_liq < 3.0:
+                result["bias"] = "LONG"
+                result["confidence"] = "ABSOLUTE"
+                result["priority_level"] = -10100
+                result["reason"] = (
+                    f"[ALGO+HFT CONSENSUS] Algo={algo_bias}, HFT={hft_bias} sepakat LONG. "
+                    f"short_liq={short_liq:.2f}% (<3%) → batalkan semua sinyal fade, force LONG. | "
+                    + result.get("reason", "")
+                )
+                result["entry_allowed"] = True
+                return result
+            elif consensus_direction == "SHORT" and long_liq < 3.0:
+                result["bias"] = "SHORT"
+                result["confidence"] = "ABSOLUTE"
+                result["priority_level"] = -10100
+                result["reason"] = (
+                    f"[ALGO+HFT CONSENSUS] Algo={algo_bias}, HFT={hft_bias} sepakat SHORT. "
+                    f"long_liq={long_liq:.2f}% (<3%) → batalkan semua sinyal fade, force SHORT. | "
+                    + result.get("reason", "")
+                )
+                result["entry_allowed"] = True
+                return result
+        
         # ========== STEP 2: VEGA FADE OVERRIDE (DENGAN GUARD) ==========
         if not result.get("_block_vega_fade"):
             vega_fade = VegaFadeOverride.detect(
