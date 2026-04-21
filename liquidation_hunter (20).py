@@ -9046,6 +9046,32 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
         result["dual_liq_trap"] = {"dual_liq_trap": False}
         return result
 
+    # ========== GATE 9: EXTREME OVERBOUGHT + DRY DUMP (Force SHORT, Priority -25000) ==========
+    # Deteksi jebakan无量阴跌 (tanpa volume下跌) + RSI 5m极端超买
+    # Ini adalah pola HFT高位派发：RSI 5m > 90意味着中期动能已完全耗尽，无量下跌是流动性枯竭的征兆
+    rsi5m = context.get("rsi6_5m", 50.0)
+    if (market_phase == "BAIT" and 
+        volume_ratio < 0.7 and 
+        rsi5m > 90 and 
+        change_5m < 0 and
+        long_liq < 10.0):   # 有合理的下跌目标
+        
+        result["bias"] = "SHORT"
+        result["confidence"] = "ABSOLUTE"
+        result["priority_level"] = -25000
+        result["entry_allowed"] = True
+        result["reason"] = (
+            f"[EXTREME OB DRY DUMP] BAIT phase, RSI5m={rsi5m:.1f} (>90), "
+            f"vol={volume_ratio:.2f}x, change={change_5m:.1f}%. "
+            f"Exhausted uptrend, forced SHORT."
+        )
+        result["aggregator_reasons"] = ["EXTREME OB DRY DUMP FORCE SHORT"]
+        result["aggregator_votes"] = {"HARD_OVERRIDE": "SHORT"}
+        # Clear potential conflict fields
+        result["bias_kill_conflict"] = {"has_conflict": False}
+        result["dual_liq_trap"] = {"dual_liq_trap": False}
+        return result
+
     # -----------------------------------------------------------------
     # 1. INISIALISASI VOTING
     # -----------------------------------------------------------------
