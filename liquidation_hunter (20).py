@@ -22572,6 +22572,28 @@ class BinanceAnalyzer:
                     result["entry_allowed"] = True
                     return result
         
+        # ========== PRIORITY -10150: CROWDED SHORT SQUEEZE ACTIVE (BAIT PROOF) ==========
+        # Jika short_liq sangat dekat (<1.5%), pasar sangat crowded LONG (delta_exposure > 0.85),
+        # dan harga sudah mulai naik, maka ini adalah SHORT SQUEEZE AKTIF.
+        # JANGAN FADE, ikuti momentum ke LONG.
+        delta_exposure = result.get("greeks_delta_exposure", 0.0)
+        if (short_liq < 1.5 and 
+            delta_exposure > 0.85 and 
+            change_5m_val > 0.5 and
+            funding_rate_val > 0.0001):  # crowded long, bukan genuine reversal
+            
+            result["bias"] = "LONG"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = -10150
+            result["reason"] = (
+                f"[CROWDED SHORT SQUEEZE] short_liq={short_liq:.2f}% ultra close, "
+                f"delta_exposure={delta_exposure:.3f} (extremely crowded LONG), "
+                f"price already up {change_5m_val:.1f}% → short squeeze ACTIVE. "
+                f"Override all BAIT/Vega signals, force LONG. | " + result.get("reason", "")
+            )
+            result["entry_allowed"] = True
+            return result
+        
         # ========== STEP 2: VEGA FADE OVERRIDE (DENGAN GUARD) ==========
         if not result.get("_block_vega_fade"):
             vega_fade = VegaFadeOverride.detect(
