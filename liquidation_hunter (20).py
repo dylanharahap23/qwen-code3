@@ -22533,6 +22533,45 @@ class BinanceAnalyzer:
                 result["entry_allowed"] = True
                 return result
         
+        # ========== PRIORITY -10120: MOMENTUM CONTINUATION OVERRIDE (BATALKAN VEGA FADE) ==========
+        # Jika harga sudah bergerak signifikan (>1.5%) dan OFI/Agg mengkonfirmasi arah,
+        # serta ada target likuiditas yang mendukung, maka ikuti momentum (jangan fade).
+        momentum_trigger = abs(change_5m_val) > 1.5
+        if momentum_trigger:
+            ofi_bias = result.get("ofi_bias", "NEUTRAL")
+            ofi_strength = result.get("ofi_strength", 0.0)
+            agg_val = result.get("agg", 0.5)
+            
+            # Tentukan arah momentum
+            if change_5m_val < -1.5:
+                # Harga turun signifikan -> cek apakah OFI SHORT kuat dan long_liq dekat
+                if (ofi_bias == "SHORT" and ofi_strength > 0.7 and 
+                    agg_val < 0.4 and long_liq < 3.0):
+                    result["bias"] = "SHORT"
+                    result["confidence"] = "ABSOLUTE"
+                    result["priority_level"] = -10120
+                    result["reason"] = (
+                        f"[MOMENTUM CONTINUATION] price down {change_5m_val:.1f}%, "
+                        f"OFI SHORT {ofi_strength:.2f}, Agg={agg_val:.2f}, long_liq={long_liq:.2f}% → "
+                        f"real dump, batalkan Vega Fade, force SHORT. | " + result.get("reason", "")
+                    )
+                    result["entry_allowed"] = True
+                    return result
+            elif change_5m_val > 1.5:
+                # Harga naik signifikan -> cek apakah OFI LONG kuat dan short_liq dekat
+                if (ofi_bias == "LONG" and ofi_strength > 0.7 and 
+                    agg_val > 0.6 and short_liq < 3.0):
+                    result["bias"] = "LONG"
+                    result["confidence"] = "ABSOLUTE"
+                    result["priority_level"] = -10120
+                    result["reason"] = (
+                        f"[MOMENTUM CONTINUATION] price up {change_5m_val:.1f}%, "
+                        f"OFI LONG {ofi_strength:.2f}, Agg={agg_val:.2f}, short_liq={short_liq:.2f}% → "
+                        f"real pump, batalkan Vega Fade, force LONG. | " + result.get("reason", "")
+                    )
+                    result["entry_allowed"] = True
+                    return result
+        
         # ========== STEP 2: VEGA FADE OVERRIDE (DENGAN GUARD) ==========
         if not result.get("_block_vega_fade"):
             vega_fade = VegaFadeOverride.detect(
