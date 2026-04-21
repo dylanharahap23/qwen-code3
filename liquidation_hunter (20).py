@@ -9112,6 +9112,91 @@ def arbitrate_final_decision(result: dict) -> dict:
     result["reason"] = f"[AGGREGATOR] {' | '.join(reasons)} | Original: {result.get('reason', '')}"
     result["aggregator_votes"] = votes
     result["aggregator_reasons"] = reasons
+    
+    # ========== TRAP OVERRIDE: BAIT + VEGA ACTIVE + GREEKS OVERRIDE ==========
+    # Pola paling licik HFT: pump/dump palsu di BAIT phase dengan Vega aktif.
+    # Meskipun Aggregator memberikan suara kuat ke satu arah, kita harus mengabaikannya
+    # dan mengikuti arah Greeks (yang biasanya SHORT pada kasus yang diberikan).
+    market_phase = result.get("market_phase", "UNKNOWN")
+    greeks_override = result.get("greeks_override", False)
+    vega_score = result.get("greeks_vega_score", 0)
+    volume_ratio = result.get("volume_ratio", 1.0)
+    greeks_bias = result.get("greeks_bias", "NEUTRAL")
+    
+    # Kondisi Trap: BAIT + Greeks override aktif + Vega score >= 4 + volume rendah
+    if (market_phase == "BAIT" and 
+        greeks_override and 
+        vega_score >= 4 and 
+        volume_ratio < 0.7 and
+        greeks_bias in ("LONG", "SHORT")):
+        
+        # === GUARD: Jangan override jika ada akumulasi jelas (Agg, OFI, Order Book) ===
+        agg_val = result.get("agg", 0.5)
+        ofi_bias = result.get("ofi_bias", "NEUTRAL")
+        ofi_strength = result.get("ofi_strength", 0.0)
+        bid_slope = result.get("bid_slope", 0.0)
+        ask_slope = result.get("ask_slope", 0.0)
+        
+        # Kondisi akumulasi kuat: semua sinyal real-time bullish
+        strong_accumulation = (
+            agg_val > 0.8 and
+            ofi_bias == "LONG" and ofi_strength > 0.7 and
+            bid_slope > ask_slope * 1.2  # buy wall dominan
+        )
+        
+        # Kondisi distribusi kuat (mirror)
+        strong_distribution = (
+            agg_val < 0.2 and
+            ofi_bias == "SHORT" and ofi_strength > 0.7 and
+            ask_slope > bid_slope * 1.2
+        )
+        
+        if strong_accumulation and greeks_bias == "SHORT":
+            # Jangan override, biarkan Aggregator (yang kemungkinan sudah LONG)
+            if "aggregator_reasons" in result:
+                result["aggregator_reasons"].append("TRAP OVERRIDE BLOCKED: Strong accumulation detected (agg>0.8, OFI LONG, bid wall dominant)")
+            else:
+                result["aggregator_reasons"] = ["TRAP OVERRIDE BLOCKED: Strong accumulation detected (agg>0.8, OFI LONG, bid wall dominant)"]
+            # Jangan ubah bias, langsung return
+            return result
+        
+        if strong_distribution and greeks_bias == "LONG":
+            if "aggregator_reasons" in result:
+                result["aggregator_reasons"].append("TRAP OVERRIDE BLOCKED: Strong distribution detected")
+            else:
+                result["aggregator_reasons"] = ["TRAP OVERRIDE BLOCKED: Strong distribution detected"]
+            return result
+        
+        # Jika lolos guard, lakukan override
+        # Simpan bias sebelumnya untuk logging
+        previous_bias = result.get("bias", "NEUTRAL")
+        # Terapkan paksa bias mengikuti Greeks
+        result["bias"] = greeks_bias
+        result["confidence"] = "ABSOLUTE"
+        result["priority_level"] = -20000  # Beri prioritas tertinggi
+        
+        # Catat alasan override
+        trap_reason = (
+            f"[TRAP OVERRIDE] BAIT phase + Vega active (score={vega_score}/6) + "
+            f"Greeks override + volume={volume_ratio:.2f}x → Pola jebakan HFT terdeteksi. "
+            f"Abaikan Aggregator (bias {previous_bias}), paksa ke {greeks_bias}."
+        )
+        # Gabungkan dengan reason yang sudah ada
+        result["reason"] = trap_reason + " | " + result.get("reason", "")
+        
+        # Tambahkan juga ke aggregator_reasons untuk transparansi
+        if "aggregator_reasons" in result:
+            result["aggregator_reasons"].append("TRAP OVERRIDE ACTIVATED: " + trap_reason)
+        else:
+            result["aggregator_reasons"] = ["TRAP OVERRIDE ACTIVATED: " + trap_reason]
+            
+        # Update aggregator_votes (opsional, untuk debugging)
+        if "aggregator_votes" in result:
+            result["aggregator_votes"]["TRAP_OVERRIDE"] = {
+                "forced_bias": greeks_bias,
+                "previous_votes": result["aggregator_votes"].copy()
+            }
+    
     return result
 
 
