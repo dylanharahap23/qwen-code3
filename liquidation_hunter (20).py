@@ -22475,6 +22475,30 @@ class BinanceAnalyzer:
         if result.get("algo_type_bias", "NEUTRAL") != json_algo:
             result["algo_type_bias"] = json_algo
         
+        # ========== PRIORITY -10200: CAPITULATION BOUNCE ABSOLUTE ==========
+        # Jika RSI6 < 15 (capitulation), change_5m < -5% (dump besar),
+        # OBV POSITIVE_EXTREME (akumulasi institusi), dan long_liq < 10% (target dekat),
+        # maka ini adalah capitulation bottom. PAKSA LONG, batalkan semua sinyal SHORT.
+        if (rsi6_val < 15 and 
+            change_5m_val < -5.0 and 
+            obv_trend == "POSITIVE_EXTREME" and 
+            obv_value > 100_000_000 and  # minimal 100 juta volume akumulasi
+            long_liq < 10.0 and
+            volume_ratio < 0.7):
+            
+            result["bias"] = "LONG"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = -10200
+            result["reason"] = (
+                f"[CAPITULATION BOUNCE ABSOLUTE] RSI6={rsi6_val:.1f} (<15 capitulation), "
+                f"price dropped {change_5m_val:.1f}%, OBV POSITIVE_EXTREME ({obv_value:,.0f} accumulation), "
+                f"long_liq={long_liq:.2f}%, volume={volume_ratio:.2f}x (exhaustion). "
+                f"HFT akan sweep long_liq lalu pump. Batalkan SEMUA sinyal SHORT, force LONG. | "
+                + result.get("reason", "")
+            )
+            result["entry_allowed"] = True
+            return result
+        
         # ========== PRIORITY -10070: ASK WALL DOMINANT FAKE SQUEEZE (BATALKAN LONG) ==========
         # Jika short_liq super dekat (<1.5%) TAPI ada ask wall dominan (>5x bid) 
         # dan long_liq juga dalam jangkauan (<5%), maka short_liq adalah UMPAN.
