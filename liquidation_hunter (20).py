@@ -69,6 +69,9 @@ _kill_direction_history: Dict[str, List[Tuple[float, str]]] = {}
 LAST_SIGNAL = None
 LAST_SIGNAL_TIME = 0
 
+# ================= OVERRIDE FREQUENCY LIMITER (Rule 7) =================
+_override_history = {}  # {symbol: [timestamps]} - tracks override attempts per symbol
+
 # ================= LECTURER FIX v10: SIGNAL CONSISTENCY VALIDATION =================
 def validate_signal_consistency(result: dict) -> bool:
     """
@@ -9014,9 +9017,30 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
     Menggantikan sistem priority-based override.
     Mengumpulkan suara dari semua detector yang aktif dan memutuskan
     berdasarkan bobot dan hirarki kepercayaan.
+    
+    Integrated with 7 Lecturer Rules for adversarial pattern protection.
     """
     if expert_opinions is None:
         expert_opinions = []
+    
+    # ================================================================
+    # 🧩 RULE 7: Override Frequency Limiter (GLOBAL CHECK)
+    # Track override attempts per symbol to prevent HFT manipulation
+    # ================================================================
+    symbol = result.get("symbol", "UNKNOWN")
+    now = time.time()
+    if symbol not in _override_history:
+        _override_history[symbol] = []
+    # Clean up records older than 10 minutes
+    _override_history[symbol] = [t for t in _override_history[symbol] if now - t < 600]
+    recent_overrides = len(_override_history[symbol])
+    
+    # Helper to record an override
+    def record_override():
+        _override_history[symbol].append(now)
+    
+    # Check if we should skip overrides due to high frequency
+    skip_override = recent_overrides >= 2
     
     # -----------------------------------------------------------------
     # 0. EXCHANGE RISK HARD BLOCK (Prioritas Tertinggi, -30000)
@@ -9030,21 +9054,59 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
     # Kondisi pengecualian: jika ini adalah genuine short squeeze (RSI rendah + short_liq dekat + exchange_safe = LONG)
     is_genuine_squeeze = (rsi6_val < 40 and short_liq < 3.0 and exchange_safe == "LONG")
     
+    # 🧩 RULE 6: RSI5m Exhaustion Override check BEFORE Exchange Hard Block
+    rsi5m = result.get("rsi6_5m", 50.0)
+    change_5m = result.get("change_5m", 0.0)
+    rsi_exhaustion_active = False
+    if rsi5m < 15 and change_5m < -4.0:
+        rsi_exhaustion_active = True
+        # Extreme oversold, any forced SHORT should be downgraded
+        if exchange_safe == "SHORT":
+            # Don't hard override, let voting decide
+            exchange_safe = "NEUTRAL"  # Effectively skip the override
+        elif exchange_safe == "LONG":
+            # Can execute but downgrade confidence later
+            pass  # Will handle in confidence assignment
+    
+    # 🧩 RULE 2: OBV-Price Divergence Hard Veto (for Exchange Gate)
+    # Check if we should skip the hard block due to OBV divergence
+    obv_trend = result.get("obv_trend", "NEUTRAL")
+    volume_ratio = result.get("volume_ratio", 1.0)
+    obv_price_divergence_skip = False
+    if exchange_risk_score >= 6 and exchange_safe in ("LONG", "SHORT") and not is_genuine_squeeze:
+        # If OBV extremely negative AND price dropped >3% AND volume ratio <0.7
+        # Skip hard override and let voting decide
+        if obv_trend == "NEGATIVE_EXTREME" and change_5m < -3.0 and volume_ratio < 0.7:
+            obv_price_divergence_skip = True
+    
     if (exchange_risk_score >= 6 and 
         exchange_safe in ("LONG", "SHORT") and 
-        not is_genuine_squeeze):
+        not is_genuine_squeeze and
+        not obv_price_divergence_skip):
         
-        result["bias"] = exchange_safe
-        result["confidence"] = "ABSOLUTE"
-        result["priority_level"] = -30000
-        result["entry_allowed"] = True
-        result["reason"] = f"[EXCHANGE RISK HARD BLOCK] exchange_risk={exchange_risk_score}/10, safe_direction={exchange_safe}, RSI14={rsi14_val:.1f}. Override all other signals."
-        result["aggregator_reasons"] = [f"EXCHANGE HARD BLOCK: Forced {exchange_safe}"]
-        result["aggregator_votes"] = {"HARD_BLOCK": exchange_safe}
-        # Clear potential conflict fields
-        result["bias_kill_conflict"] = {"has_conflict": False}
-        result["dual_liq_trap"] = {"dual_liq_trap": False}
-        return result
+        # Apply Rule 6 RSI exhaustion downgrade if applicable
+        if rsi_exhaustion_active and exchange_safe == "LONG":
+            # Execute but will downgrade confidence
+            pass
+        
+        # Check Rule 7 frequency limiter
+        if skip_override:
+            # Frequency too high, skip this override and let aggregator decide
+            reasons = []
+            reasons.append(f"[OVERRIDE FREQ LIMITER] Skipping EXCHANGE HARD BLOCK due to {recent_overrides} recent overrides")
+        else:
+            record_override()
+            result["bias"] = exchange_safe
+            result["confidence"] = "ABSOLUTE" if not (rsi_exhaustion_active and exchange_safe == "LONG") else "HIGH"
+            result["priority_level"] = -30000
+            result["entry_allowed"] = True
+            result["reason"] = f"[EXCHANGE RISK HARD BLOCK] exchange_risk={exchange_risk_score}/10, safe_direction={exchange_safe}, RSI14={rsi14_val:.1f}. Override all other signals."
+            result["aggregator_reasons"] = [f"EXCHANGE HARD BLOCK: Forced {exchange_safe}"]
+            result["aggregator_votes"] = {"HARD_BLOCK": exchange_safe}
+            # Clear potential conflict fields
+            result["bias_kill_conflict"] = {"has_conflict": False}
+            result["dual_liq_trap"] = {"dual_liq_trap": False}
+            return result
 
     # ========== GATE 9: EXTREME OVERBOUGHT + DRY DUMP (Force SHORT, Priority -25000) ==========
     # Deteksi jebakan无量阴跌 (tanpa volume下跌) + RSI 5m极端超买
@@ -9083,6 +9145,42 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
     votes = {"LONG": 0.0, "SHORT": 0.0}
     reasons = []
     context = result
+
+    # ================================================================
+    # 🧩 RULE 5: Regime-Phase Conflict Block (Early Stage Check)
+    # Dangerous combination: LIQUIDATION_HUNT + BAIT requires 2 confirmations
+    # ================================================================
+    market_regime = result.get("market_regime", "UNKNOWN")
+    market_phase = result.get("market_phase", "UNKNOWN")
+    if market_regime == "LIQUIDATION_HUNT" and market_phase == "BAIT":
+        independent_absolute = 0
+        if result.get("exchange_risk_score", 0) >= 6:
+            independent_absolute += 1
+        if result.get("greeks_gamma_intensity") == "EXTREME":
+            independent_absolute += 1
+        if result.get("obv_magnitude") == "HIGH":
+            independent_absolute += 1
+        if independent_absolute < 2:
+            result["bias"] = "NEUTRAL"
+            result["confidence"] = "BLOCK"
+            result["entry_allowed"] = False
+            result["reason"] = "[REGIME-PHASE CONFLICT] LIQUIDATION_HUNT + BAIT without 2 confirmations → NO TRADE"
+            return result
+
+    # ================================================================
+    # 🧩 RULE 3: Liquidity Asymmetry Trap Detector
+    # Check before LIQUIDITY LAW voting
+    # ================================================================
+    short_liq_val = context.get("short_liq", 99.0)
+    long_liq_val = context.get("long_liq", 99.0)
+    if short_liq_val > 0 and long_liq_val > 0:
+        liq_ratio = long_liq_val / short_liq_val if short_liq_val > 0 else 999
+        if liq_ratio < 0.2 and result.get("bias", "NEUTRAL") == "LONG":
+            result["bias"] = "NEUTRAL"
+            result["confidence"] = "BLOCK"
+            result["entry_allowed"] = False
+            result["reason"] = f"[LIQ ASYMMETRY TRAP] long_liq={long_liq_val:.2f}% extremely close, short_liq={short_liq_val:.2f}% far → LONG blocked."
+            return result
 
     # -----------------------------------------------------------------
     # 2. TIER 1: HUKUM FISIKA PASAR (Bobot 10.0)
@@ -9206,6 +9304,26 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
     )
     
     if basic_trap_conditions:
+        # 🧩 RULE 4: Anti-Vega Manipulation Gate
+        # Additional requirement: must have confirmations from volume, aggregator, and OBV
+        aggregator_bias = "LONG" if votes["LONG"] > votes["SHORT"] else "SHORT"
+        obv_trend_check = context.get("obv_trend", "NEUTRAL")
+        
+        # Check if all confirmations are met
+        has_volume_confirmation = volume_ratio > 0.65
+        has_aggregator_alignment = aggregator_bias == greeks_bias
+        has_obv_confirmation = (
+            (greeks_bias == "LONG" and obv_trend_check == "POSITIVE_EXTREME") or
+            (greeks_bias == "SHORT" and obv_trend_check == "NEGATIVE_EXTREME")
+        )
+        
+        if not (has_volume_confirmation and has_aggregator_alignment and has_obv_confirmation):
+            reasons.append(
+                f"TRAP OVERRIDE BLOCKED (Anti-Vega Gate): high Vega but missing confirmations. "
+                f"volume_ok={has_volume_confirmation}, agg_align={has_aggregator_alignment}, obv_ok={has_obv_confirmation}"
+            )
+            basic_trap_conditions = False
+        
         # GATE 1: Validasi Energi Pasar (dengan pengecualian Thin Ask Wall)
         if up_energy > 2.0 and down_energy < 0.1:
             # Pengecualian: Jika ask_slope sangat tipis dibanding bid_slope (rasio > 5x)
@@ -9408,6 +9526,22 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
         result["confidence"] = "BLOCK"
         result["entry_allowed"] = False
         reasons.append("DEADLOCK: Equal evidence for both sides.")
+
+    # ================================================================
+    # 🧩 RULE 1: Consensus Divergence Penalty (Post-Voting Check)
+    # If aggregator vote is extreme but result bias conflicts, downgrade confidence
+    # ================================================================
+    total_votes = votes["LONG"] + votes["SHORT"]
+    if total_votes > 0:
+        long_pct = votes["LONG"] / total_votes
+        expected_bias = "LONG" if long_pct > 0.5 else "SHORT"
+        
+        # Check for extreme divergence (>85% or <15%)
+        if (long_pct > 0.85 or long_pct < 0.15) and result.get("bias", "NEUTRAL") != expected_bias:
+            # Downgrade confidence if ABSOLUTE
+            if result.get("confidence") == "ABSOLUTE":
+                result["confidence"] = "HIGH"
+            result["reason"] += f" | ⚠️ CONSENSUS DIVERGENCE: Override conflicts with strong aggregator vote (LONG={long_pct*100:.1f}%)."
 
     result["reason"] = "[AGGREGATOR] " + " | ".join(reasons) + " | Original: " + context.get("reason", "")
     result["aggregator_reasons"] = reasons
