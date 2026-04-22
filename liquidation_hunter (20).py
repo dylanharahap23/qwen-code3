@@ -735,21 +735,21 @@ class LowVolumeFakeVacuumGuard:
                rsi6_5m: float, rsi6: float, greeks_kill_direction: str,
                market_phase: str) -> dict:
         
-        if volume_ratio >= 0.65:
+        if volume_ratio >= 0.70:
             return {"override": False}
-        if abs(change_5m) < 1.5:
+        if abs(change_5m) < 1.0:
             return {"override": False}
-        if down_energy >= 0.01:          # vacuum asli
+        if down_energy >= 0.01:
             return {"override": False}
         
-        extreme_rsi = (rsi6_5m > 75 or rsi6_5m < 25) or (rsi6 > 80 or rsi6 < 20)
+        extreme_rsi = (rsi6_5m > 78 or rsi6_5m < 25) or (rsi6 > 78 or rsi6 < 20)
         if not extreme_rsi:
             return {"override": False}
         
         # Default SHORT (HFT trap biasanya dump)
         bias = "SHORT"
         # Exception: kalau Greeks sudah jelas LONG + phase KILL + up move nyata
-        if greeks_kill_direction == "LONG" and market_phase == "KILL" and change_5m > 0:
+        if greeks_kill_direction == "LONG" and market_phase == "KILL" and change_5m > 3.0:
             bias = "LONG"
         
         return {
@@ -762,6 +762,84 @@ class LowVolumeFakeVacuumGuard:
                 f"HFT low-volume trap. Force {bias}."
             ),
             "priority": -28700
+        }
+
+
+class MicroShortLiqBlowOffTopTrap:
+    """
+    PRIORITY -28800 (PALING TINGGI SAAT INI)
+    Khusus tangkap kasus RAVE 16:32 & CHIP 16:36:
+    - short_liq < 3.0% (micro)
+    - volume_ratio < 0.70x
+    - RSI5m > 80 (blow-off top)
+    - down_energy = 0 (fake vacuum)
+    â†’ Ini HFT micro-sweep short lalu DUMP ke long_liq
+    """
+    @staticmethod
+    def detect(short_liq: float, long_liq: float, volume_ratio: float,
+               rsi6_5m: float, down_energy: float, change_5m: float,
+               greeks_kill_direction: str) -> dict:
+        
+        if short_liq >= 3.0:
+            return {"override": False}
+        if volume_ratio >= 0.70:
+            return {"override": False}
+        if rsi6_5m <= 80:
+            return {"override": False}
+        if down_energy >= 0.01:
+            return {"override": False}
+        
+        if greeks_kill_direction == "SHORT":
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"MICRO SHORT LIQ BLOW-OFF TOP TRAP: short_liq={short_liq:.2f}%, "
+                    f"vol={volume_ratio:.2f}x, RSI5m={rsi6_5m:.1f} (blow-off), "
+                    f"down_energy=0 â†’ HFT sweep micro short lalu dump. Force SHORT."
+                ),
+                "priority": -28800
+            }
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"MICRO SHORT LIQ BLOW-OFF TOP TRAP (default): short_liq={short_liq:.2f}%, "
+                f"RSI5m={rsi6_5m:.1f}, vol={volume_ratio:.2f}x, fake vacuum â†’ dump imminent."
+            ),
+            "priority": -28800
+        }
+
+
+class ExtremeRSI5mLowCapBlowOffTrap:
+    """
+    PRIORITY -28900 (PALING TINGGI SAAT INI)
+    Khusus tangkap kasus GUAUSDT, RAVE 16:32, CHIP 16:36:
+    RSI5m >= 88 + down_energy=0 + low cap + short_liq dekat -> dump keras
+    """
+    @staticmethod
+    def detect(rsi6_5m: float, volume_ratio: float, down_energy: float,
+               short_liq: float, long_liq: float, market_regime: str) -> dict:
+        
+        if rsi6_5m < 88:
+            return {"override": False}
+        if down_energy >= 0.01:
+            return {"override": False}
+        if volume_ratio > 0.90:
+            return {"override": False}
+        if short_liq >= 4.0:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"EXTREME RSI5M LOW-CAP BLOW-OFF TRAP: RSI5m={rsi6_5m:.1f} (blow-off), "
+                f"vol={volume_ratio:.2f}x, down_energy=0, short_liq={short_liq:.2f}% (dekat) "
+                f"di {market_regime} -> HFT bait LONG lalu dump keras. Force SHORT."
+            ),
+            "priority": -28900
         }
 
 
@@ -9653,16 +9731,21 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
     # 7. KEPUTUSAN AKHIR (VOTING)
     # -----------------------------------------------------------------
     
-    # PERLEMAH VACUUM DI LOW VOLUME (Step 3 - Optional tapi Direkomendasikan)
+    # PERLEMAH VACUUM DI LOW VOLUME + EXTREME RSI
     volume_ratio = result.get("volume_ratio", 1.0)
     down_energy = result.get("down_energy", 0.0)
-    if volume_ratio < 0.65 and down_energy < 0.01:
-        # Kurangi kekuatan LONG vote dari VACUUM / NoSeller
-        if "No sellers" in result.get("reason", "") or "vacuum" in result.get("reason", "").lower():
+    rsi6_5m = result.get("rsi6_5m", 50.0)
+    if volume_ratio < 0.70 and down_energy < 0.01 and rsi6_5m > 78:
+        if "VACUUM: No sellers" in result.get("reason", ""):
             original_long_votes = votes.get("LONG", 0)
-            votes["LONG"] = max(0, votes.get("LONG", 8) - 5)
+            votes["LONG"] = max(0, votes.get("LONG", 8) - 6)
             result["_fake_vacuum_weakened"] = True
             result["_original_long_votes"] = original_long_votes
+            fake_vacuum_reason = (
+                f"FAKE_VACUUM_EXTREME_RSI: vol={volume_ratio:.2f}x + "
+                f"RSI5m={rsi6_5m:.1f} â†’ weakened NoSeller vote"
+            )
+            reasons.append(fake_vacuum_reason)
     
     if votes["LONG"] > votes["SHORT"]:
         result["bias"] = "LONG"
@@ -25513,8 +25596,25 @@ class BinanceAnalyzer:
             result["entry_allowed"] = True
             return result
         
-        # ================= NEW: ANTI-HFT LOW VOLUME TRAP (Priority Tertinggi) =================
-        # Taruh setelah semua LiquidityExtreme / CrowdedLong guard
+        # ================= NEW HIGH PRIORITY ANTI-HFT TRAPS (2026 Edition) =================
+        # Taruh setelah semua guard liquidity extreme / crowded long
+        micro_blowoff = MicroShortLiqBlowOffTopTrap.detect(
+            short_liq=short_liq,
+            long_liq=long_liq,
+            volume_ratio=volume_ratio,
+            rsi6_5m=rsi6_5m_val,
+            down_energy=down_energy_val,
+            change_5m=change_5m_val,
+            greeks_kill_direction=result.get("greeks_kill_direction", "")
+        )
+        if micro_blowoff["override"]:
+            result["bias"] = micro_blowoff["bias"]
+            result["reason"] = f"[MICRO SHORT BLOWOFF] {micro_blowoff['reason']}"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = micro_blowoff["priority"]
+            result["entry_allowed"] = True
+            return result
+
         low_vol_vacuum = LowVolumeFakeVacuumGuard.detect(
             volume_ratio=volume_ratio,
             down_energy=down_energy_val,
@@ -28910,6 +29010,15 @@ class BinanceAnalyzer:
 
                         # ===== HIGHEST PRIORITY OVERRIDES: LIQUIDITY EXTREME (-2001 to -1998) =====
                         # Definisikan semua detector terlebih dahulu
+                        market_regime = locals().get("regime_data", {}).get("regime", "UNKNOWN")
+                        extreme_rsi_lowcap = ExtremeRSI5mLowCapBlowOffTrap.detect(
+                            rsi6_5m=rsi6_5m,
+                            volume_ratio=volume_ratio,
+                            down_energy=down_energy,
+                            short_liq=liq["short_dist"],
+                            long_liq=liq["long_dist"],
+                            market_regime=market_regime
+                        )
                         liquidity_extreme = LiquidityExtremeOverride.detect(
                             liq["short_dist"], liq["long_dist"], funding_rate,
                             change_5m, agg, up_energy
@@ -28924,7 +29033,15 @@ class BinanceAnalyzer:
                             liq["short_dist"], liq["long_dist"], change_5m
                         )
 
-                        if liquidity_extreme["override"]:
+                        if extreme_rsi_lowcap["override"]:
+                            final_bias = extreme_rsi_lowcap["bias"]
+                            final_reason = extreme_rsi_lowcap["reason"]
+                            final_confidence = "ABSOLUTE"
+                            final_phase = "EXTREME_RSI5M_LOW_CAP_BLOWOFF"
+                            priority = extreme_rsi_lowcap["priority"]
+                            prob_engine.add(final_bias, 8.0)
+                            _liquidity_extreme_override = True
+                        elif liquidity_extreme["override"]:
                             final_bias = liquidity_extreme["bias"]
                             final_reason = liquidity_extreme["reason"]
                             final_confidence = liquidity_extreme["confidence"]
@@ -30979,32 +31096,40 @@ class BinanceAnalyzer:
                     # dan crowded LONG dengan RSI ekstrem
                     # CATATAN: Gunakan variabel lokal yang sudah ada di scope analyze(),
                     # BUKAN result.get() karena result belum dibuat di titik ini
-                    funding_crowded_long = (
-                        funding_rate is not None and
-                        (funding_rate or 0) > 0.0005
-                    )
+                    if rsi6_5m > 85 and down_energy < 0.01:
+                        final_bias = "SHORT"
+                        final_reason = f"LOW CAP OVERRIDE CANCELLED: RSI5m={rsi6_5m:.1f} + fake vacuum -> Force SHORT"
+                        final_confidence = "ABSOLUTE"
+                        final_phase = "LOW_CAP_EXTREME_RSI_GUARD"
+                        priority = -28900
+                    else:
+                        funding_crowded_long = (
+                            funding_rate is not None and
+                            (funding_rate or 0) > 0.0005
+                        )
                     
-                    rsi_extreme = rsi6 > 85 or rsi6_5m > 75
+                        rsi_extreme = rsi6 > 85 or rsi6_5m > 75
                     
-                    # Jika volume ratio rendah + RSI extreme + funding crowded LONG
-                    # Low cap sniper TIDAK BOLEH override ke LONG
-                    if volume_ratio < 0.6 and rsi_extreme and funding_crowded_long:
-                        final_reason += f" | Low cap GUARD: Volume low + RSI extreme ({rsi6:.1f}/{rsi6_5m:.1f}) + crowded LONG → SKIP liquidity override, keep {final_bias}"
+                        # Jika volume ratio rendah + RSI extreme + funding crowded LONG
+                        # Low cap sniper TIDAK BOLEH override ke LONG
+                        if volume_ratio < 0.6 and rsi_extreme and funding_crowded_long:
+                            final_reason += f" | Low cap GUARD: Volume low + RSI extreme ({rsi6:.1f}/{rsi6_5m:.1f}) + crowded LONG -> SKIP liquidity override, keep {final_bias}"
+                            # legacy low-cap guard reason removed after RSI5m patch
                         # Jangan ubah final_bias
                     
-                    elif volume_ratio < 0.6 and (rsi6 < 20 or rsi6 > 80):
-                        final_reason += f" | Low cap but extreme RSI6 ({rsi6:.1f}) → skip liquidity override"
+                        if volume_ratio < 0.6 and (rsi6 < 20 or rsi6 > 80):
+                            final_reason += f" | Low cap but extreme RSI6 ({rsi6:.1f}) -> skip liquidity override"
                     
-                    else:
-                        if liq["short_dist"] < liq["long_dist"]:
-                            if final_bias != "LONG":
-                                final_bias = "LONG"
-                                final_reason = f"Low cap mode: overriding to LONG (short liq closer)"
                         else:
-                            if final_bias != "SHORT":
-                                final_bias = "SHORT"
-                                final_reason = f"Low cap mode: overriding to SHORT (long liq closer)"
-                        final_confidence = "ABSOLUTE"
+                            if liq["short_dist"] < liq["long_dist"]:
+                                if final_bias != "LONG":
+                                    final_bias = "LONG"
+                                    final_reason = f"Low cap mode: overriding to LONG (short liq closer)"
+                            else:
+                                if final_bias != "SHORT":
+                                    final_bias = "SHORT"
+                                    final_reason = f"Low cap mode: overriding to SHORT (long liq closer)"
+                            final_confidence = "ABSOLUTE"
                         final_phase = "LOW_CAP_SNIPER"
 
             # Latency compensator
