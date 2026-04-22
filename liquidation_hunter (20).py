@@ -9042,14 +9042,80 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
     # Check if we should skip overrides due to high frequency
     skip_override = recent_overrides >= 2
     
+    # ================================================================
+    # 🛡️ PERBAIKAN 3: LIQUIDITY PROXIMITY ABSOLUTE OVERRIDE (Priority -40000)
+    # Otoritas tertinggi - jika likuidasi <1.0%, ikuti arah kill tanpa kecuali.
+    # ================================================================
+    greeks_kill = result.get("greeks_kill_direction", "NEUTRAL")
+    short_liq_abs = result.get("short_liq", 99.0)
+    long_liq_abs = result.get("long_liq", 99.0)
+    
+    if (short_liq_abs < 1.0 and short_liq_abs < long_liq_abs and greeks_kill == "LONG") or \
+       (long_liq_abs < 1.0 and long_liq_abs < short_liq_abs and greeks_kill == "SHORT"):
+        result["bias"] = greeks_kill
+        result["confidence"] = "ABSOLUTE"
+        result["priority_level"] = -40000
+        result["entry_allowed"] = True
+        result["reason"] = f"[LIQ PROXIMITY ABSOLUTE] Target liq <1.0% (short={short_liq_abs:.2f}%, long={long_liq_abs:.2f}%), kill direction={greeks_kill}. No gate can override."
+        result["aggregator_reasons"] = ["LIQUIDITY PROXIMITY ABSOLUTE: Forced " + greeks_kill]
+        result["aggregator_votes"] = {"LIQ_ABSOLUTE": greeks_kill}
+        # Clear potential conflict fields
+        result["bias_kill_conflict"] = {"has_conflict": False}
+        result["dual_liq_trap"] = {"dual_liq_trap": False}
+        return result
+    
+    # ================================================================
+    # 🛡️ PERBAIKAN 1: PRE-KILL EXCEPTION (Overrides Exchange Gate, Priority -30500)
+    # Pengecualian sebelum Exchange Risk Hard Block untuk kondisi kill yang sangat kuat.
+    # ================================================================
+    pre_kill = result.get("greeks_pre_kill", {})
+    gamma_exec_score = result.get("greeks_gamma_exec_score", 0)
+    kill_speed = result.get("greeks_kill_speed", 0.0)
+    kill_direction = result.get("greeks_kill_direction", "NEUTRAL")
+    short_liq_pk = result.get("short_liq", 99.0)
+    long_liq_pk = result.get("long_liq", 99.0)
+    
+    if (pre_kill.get("override", False) and 
+        gamma_exec_score >= 5 and 
+        kill_speed > 2.0 and
+        kill_direction in ("LONG", "SHORT")):
+        
+        # Cek apakah target likuidasi di arah kill sangat dekat
+        target_liq_close = (kill_direction == "LONG" and short_liq_pk < 1.0) or \
+                           (kill_direction == "SHORT" and long_liq_pk < 1.0)
+        if target_liq_close:
+            result["bias"] = kill_direction
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = -30500  # Lebih tinggi dari Exchange Gate (-30000)
+            result["entry_allowed"] = True
+            result["reason"] = (
+                f"[PRE-KILL EXCEPTION] greeks_pre_kill active, gamma_exec={gamma_exec_score}/6, "
+                f"kill_speed={kill_speed:.1f}, target_liq <1.0%. Exchange gate bypassed."
+            )
+            result["aggregator_reasons"] = ["PRE-KILL EXCEPTION: Forced " + kill_direction]
+            result["aggregator_votes"] = {"PRE_KILL_EXCEPTION": kill_direction}
+            # Clear potential conflict fields
+            result["bias_kill_conflict"] = {"has_conflict": False}
+            result["dual_liq_trap"] = {"dual_liq_trap": False}
+            return result
+    
     # -----------------------------------------------------------------
-    # 0. EXCHANGE RISK HARD BLOCK (Prioritas Tertinggi, -30000)
+    # 0. EXCHANGE RISK HARD BLOCK (dengan threshold dinamis, Priority -30000)
     # -----------------------------------------------------------------
     exchange_risk_score = result.get("exchange_risk_score", 0)
     exchange_safe = result.get("exchange_safe_direction", "NEUTRAL")
+    greeks_bias = result.get("greeks_bias", "NEUTRAL")
     rsi14_val = result.get("rsi14", 50.0)
     rsi6_val = result.get("rsi6", 50.0)
     short_liq = result.get("short_liq", 99.0)
+    
+    # 🛡️ PERBAIKAN 2: Exchange Risk Score Dinamis (Anti-Manipulasi Threshold)
+    effective_threshold = 6  # default
+    # Jika Greeks sangat kuat dan berlawanan dengan exchange_safe, naikkan threshold
+    if greeks_bias in ("LONG", "SHORT") and greeks_bias != exchange_safe:
+        if result.get("greeks_gamma_exec_score", 0) >= 4:
+            effective_threshold = 7  # perlu risiko lebih tinggi untuk override
+            # Atau bisa langsung downgrade ke soft suggestion (tidak hard block)
     
     # Kondisi pengecualian: jika ini adalah genuine short squeeze (RSI rendah + short_liq dekat + exchange_safe = LONG)
     is_genuine_squeeze = (rsi6_val < 40 and short_liq < 3.0 and exchange_safe == "LONG")
@@ -9079,7 +9145,7 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
         if obv_trend == "NEGATIVE_EXTREME" and change_5m < -3.0 and volume_ratio < 0.7:
             obv_price_divergence_skip = True
     
-    if (exchange_risk_score >= 6 and 
+    if (exchange_risk_score >= effective_threshold and 
         exchange_safe in ("LONG", "SHORT") and 
         not is_genuine_squeeze and
         not obv_price_divergence_skip):
