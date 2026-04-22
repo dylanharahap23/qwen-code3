@@ -9024,6 +9024,20 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
         expert_opinions = []
     
     # ================================================================
+    # 🔧 FIX 1: REGIME MANIPULATION - HARD STOP (HIGHEST PRIORITY)
+    # BSBUSDT 03:22 Fix: Block all trades if regime detects manipulation
+    # ================================================================
+    if result.get("regime_skip") or result.get("market_regime") == "MANIPULATION":
+        result["bias"] = "NEUTRAL"
+        result["confidence"] = "BLOCK"
+        result["entry_allowed"] = False
+        result["priority_level"] = -50000
+        result["reason"] = "[REGIME HARD STOP] MANIPULATION detected, all signals unreliable. NO TRADE."
+        result["aggregator_reasons"] = ["REGIME MANIPULATION: Forced NEUTRAL"]
+        result["aggregator_votes"] = {"HARD_STOP": "NEUTRAL"}
+        return result
+    
+    # ================================================================
     # 🧩 RULE 7: Override Frequency Limiter (GLOBAL CHECK)
     # Track override attempts per symbol to prevent HFT manipulation
     # ================================================================
@@ -9204,6 +9218,24 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
         result["bias_kill_conflict"] = {"has_conflict": False}
         result["dual_liq_trap"] = {"dual_liq_trap": False}
         return result
+    
+    # 🔧 FIX 3: RSI TIMEFRAME DIVERGENCE GATE (Momentum Exhaustion)
+    # BSBUSDT 03:22 Fix: Detect when 1m RSI is extreme but 5m RSI disagrees → momentum exhausted
+    rsi1m = result.get("rsi6", 50.0)
+    rsi5m_div = result.get("rsi6_5m", 50.0)
+    if rsi1m > 85 and rsi5m_div < 60:
+        if result.get("bias") == "LONG":
+            result["bias"] = "NEUTRAL"
+            result["confidence"] = "BLOCK"
+            result["entry_allowed"] = False
+            result["reason"] = f"[RSI DIVERGENCE] RSI1m={rsi1m:.1f} vs RSI5m={rsi5m_div:.1f} → momentum exhausted, LONG blocked."
+            if "aggregator_reasons" not in result:
+                result["aggregator_reasons"] = []
+            result["aggregator_reasons"].append("RSI DIVERGENCE: Forced NEUTRAL")
+            return result
+        elif result.get("bias") == "SHORT":
+            # For SHORT, we can downgrade but in this case we handle LONG first
+            pass
 
     # -----------------------------------------------------------------
     # 1. INISIALISASI VOTING
@@ -9254,6 +9286,14 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
     liq_bias = "LONG" if context.get("short_liq", 99) < context.get("long_liq", 99) else "SHORT"
     liq_diff = abs(context.get("short_liq", 0) - context.get("long_liq", 0))
     long_liq = context.get("long_liq", 99.0)
+    
+    # 🔧 FIX 2: OFI DOMINANCE FLOOR (Mandatory vote, cannot be skipped)
+    # BSBUSDT 03:22 Fix: Strong OFI signals must be counted as independent vote
+    ofi_strength = result.get("ofi_strength", 0.0)
+    ofi_bias = result.get("ofi_bias", "NEUTRAL")
+    if ofi_strength > 0.75 and ofi_bias in ("LONG", "SHORT"):
+        votes[ofi_bias] += 10.0  # High weight
+        reasons.append(f"OFI FLOOR: strength={ofi_strength:.2f}, mandatory vote for {ofi_bias}")
     
     # LIQUIDITY LAW dengan bobot dinamis
     if short_liq < 1.5 and short_liq < long_liq:
