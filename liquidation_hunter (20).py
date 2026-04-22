@@ -9049,7 +9049,12 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
     # ========== GATE 9: EXTREME OVERBOUGHT + DRY DUMP (Force SHORT, Priority -25000) ==========
     # Deteksi jebakan无量阴跌 (tanpa volume下跌) + RSI 5m极端超买
     # Ini adalah pola HFT高位派发：RSI 5m > 90意味着中期动能已完全耗尽，无量下跌是流动性枯竭的征兆
-    rsi5m = context.get("rsi6_5m", 50.0)
+    rsi5m = result.get("rsi6_5m", 50.0)
+    market_phase = result.get("market_phase", "UNKNOWN")
+    volume_ratio = result.get("volume_ratio", 1.0)
+    change_5m = result.get("change_5m", 0.0)
+    long_liq = result.get("long_liq", 99.0)
+    
     if (market_phase == "BAIT" and 
         volume_ratio < 0.7 and 
         rsi5m > 90 and 
