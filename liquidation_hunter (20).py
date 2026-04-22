@@ -725,6 +725,79 @@ class CrowdedLongRSI5mExtremeOverboughtTrap:
         }
 
 
+class LowVolumeFakeVacuumGuard:
+    """
+    PRIORITY -28700 (PALING TINGGI BARU)
+    Menangkap 5/6 case gagal kamu: low volume + fake vacuum + extreme RSI
+    """
+    @staticmethod
+    def detect(volume_ratio: float, down_energy: float, change_5m: float,
+               rsi6_5m: float, rsi6: float, greeks_kill_direction: str,
+               market_phase: str) -> dict:
+        
+        if volume_ratio >= 0.65:
+            return {"override": False}
+        if abs(change_5m) < 1.5:
+            return {"override": False}
+        if down_energy >= 0.01:          # vacuum asli
+            return {"override": False}
+        
+        extreme_rsi = (rsi6_5m > 75 or rsi6_5m < 25) or (rsi6 > 80 or rsi6 < 20)
+        if not extreme_rsi:
+            return {"override": False}
+        
+        # Default SHORT (HFT trap biasanya dump)
+        bias = "SHORT"
+        # Exception: kalau Greeks sudah jelas LONG + phase KILL + up move nyata
+        if greeks_kill_direction == "LONG" and market_phase == "KILL" and change_5m > 0:
+            bias = "LONG"
+        
+        return {
+            "override": True,
+            "bias": bias,
+            "reason": (
+                f"LOW VOLUME FAKE VACUUM TRAP: vol={volume_ratio:.2f}x (<0.65), "
+                f"down_energy={down_energy:.3f} (manufactured vacuum), "
+                f"change={change_5m:.2f}%, RSI5m={rsi6_5m:.1f} (extreme) → "
+                f"HFT low-volume trap. Force {bias}."
+            ),
+            "priority": -28700
+        }
+
+
+class ExtremeRSIContinuationGuard:
+    """
+    PRIORITY -28600
+    Blow-off top & falling knife continuation (kasus CHIP 12:43 & QU 09:35)
+    """
+    @staticmethod
+    def detect(rsi6_5m: float, volume_ratio: float, change_5m: float,
+               down_energy: float, up_energy: float) -> dict:
+        
+        if volume_ratio >= 0.70:
+            return {"override": False}
+        
+        # Blow-off Top
+        if rsi6_5m > 85 and change_5m > 2.0 and down_energy < 0.01:
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"BLOW-OFF TOP + LOW VOL: RSI5m={rsi6_5m:.1f}, vol={volume_ratio:.2f}x, down_energy=0 → Force SHORT",
+                "priority": -28600
+            }
+        
+        # Falling Knife Continuation
+        if rsi6_5m < 20 and change_5m < -2.0 and down_energy < 0.01:
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"FALLING KNIFE CONTINUATION: RSI5m={rsi6_5m:.1f}, continued drop, fake vacuum → Force SHORT",
+                "priority": -28600
+            }
+        
+        return {"override": False}
+
+
 class RSI5mBaitTrapShortOverride:
     """
     🔥 PRIORITY -26400: RSI5M BAIT TRAP -> FORCE SHORT
@@ -9579,6 +9652,18 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
     # -----------------------------------------------------------------
     # 7. KEPUTUSAN AKHIR (VOTING)
     # -----------------------------------------------------------------
+    
+    # PERLEMAH VACUUM DI LOW VOLUME (Step 3 - Optional tapi Direkomendasikan)
+    volume_ratio = result.get("volume_ratio", 1.0)
+    down_energy = result.get("down_energy", 0.0)
+    if volume_ratio < 0.65 and down_energy < 0.01:
+        # Kurangi kekuatan LONG vote dari VACUUM / NoSeller
+        if "No sellers" in result.get("reason", "") or "vacuum" in result.get("reason", "").lower():
+            original_long_votes = votes.get("LONG", 0)
+            votes["LONG"] = max(0, votes.get("LONG", 8) - 5)
+            result["_fake_vacuum_weakened"] = True
+            result["_original_long_votes"] = original_long_votes
+    
     if votes["LONG"] > votes["SHORT"]:
         result["bias"] = "LONG"
         result["confidence"] = "ABSOLUTE" if votes["LONG"] >= 15 else "HIGH"
@@ -25427,6 +25512,41 @@ class BinanceAnalyzer:
             result["priority_level"] = algo_hft_veto["priority"]
             result["entry_allowed"] = True
             return result
+        
+        # ================= NEW: ANTI-HFT LOW VOLUME TRAP (Priority Tertinggi) =================
+        # Taruh setelah semua LiquidityExtreme / CrowdedLong guard
+        low_vol_vacuum = LowVolumeFakeVacuumGuard.detect(
+            volume_ratio=volume_ratio,
+            down_energy=down_energy_val,
+            change_5m=change_5m_val,
+            rsi6_5m=rsi6_5m_val,
+            rsi6=rsi6_val,
+            greeks_kill_direction=result.get("greeks_kill_direction", ""),
+            market_phase=result.get("market_phase", "UNKNOWN")
+        )
+
+        if low_vol_vacuum["override"]:
+            result["bias"] = low_vol_vacuum["bias"]
+            result["reason"] = f"[LOW VOL FAKE VACUUM] {low_vol_vacuum['reason']}"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = low_vol_vacuum["priority"]
+            result["entry_allowed"] = True
+            return result
+        else:
+            extreme_rsi_guard = ExtremeRSIContinuationGuard.detect(
+                rsi6_5m=rsi6_5m_val,
+                volume_ratio=volume_ratio,
+                change_5m=change_5m_val,
+                down_energy=down_energy_val,
+                up_energy=up_energy_val
+            )
+            if extreme_rsi_guard["override"]:
+                result["bias"] = extreme_rsi_guard["bias"]
+                result["reason"] = f"[EXTREME RSI CONTINUATION] {extreme_rsi_guard['reason']}"
+                result["confidence"] = "ABSOLUTE"
+                result["priority_level"] = extreme_rsi_guard["priority"]
+                result["entry_allowed"] = True
+                return result
         
         # ===== PRIORITY -27600: PROXIMITY AGG-OFI REVERSAL =====
         prox_agg_rev = ProximityAggOFIReversal.detect(

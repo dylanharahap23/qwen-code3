@@ -1,4 +1,44 @@
 ```
+# Environment
+.env
+.env.local
+.env.*
+
+# Logs and temp files
+*.log
+*.tmp
+*.swp
+
+# Editors
+.vscode/
+.idea/
+
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg-info/
+.eggs/
+.coverage
+htmlcov/
+.mypy_cache/
+.pytest_cache/
+.tox/
+.coverage*
+.nox/
+
+# Build and distribution
+dist/
+build/
+*.egg
+*.whl
+pip-log.txt
+pip-delete-this-directory.txt
+
+# System
+.DS_Store
+Thumbs.db
 ```
