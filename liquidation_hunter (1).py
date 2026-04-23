@@ -858,6 +858,40 @@ class DeepOversoldFakeBounceTrap:
         }
 
 
+class GammaExtremeMicroShortLiqFakeSqueeze:
+    """
+    PRIORITY -30200 (LEBIH TINGGI DARI SEMUA LIQ PROXIMITY & EXCHANGE RISK)
+    Khusus CHIPUSDT pattern: gamma_intensity=EXTREME + short_liq <1% + pump kecil (<3%) + long_liq jauh
+    → Ini fake micro squeeze, HFT sweep lalu dump. Force SHORT.
+    """
+    @staticmethod
+    def detect(short_liq: float, long_liq: float, change_5m: float,
+               greeks_gamma_intensity: str, greeks_kill_speed: float,
+               delta_exposure: float, up_energy: float) -> dict:
+        
+        if short_liq >= 1.0:
+            return {"override": False}
+        
+        if greeks_gamma_intensity != "EXTREME":
+            return {"override": False}
+        
+        # Pump masih kecil + long_liq jauh = fake squeeze (bukan continuation)
+        if change_5m < 4.0 and long_liq > short_liq * 5:
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"GAMMA EXTREME FAKE MICRO SQUEEZE: gamma=EXTREME, short_liq={short_liq:.2f}%, "
+                    f"change={change_5m:.2f}% (pump kecil), long_liq={long_liq:.2f}% (jauh), "
+                    f"delta_exposure={delta_exposure:.3f}, up_energy={up_energy:.2f} → "
+                    f"HFT bait sweep lalu dump. Force SHORT. Override LIQ Proximity."
+                ),
+                "priority": -30200
+            }
+        
+        return {"override": False}
+
+
 class UltraCloseShortLiqContinuationSqueeze:
     """
     PRIORITY -30100 (LEBIH TINGGI DARI EXCHANGE RISK HARD BLOCK)
@@ -9349,6 +9383,22 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
     greeks_kill = result.get("greeks_kill_direction", "NEUTRAL")
     short_liq_abs = result.get("short_liq", 99.0)
     long_liq_abs = result.get("long_liq", 99.0)
+    greeks_gamma_intensity_abs = result.get("greeks_gamma_intensity", "LOW")
+    change_5m_abs = abs(result.get("change_5m", 0.0))
+    
+    # 🔥 GAMMA EXTREME FAKE SQUEEZE GUARD: Jika short_liq < 1.0 + gamma EXTREME + pump kecil, jangan paksa LONG
+    if short_liq_abs < 1.0 and greeks_gamma_intensity_abs == "EXTREME" and change_5m_abs < 3.0:
+        # Fake squeeze, jangan paksa LONG
+        result["bias"] = "SHORT"
+        result["reason"] = f"[LIQ PROXIMITY ABSOLUTE] Target liq <1.0% (short={short_liq_abs:.2f}%, long={long_liq_abs:.2f}%), kill direction={greeks_kill}. | GAMMA EXTREME + SMALL PUMP → fake squeeze, Force SHORT"
+        result["confidence"] = "ABSOLUTE"
+        result["priority_level"] = -40000
+        result["entry_allowed"] = True
+        result["aggregator_reasons"] = ["LIQUIDITY PROXIMITY ABSOLUTE with GAMMA EXTREME FAKE SQUEEZE GUARD: Forced SHORT"]
+        result["aggregator_votes"] = {"LIQ_ABSOLUTE": "SHORT"}
+        result["bias_kill_conflict"] = {"has_conflict": False}
+        result["dual_liq_trap"] = {"dual_liq_trap": False}
+        return result
     
     if (short_liq_abs < 1.0 and short_liq_abs < long_liq_abs and greeks_kill == "LONG") or \
        (long_liq_abs < 1.0 and long_liq_abs < short_liq_abs and greeks_kill == "SHORT"):
@@ -25212,6 +25262,31 @@ class BinanceAnalyzer:
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = deep_oversold_trap["priority"]
             result["entry_allowed"] = True
+            return result
+        
+        # ===== PRIORITY -30200: GAMMA EXTREME FAKE MICRO SQUEEZE (CHIPUSDT FIX) =====
+        gamma_fake = GammaExtremeMicroShortLiqFakeSqueeze.detect(
+            short_liq=short_liq,
+            long_liq=long_liq,
+            change_5m=change_5m_val,
+            greeks_gamma_intensity=result.get("greeks_gamma_intensity", "LOW"),
+            greeks_kill_speed=result.get("greeks_kill_speed", 0),
+            delta_exposure=result.get("greeks_delta_exposure", 0),
+            up_energy=up_energy_val
+        )
+        if gamma_fake["override"]:
+            final_bias = gamma_fake["bias"]
+            final_reason = gamma_fake["reason"]
+            final_confidence = "ABSOLUTE"
+            final_phase = "GAMMA_EXTREME_FAKE_SQUEEZE"
+            priority = gamma_fake["priority"]
+            prob_engine.add(final_bias, 8.5)
+            result["bias"] = final_bias
+            result["reason"] = f"[GAMMA EXTREME FAKE SQUEEZE] {final_reason} | " + result.get("reason", "")
+            result["confidence"] = final_confidence
+            result["priority_level"] = priority
+            result["entry_allowed"] = True
+            result["_liquidity_extreme_override"] = False
             return result
         
         # ===== PRIORITY -30100: ULTRA CLOSE SHORT LIQ CONTINUATION SQUEEZE (UBUSDT FIX) =====
