@@ -858,6 +858,43 @@ class DeepOversoldFakeBounceTrap:
         }
 
 
+class DeepOversoldFakeBounceFallingKnife:
+    """
+    PRIORITY -30700 (LEBIH TINGGI DARI SEMUA GUARD SEBELUMNYA)
+    Tangkap pola MOVRUSDT terbaru: deep oversold + high up_energy + down_energy=0 + harga sudah turun keras
+    """
+    @staticmethod
+    def detect(rsi6: float, rsi6_5m: float, up_energy: float, down_energy: float,
+               change_5m: float, volume_ratio: float, long_liq: float,
+               market_phase: str) -> dict:
+
+        if rsi6 > 30 or rsi6_5m > 35:
+            return {"override": False}
+
+        if up_energy < 2.0 or down_energy > 0.01:
+            return {"override": False}
+
+        if change_5m > -1.0:
+            return {"override": False}
+
+        if volume_ratio > 0.75:
+            return {"override": False}
+
+        if long_liq < 3.0 and market_phase in ["BAIT", "LOW_CAP_SNIPER"]:
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"DEEP OVERSOLD FAKE BOUNCE FALLING KNIFE: RSI6={rsi6:.1f}, "
+                    f"up_energy={up_energy:.2f} (fake), change_5m={change_5m:.2f}%, "
+                    f"long_liq={long_liq:.2f}% -> HFT sweep long liq lalu lanjut dump. FORCE SHORT."
+                ),
+                "priority": -30700
+            }
+
+        return {"override": False}
+
+
 class GammaExtremeMicroShortLiqFakeSqueeze:
     """
     PRIORITY -30200 (LEBIH TINGGI DARI SEMUA LIQ PROXIMITY & EXCHANGE RISK)
@@ -931,8 +968,8 @@ class LongLiqProximityFallingKnifeTrap:
 class LongLiqUltraCloseFallingKnifeV3:
     """
     PRIORITY -30600 (PALING TINGGI SAAT INI)
-    Versi paling keras untuk TACUSDT & SPKUSDT pattern.
-    long_liq < 1.2% + harga turun + fake vacuum = langsung Force SHORT.
+    VERSI PALING KERAS
+    Untuk kasus SPKUSDT & TACUSDT terbaru.
     """
     @staticmethod
     def detect(long_liq: float, change_5m: float, down_energy: float,
@@ -1165,6 +1202,80 @@ class ExtremeRSIContinuationGuard:
             }
         
         return {"override": False}
+
+
+class RSI5mOverboughtVegaFadeBlocker:
+    """Refined - Priority -28010"""
+    @staticmethod
+    def detect(market_phase, vega_active, vega_score, rsi6_5m,
+               change_5m, kill_direction, down_energy, volume_ratio, gamma_executing):
+
+        if not (market_phase == "BAIT" and vega_active and vega_score >= 4):
+            return {"override": False}
+        if rsi6_5m <= 78 or change_5m >= 0:
+            return {"override": False}
+        if gamma_executing:
+            return {"override": False}
+        if down_energy > 0.01 or volume_ratio > 0.58:
+            return {"override": False}
+
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": f"RSI5M OVERBOUGHT VEGA-FADE BLOCKED: RSI5m={rsi6_5m:.1f}, change={change_5m:.2f}%, fake vacuum",
+            "priority": -28010
+        }
+
+
+class UpEnergyAbsorbedBearish:
+    """Refined"""
+    @staticmethod
+    def detect(up_energy, change_5m, volume_ratio, rsi6_5m):
+        if up_energy <= 1.0 or change_5m >= 0 or volume_ratio > 0.58 or rsi6_5m < 76:
+            return {"override": False}
+
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": f"UP ENERGY ABSORBED: up={up_energy:.2f} tapi harga turun {change_5m:.2f}% (distribusi)",
+            "priority": -27960
+        }
+
+
+class KillDirectionOverboughtGuard:
+    """Refined - Lebih ketat"""
+    @staticmethod
+    def detect(kill_direction, rsi6_5m, gamma_executing, kill_speed):
+        if kill_direction != "LONG" or gamma_executing or kill_speed > 1.0:
+            return {"override": False}
+        if rsi6_5m < 80:
+            return {"override": False}
+
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": f"KILL DIRECTION OVERRULED BY OVERBOUGHT: RSI5m={rsi6_5m:.1f}, kill_speed rendah",
+            "priority": -27800
+        }
+
+
+class RsiTfDivergenceVegaTrap:
+    """Refined"""
+    @staticmethod
+    def detect(rsi6, rsi6_5m, vega_active, market_phase, volume_ratio):
+        if not (vega_active and market_phase == "BAIT"):
+            return {"override": False}
+        if rsi6_5m <= 72 or rsi6 >= 65 or (rsi6_5m - rsi6) < 18:
+            return {"override": False}
+        if volume_ratio > 0.6:
+            return {"override": False}
+
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": f"RSI MULTI-TF DIVERGENCE + VEGA: {rsi6_5m:.1f} vs {rsi6:.1f}",
+            "priority": -27955
+        }
 
 
 class RSI5mBaitTrapShortOverride:
@@ -9509,6 +9620,7 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
     """
     if expert_opinions is None:
         expert_opinions = []
+    reasons = []
     
     # ================================================================
     # 🧩 RULE 7: Override Frequency Limiter (GLOBAL CHECK)
@@ -9666,9 +9778,9 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
             down_energy_val = result.get("down_energy", 0.0)
             volume_ratio_val = result.get("volume_ratio", 1.0)
             
-            if (long_liq_val < 1.2 and change_5m_val < -1.0 and 
+            if (long_liq_val < 1.2 and change_5m_val < -0.5 and 
                 down_energy_val < 0.01 and volume_ratio_val < 0.60):
-                exchange_risk_score = 3   # turunkan drastis
+                exchange_risk_score = 2
                 reasons.append(f"Exchange Risk OVERRIDDEN by Long Liq Falling Knife V3")
         
         # 🔥 LECTURER FIX 3: Perkuat Exchange Risk Exception untuk Long Liq Fake Vacuum
@@ -9681,6 +9793,28 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
             if long_liq_val < short_liq_val and long_liq_val < 2.0 and volume_ratio_val < 0.65 and down_energy_val < 0.01:
                 exchange_risk_score = 4   # turunkan agar sinyal SHORT bisa menang
         
+        if exchange_safe == "LONG":
+            long_liq_val = result.get("long_liq", 99.0)
+            change_5m_val = result.get("change_5m", 0.0)
+            down_energy_val = result.get("down_energy", 0.0)
+            volume_ratio_val = result.get("volume_ratio", 1.0)
+            if (long_liq_val < 1.2 and change_5m_val < -0.5 and
+                down_energy_val < 0.01 and volume_ratio_val < 0.60):
+                result["bias"] = "SHORT"
+                result["confidence"] = "ABSOLUTE"
+                result["priority_level"] = -30550
+                result["entry_allowed"] = True
+                result["reason"] = (
+                    f"[EXCHANGE RISK FALLING KNIFE EXCEPTION] long_liq={long_liq_val:.2f}% + "
+                    f"change_5m={change_5m_val:.2f}% + vol={volume_ratio_val:.2f}x + fake vacuum "
+                    f"-> falling knife to long_liq. Force SHORT."
+                )
+                result["aggregator_reasons"] = ["EXCHANGE FALLING KNIFE EXCEPTION: Forced SHORT"]
+                result["aggregator_votes"] = {"EXCHANGE_EXCEPTION": "SHORT"}
+                result["bias_kill_conflict"] = {"has_conflict": False}
+                result["dual_liq_trap"] = {"dual_liq_trap": False}
+                return result
+
         if exchange_safe == "SHORT":
             ultra_micro_exchange_exception = UltraMicroShortLiqSqueezeOverride.detect(
                 short_liq=short_liq,
@@ -9714,7 +9848,6 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
         # Check Rule 7 frequency limiter
         if skip_override:
             # Frequency too high, skip this override and let aggregator decide
-            reasons = []
             reasons.append(f"[OVERRIDE FREQ LIMITER] Skipping EXCHANGE HARD BLOCK due to {recent_overrides} recent overrides")
         else:
             record_override()
@@ -9765,7 +9898,6 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
     # 1. INISIALISASI VOTING
     # -----------------------------------------------------------------
     votes = {"LONG": 0.0, "SHORT": 0.0}
-    reasons = []
     context = result
 
     # ================================================================
@@ -9809,7 +9941,12 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
     # -----------------------------------------------------------------
     liq_bias = "LONG" if context.get("short_liq", 99) < context.get("long_liq", 99) else "SHORT"
     liq_diff = abs(context.get("short_liq", 0) - context.get("long_liq", 0))
+    short_liq = context.get("short_liq", 99.0)
     long_liq = context.get("long_liq", 99.0)
+    change_5m = context.get("change_5m", 0.0)
+    volume_ratio = context.get("volume_ratio", 1.0)
+    up_energy = context.get("up_energy", 0.0)
+    down_energy = context.get("down_energy", 0.0)
     
     # LIQUIDITY LAW dengan bobot dinamis
     if short_liq < 1.5 and short_liq < long_liq:
@@ -9844,8 +9981,6 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
         votes["SHORT"] += liq_weight
 
     # Zero Sellers / Buyers (Vacuum)
-    up_energy = context.get("up_energy", 0.0)
-    down_energy = context.get("down_energy", 0.0)
     if down_energy < 0.01 and up_energy > 0.5:
         votes["LONG"] += 8.0
         reasons.append("VACUUM: No sellers + active buyers")
@@ -9874,7 +10009,6 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
     # 4. TIER 3: SINYAL MATEMATIS EKSTREM (Bobot 7.0)
     # -----------------------------------------------------------------
     rsi_val = context.get("rsi6_5m", 50.0)
-    change_5m = context.get("change_5m", 0.0)
     if rsi_val < 15 and change_5m < -2.0:
         votes["LONG"] += 7.0
         reasons.append("MATH: Extreme capitulation (RSI5m<15)")
@@ -9888,7 +10022,6 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
     market_phase = context.get("market_phase", "UNKNOWN")
     greeks_override = context.get("greeks_override", False)
     vega_score = context.get("greeks_vega_score", 0)
-    volume_ratio = context.get("volume_ratio", 1.0)
     greeks_bias = context.get("greeks_bias", "NEUTRAL")
     
     bid_slope = context.get("bid_slope", 0.0)
@@ -10148,15 +10281,23 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
     # 7. KEPUTUSAN AKHIR (VOTING)
     # -----------------------------------------------------------------
     
-    # PERLEMAH VACUUM DI LOW VOLUME + EXTREME RSI
+    # PERLEMAH VACUUM DI LOW VOLUME + EXTREME RSI / FALLING KNIFE
     volume_ratio = result.get("volume_ratio", 1.0)
     down_energy = result.get("down_energy", 0.0)
     rsi6_5m = result.get("rsi6_5m", 50.0)
     rsi6 = result.get("rsi6", 50.0)
-    if volume_ratio < 0.70 and down_energy < 0.01 and rsi6_5m > 78:
+    long_liq_vote = result.get("long_liq", 99.0)
+    change_5m_vote = result.get("change_5m", 0.0)
+    fake_vacuum_extreme = volume_ratio < 0.70 and down_energy < 0.01 and rsi6_5m > 78
+    fake_vacuum_falling_knife = (
+        volume_ratio < 0.60 and down_energy < 0.01 and
+        long_liq_vote < 1.2 and change_5m_vote < -0.5
+    )
+    if fake_vacuum_extreme or fake_vacuum_falling_knife:
         if "VACUUM: No sellers" in result.get("reason", ""):
             original_long_votes = votes.get("LONG", 0)
-            votes["LONG"] = max(0, votes.get("LONG", 8) - 6)
+            weaken_amount = 7 if fake_vacuum_falling_knife else 6
+            votes["LONG"] = max(0, votes.get("LONG", 8) - weaken_amount)
             result["_fake_vacuum_weakened"] = True
             result["_original_long_votes"] = original_long_votes
             fake_vacuum_reason = (
@@ -23779,7 +23920,71 @@ class BinanceAnalyzer:
         if ultra_close_liq:
             # Nonaktifkan sementara Vega Fade untuk sinyal ini
             result["_block_vega_fade"] = True
-        
+
+        # ========== LECTURER REFINEMENT GUARDS (KATUSDT SAFE, MOVRUSDT HARD SHORT) ==========
+        # Dipasang sebelum Vega Fade dan sebelum guard kill-direction lama.
+        rsi5m_vega_blocker = RSI5mOverboughtVegaFadeBlocker.detect(
+            market_phase=market_phase,
+            vega_active=result.get("greeks_vega_active", False),
+            vega_score=result.get("greeks_vega_score", 0),
+            rsi6_5m=rsi6_5m_val,
+            change_5m=change_5m_val,
+            kill_direction=kill_direction,
+            down_energy=down_energy_val,
+            volume_ratio=volume_ratio,
+            gamma_executing=gamma_executing
+        )
+        if rsi5m_vega_blocker["override"]:
+            result["bias"] = rsi5m_vega_blocker["bias"]
+            result["reason"] = f"[RSI5M VEGA BLOCKER] {rsi5m_vega_blocker['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = rsi5m_vega_blocker["priority"]
+            result["entry_allowed"] = True
+            return result
+
+        up_energy_absorbed = UpEnergyAbsorbedBearish.detect(
+            up_energy=up_energy_val,
+            change_5m=change_5m_val,
+            volume_ratio=volume_ratio,
+            rsi6_5m=rsi6_5m_val
+        )
+        if up_energy_absorbed["override"]:
+            result["bias"] = up_energy_absorbed["bias"]
+            result["reason"] = f"[UP ENERGY ABSORBED] {up_energy_absorbed['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = up_energy_absorbed["priority"]
+            result["entry_allowed"] = True
+            return result
+
+        rsi_tf_vega_trap = RsiTfDivergenceVegaTrap.detect(
+            rsi6=rsi6_val,
+            rsi6_5m=rsi6_5m_val,
+            vega_active=result.get("greeks_vega_active", False),
+            market_phase=market_phase,
+            volume_ratio=volume_ratio
+        )
+        if rsi_tf_vega_trap["override"]:
+            result["bias"] = rsi_tf_vega_trap["bias"]
+            result["reason"] = f"[RSI TF VEGA TRAP] {rsi_tf_vega_trap['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = rsi_tf_vega_trap["priority"]
+            result["entry_allowed"] = True
+            return result
+
+        kill_direction_ob_guard = KillDirectionOverboughtGuard.detect(
+            kill_direction=kill_direction,
+            rsi6_5m=rsi6_5m_val,
+            gamma_executing=gamma_executing,
+            kill_speed=kill_speed
+        )
+        if kill_direction_ob_guard["override"]:
+            result["bias"] = kill_direction_ob_guard["bias"]
+            result["reason"] = f"[KILL DIR OVERBOUGHT] {kill_direction_ob_guard['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = kill_direction_ob_guard["priority"]
+            result["entry_allowed"] = True
+            return result
+
         # ========== PRIORITY -10180: SYMMETRIC LIQUIDITY + STRONG ORDER FLOW ==========
         # Jika short_liq dan long_liq hampir simetris (<1% beda), dan order flow
         # sangat dominan ke satu arah (agg ekstrem + OFI + no opposite energy),
@@ -25427,6 +25632,25 @@ class BinanceAnalyzer:
             result["entry_allowed"] = True
             return result
         
+        # ===== PRIORITY -30700: DEEP OVERSOLD FAKE BOUNCE FALLING KNIFE (MOVRUSDT FIX) =====
+        oversold_knife = DeepOversoldFakeBounceFallingKnife.detect(
+            rsi6=rsi6_val,
+            rsi6_5m=rsi6_5m_val,
+            up_energy=up_energy_val,
+            down_energy=down_energy_val,
+            change_5m=change_5m_val,
+            volume_ratio=volume_ratio,
+            long_liq=long_liq,
+            market_phase=result.get("market_phase", market_phase)
+        )
+        if oversold_knife["override"]:
+            result["bias"] = oversold_knife["bias"]
+            result["reason"] = f"[DEEP OVERSOLD FALLING KNIFE] {oversold_knife['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = oversold_knife["priority"]
+            result["entry_allowed"] = True
+            return result
+
         # ===== PRIORITY -29000: DEEP OVERSOLD FAKE BOUNCE TRAP (UBUSDT PATTERN) =====
         deep_oversold_trap = DeepOversoldFakeBounceTrap.detect(
             rsi6=rsi6_val,
@@ -25461,7 +25685,6 @@ class BinanceAnalyzer:
             final_confidence = "ABSOLUTE"
             final_phase = "LONG_LIQ_ULTRA_FALLING_KNIFE_V3"
             priority = long_liq_knife_v3["priority"]
-            prob_engine.add(final_bias, 9.5)   # bobot super maksimal
             result["bias"] = final_bias
             result["reason"] = f"[LONG LIQ ULTRA FALLING KNIFE V3] {final_reason} | " + result.get("reason", "")
             result["confidence"] = final_confidence
@@ -25484,7 +25707,6 @@ class BinanceAnalyzer:
             final_confidence = "ABSOLUTE"
             final_phase = "LONG_LIQ_FALLING_KNIFE_V2"
             priority = long_liq_knife_v2["priority"]
-            prob_engine.add(final_bias, 9.0)   # bobot super berat
             result["bias"] = final_bias
             result["reason"] = f"[LONG LIQ FALLING KNIFE V2] {final_reason} | " + result.get("reason", "")
             result["confidence"] = final_confidence
@@ -25508,7 +25730,6 @@ class BinanceAnalyzer:
             final_confidence = "ABSOLUTE"
             final_phase = "LONG_LIQ_FALLING_KNIFE"
             priority = long_liq_knife["priority"]
-            prob_engine.add(final_bias, 8.5)
             result["bias"] = final_bias
             result["reason"] = f"[LONG LIQ FALLING KNIFE] {final_reason} | " + result.get("reason", "")
             result["confidence"] = final_confidence
@@ -25533,7 +25754,6 @@ class BinanceAnalyzer:
             final_confidence = "ABSOLUTE"
             final_phase = "GAMMA_EXTREME_FAKE_SQUEEZE"
             priority = gamma_fake["priority"]
-            prob_engine.add(final_bias, 8.5)
             result["bias"] = final_bias
             result["reason"] = f"[GAMMA EXTREME FAKE SQUEEZE] {final_reason} | " + result.get("reason", "")
             result["confidence"] = final_confidence
@@ -25558,7 +25778,6 @@ class BinanceAnalyzer:
             final_confidence = "ABSOLUTE"
             final_phase = "ULTRA_SHORT_SQUEEZE_CONTINUATION"
             priority = ultra_squeeze["priority"]
-            prob_engine.add(final_bias, 8.0)
             result["bias"] = final_bias
             result["reason"] = f"[ULTRA SHORT SQUEEZE] {final_reason} | " + result.get("reason", "")
             result["confidence"] = final_confidence
@@ -29597,9 +29816,29 @@ class BinanceAnalyzer:
                         squeeze_trap = {"override": False}
                         overbought_trap_old = {"override": False}
 
-                        # ===== HIGHEST PRIORITY OVERRIDES: LIQUIDITY EXTREME (-2001 to -1998) =====
+                        # ===== HIGHEST PRIORITY OVERRIDES: LIQUIDITY EXTREME (-30700 and below) =====
                         # Definisikan semua detector terlebih dahulu
                         market_regime = locals().get("regime_data", {}).get("regime", "UNKNOWN")
+                        provisional_phase_data = {
+                            "change_5m": change_5m,
+                            "volume_ratio": volume_ratio,
+                            "down_energy": down_energy,
+                            "up_energy": up_energy,
+                            "ofi_bias": ofi["bias"],
+                            "rsi6": rsi6,
+                            "obv_trend": obv_trend,
+                        }
+                        provisional_market_phase = detect_market_phase(provisional_phase_data).phase
+                        oversold_knife = DeepOversoldFakeBounceFallingKnife.detect(
+                            rsi6=rsi6,
+                            rsi6_5m=rsi6_5m,
+                            up_energy=up_energy,
+                            down_energy=down_energy,
+                            change_5m=change_5m,
+                            volume_ratio=volume_ratio,
+                            long_liq=liq["long_dist"],
+                            market_phase=provisional_market_phase
+                        )
                         extreme_rsi_lowcap = ExtremeRSI5mLowCapBlowOffTrap.detect(
                             rsi6_5m=rsi6_5m,
                             volume_ratio=volume_ratio,
@@ -29607,6 +29846,14 @@ class BinanceAnalyzer:
                             short_liq=liq["short_dist"],
                             long_liq=liq["long_dist"],
                             market_regime=market_regime
+                        )
+                        ultra_knife = LongLiqUltraCloseFallingKnifeV3.detect(
+                            long_liq=liq["long_dist"],
+                            change_5m=change_5m,
+                            down_energy=down_energy,
+                            volume_ratio=volume_ratio,
+                            exchange_risk_score=locals().get("exchange_risk", {}).get("risk_score", 0),
+                            up_energy=up_energy
                         )
                         ultra_micro_squeeze = UltraMicroShortLiqSqueezeOverride.detect(
                             short_liq=liq["short_dist"],
@@ -29629,7 +29876,23 @@ class BinanceAnalyzer:
                             liq["short_dist"], liq["long_dist"], change_5m
                         )
 
-                        if ultra_micro_squeeze["override"]:
+                        if oversold_knife["override"]:
+                            final_bias = oversold_knife["bias"]
+                            final_reason = oversold_knife["reason"]
+                            final_confidence = "ABSOLUTE"
+                            final_phase = "DEEP_OVERSOLD_FALLING_KNIFE"
+                            priority = oversold_knife["priority"]
+                            prob_engine.add(final_bias, 10.0)
+                            _liquidity_extreme_override = False
+                        elif ultra_knife["override"]:
+                            final_bias = ultra_knife["bias"]
+                            final_reason = ultra_knife["reason"]
+                            final_confidence = "ABSOLUTE"
+                            final_phase = "ULTRA_LONG_LIQ_KNIFE"
+                            priority = ultra_knife["priority"]
+                            prob_engine.add(final_bias, 9.5)
+                            _liquidity_extreme_override = True
+                        elif ultra_micro_squeeze["override"]:
                             final_bias = ultra_micro_squeeze["bias"]
                             final_reason = ultra_micro_squeeze["reason"]
                             final_confidence = "ABSOLUTE"
