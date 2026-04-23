@@ -858,6 +858,42 @@ class DeepOversoldFakeBounceTrap:
         }
 
 
+class UltraCloseShortLiqContinuationSqueeze:
+    """
+    PRIORITY -30100 (LEBIH TINGGI DARI EXCHANGE RISK HARD BLOCK)
+    Tangkap kasus UBUSDT & SPKUSDT: short_liq < 1.0% + pump kuat + agg/OFI bullish
+    → Ini genuine micro short squeeze continuation. Force LONG, cancel hard SHORT block.
+    """
+    @staticmethod
+    def detect(short_liq: float, change_5m: float, agg: float,
+               ofi_bias: str, ofi_strength: float,
+               delta_exposure: float, greeks_kill_direction: str) -> dict:
+        
+        if short_liq >= 1.0:
+            return {"override": False}
+        
+        # Momentum kuat + buying consensus
+        strong_momentum = (change_5m > 4.0 and agg > 0.85) or (ofi_bias == "LONG" and ofi_strength > 0.85)
+        if not strong_momentum:
+            return {"override": False}
+        
+        # LONG crowded + Greeks conflict = squeeze potensial
+        if delta_exposure < 0.90:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "LONG",
+            "reason": (
+                f"ULTRA CLOSE SHORT LIQ CONTINUATION SQUEEZE: short_liq={short_liq:.2f}% (micro), "
+                f"change_5m={change_5m:.2f}% (strong pump), agg={agg:.2f}, OFI={ofi_bias} {ofi_strength:.2f}, "
+                f"delta_exposure={delta_exposure:.3f} (LONG crowded) → genuine squeeze continuation. "
+                f"Cancel Exchange Risk Hard Block. Force LONG."
+            ),
+            "priority": -30100
+        }
+
+
 class ExtremeRSI5mLowCapBlowOffTrap:
     """
     PRIORITY -28900 (PALING TINGGI SAAT INI)
@@ -9553,9 +9589,15 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
     if short_liq < 1.5 and short_liq < long_liq:
         liq_weight = 10.0
         # Jika exchange risk HIGH dan merekomendasikan SHORT, turunkan bobot
+        # KECUALI jika ada squeeze momentum (short_liq < 1.0% + pump kuat)
         if exchange_risk_score >= 6 and exchange_safe == "SHORT":
-            liq_weight = 3.0
-            reasons.append(f"LIQUIDITY LAW: short_liq ultra close but EXCHANGE WARNING reduces weight to {liq_weight}")
+            if short_liq < 1.0 and change_5m > 4.0:
+                # Jangan hard block jika ada squeeze momentum
+                exchange_risk_score = 5  # turunkan agar sinyal squeeze bisa menang
+                reasons.append(f"EXCHANGE RISK WEAKENED: short_liq={short_liq:.2f}% + change_5m={change_5m:.2f}% → squeeze momentum detected")
+            else:
+                liq_weight = 3.0
+                reasons.append(f"LIQUIDITY LAW: short_liq ultra close but EXCHANGE WARNING reduces weight to {liq_weight}")
         else:
             reasons.append("LIQUIDITY LAW: short_liq ultra close")
         votes["LONG"] += liq_weight
@@ -25170,6 +25212,31 @@ class BinanceAnalyzer:
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = deep_oversold_trap["priority"]
             result["entry_allowed"] = True
+            return result
+        
+        # ===== PRIORITY -30100: ULTRA CLOSE SHORT LIQ CONTINUATION SQUEEZE (UBUSDT FIX) =====
+        ultra_squeeze = UltraCloseShortLiqContinuationSqueeze.detect(
+            short_liq=short_liq,
+            change_5m=change_5m_val,
+            agg=agg_val,
+            ofi_bias=ofi_bias,
+            ofi_strength=ofi_strength,
+            delta_exposure=result.get("greeks_delta_exposure", 0),
+            greeks_kill_direction=result.get("greeks_kill_direction", "")
+        )
+        if ultra_squeeze["override"]:
+            final_bias = ultra_squeeze["bias"]
+            final_reason = ultra_squeeze["reason"]
+            final_confidence = "ABSOLUTE"
+            final_phase = "ULTRA_SHORT_SQUEEZE_CONTINUATION"
+            priority = ultra_squeeze["priority"]
+            prob_engine.add(final_bias, 8.0)
+            result["bias"] = final_bias
+            result["reason"] = f"[ULTRA SHORT SQUEEZE] {final_reason} | " + result.get("reason", "")
+            result["confidence"] = final_confidence
+            result["priority_level"] = priority
+            result["entry_allowed"] = True
+            result["_liquidity_extreme_override"] = False
             return result
         
         # ===== PRIORITY -28000: BAIT OVERSOLD FAKE BOUNCE TRAP =====
