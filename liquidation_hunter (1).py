@@ -1418,6 +1418,39 @@ class AggJsonVsDisplayBiasCorrection:
         }
 
 
+class LongLiqCloseFakeVacuumDump:
+    """
+    PRIORITY -30400 (PALING TINGGI SAAT INI)
+    Tangkap RAVEUSDT & UAIUSDT: long_liq lebih dekat + down_energy=0 + volume rendah
+    → HFT bait LONG lalu dump ke long_liq. Force SHORT.
+    """
+    @staticmethod
+    def detect(long_liq: float, short_liq: float, volume_ratio: float,
+               down_energy: float, change_5m: float, greeks_kill_direction: str) -> dict:
+        
+        if long_liq >= short_liq:   # long_liq harus lebih dekat
+            return {"override": False}
+        if volume_ratio >= 0.65:
+            return {"override": False}
+        if down_energy >= 0.01:
+            return {"override": False}
+        
+        # Pump kecil atau turun = fake move
+        if abs(change_5m) < 3.0 or change_5m < 0:
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"LONG LIQ CLOSE FAKE VACUUM DUMP: long_liq={long_liq:.2f}% < short_liq={short_liq:.2f}%, "
+                    f"vol={volume_ratio:.2f}x, down_energy=0 (fake vacuum), change={change_5m:.2f}% → "
+                    f"HFT bait LONG lalu dump ke long_liq. Force SHORT. Override all."
+                ),
+                "priority": -30400
+            }
+        
+        return {"override": False}
+
+
 class CapitulationDipOBVGuardLongLiqClose:
     """
     PRIORITY -30050: blokir false positive DipThenRip OBV saat long_liq adalah target cascade.
@@ -9552,6 +9585,16 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
         exchange_safe in ("LONG", "SHORT") and 
         not is_genuine_squeeze and
         not obv_price_divergence_skip):
+        
+        # 🔥 LECTURER FIX 3: Perkuat Exchange Risk Exception untuk Long Liq Fake Vacuum
+        if exchange_risk_score >= 7 and exchange_safe == "LONG":
+            long_liq_val = result.get("long_liq", 99.0)
+            short_liq_val = result.get("short_liq", 99.0)
+            volume_ratio_val = result.get("volume_ratio", 1.0)
+            down_energy_val = result.get("down_energy", 0.0)
+            
+            if long_liq_val < short_liq_val and long_liq_val < 2.0 and volume_ratio_val < 0.65 and down_energy_val < 0.01:
+                exchange_risk_score = 4   # turunkan agar sinyal SHORT bisa menang
         
         if exchange_safe == "SHORT":
             ultra_micro_exchange_exception = UltraMicroShortLiqSqueezeOverride.detect(
@@ -29502,6 +29545,23 @@ class BinanceAnalyzer:
                         has_extreme_override = _liquidity_extreme_override
 
                         # ===== HIGH PRIORITY OVERRIDES (cascading if-else) =====
+
+                        # ================= LONG LIQ CLOSE FAKE VACUUM DUMP (RAVE & UAI FIX) =================
+                        long_liq_dump = LongLiqCloseFakeVacuumDump.detect(
+                            long_liq=liq["long_dist"],
+                            short_liq=liq["short_dist"],
+                            volume_ratio=volume_ratio,
+                            down_energy=down_energy,
+                            change_5m=change_5m,
+                            greeks_kill_direction=result.get("greeks_kill_direction", "")
+                        )
+                        if not has_extreme_override and long_liq_dump["override"]:
+                            final_bias = long_liq_dump["bias"]
+                            final_reason = long_liq_dump["reason"]
+                            final_confidence = "ABSOLUTE"
+                            final_phase = "LONG_LIQ_FAKE_VACUUM_DUMP"
+                            priority = long_liq_dump["priority"]
+                            prob_engine.add(final_bias, 8.5)
 
                         # ===== PRIORITY -1107: POST-SQUEEZE REVERSAL =====
                         post_squeeze = PostSqueezeReversal.detect(
