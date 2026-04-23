@@ -928,6 +928,41 @@ class LongLiqProximityFallingKnifeTrap:
         return {"override": False}
 
 
+class LongLiqProximityFallingKnifeTrapV2:
+    """
+    PRIORITY -30500 (PALING TINGGI SAAT INI)
+    Versi upgrade untuk SPKUSDT pattern: long_liq < 1.5% + harga turun + fake vacuum
+    Override Exchange Risk Hard Block secara paksa.
+    """
+    @staticmethod
+    def detect(long_liq: float, change_5m: float, down_energy: float,
+               volume_ratio: float, exchange_risk_score: int) -> dict:
+        
+        if long_liq >= 1.5:
+            return {"override": False}
+        
+        if change_5m >= -0.5:                  # harus ada penurunan nyata
+            return {"override": False}
+        
+        if down_energy >= 0.01:                # fake vacuum
+            return {"override": False}
+        
+        if volume_ratio >= 0.55:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"LONG LIQ PROXIMITY FALLING KNIFE V2: long_liq={long_liq:.2f}% (ultra dekat), "
+                f"change_5m={change_5m:.2f}% (jatuh), down_energy=0 (fake vacuum), "
+                f"vol={volume_ratio:.2f}x, risk_score={exchange_risk_score} → "
+                f"HFT bait LONG lalu dump ke long_liq. Override Exchange Risk Hard Block."
+            ),
+            "priority": -30500
+        }
+
+
 class UltraCloseShortLiqContinuationSqueeze:
     """
     PRIORITY -30100 (LEBIH TINGGI DARI EXCHANGE RISK HARD BLOCK)
@@ -9746,8 +9781,14 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
     elif long_liq < 1.5 and long_liq < short_liq:
         liq_weight = 10.0
         if exchange_risk_score >= 6 and exchange_safe == "LONG":
-            liq_weight = 3.0
-            reasons.append(f"LIQUIDITY LAW: long_liq ultra close but EXCHANGE WARNING reduces weight to {liq_weight}")
+            # 🔥 LECTURER FIX: Jangan hard block LONG di kasus falling knife ke long_liq
+            if long_liq < 1.5 and change_5m < -1.0 and down_energy < 0.01 and volume_ratio < 0.55:
+                # Jangan hard block jika ada falling knife pattern ke long_liq
+                exchange_risk_score = 4
+                reasons.append("Exchange Risk overridden by Long Liq Falling Knife Trap")
+            else:
+                liq_weight = 3.0
+                reasons.append(f"LIQUIDITY LAW: long_liq ultra close but EXCHANGE WARNING reduces weight to {liq_weight}")
         else:
             reasons.append("LIQUIDITY LAW: long_liq ultra close")
         votes["SHORT"] += liq_weight
@@ -25355,6 +25396,29 @@ class BinanceAnalyzer:
             result["entry_allowed"] = True
             return result
         
+        # ===== PRIORITY -30500: LONG LIQ PROXIMITY FALLING KNIFE V2 (SPKUSDT FIX) =====
+        long_liq_knife_v2 = LongLiqProximityFallingKnifeTrapV2.detect(
+            long_liq=long_liq,
+            change_5m=change_5m_val,
+            down_energy=down_energy_val,
+            volume_ratio=volume_ratio,
+            exchange_risk_score=result.get("exchange_risk_score", 0)
+        )
+        if long_liq_knife_v2["override"]:
+            final_bias = long_liq_knife_v2["bias"]
+            final_reason = long_liq_knife_v2["reason"]
+            final_confidence = "ABSOLUTE"
+            final_phase = "LONG_LIQ_FALLING_KNIFE_V2"
+            priority = long_liq_knife_v2["priority"]
+            prob_engine.add(final_bias, 9.0)   # bobot super berat
+            result["bias"] = final_bias
+            result["reason"] = f"[LONG LIQ FALLING KNIFE V2] {final_reason} | " + result.get("reason", "")
+            result["confidence"] = final_confidence
+            result["priority_level"] = priority
+            result["entry_allowed"] = True
+            result["_liquidity_extreme_override"] = False
+            return result
+
         # ===== PRIORITY -30300: LONG LIQ PROXIMITY FALLING KNIFE TRAP (SPKUSDT FIX) =====
         long_liq_knife = LongLiqProximityFallingKnifeTrap.detect(
             long_liq=long_liq,
