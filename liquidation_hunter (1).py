@@ -843,6 +843,44 @@ class ExtremeRSI5mLowCapBlowOffTrap:
         }
 
 
+class ExtremeMultiTFDivergenceVacuumTrap:
+    """
+    PRIORITY -28950
+    Tangkap pola RAVEUSDT ini: RSI1m bullish (74+) vs RSI5m oversold (<30) + low volume + fake vacuum
+    → Bear trap / fake bounce → Force SHORT
+    """
+    @staticmethod
+    def detect(rsi6: float, rsi6_5m: float, volume_ratio: float,
+               down_energy: float, change_5m: float,
+               short_liq: float, long_liq: float) -> dict:
+        
+        if volume_ratio >= 0.40:                    # low volume
+            return {"override": False}
+        if down_energy >= 0.01:                     # vacuum palsu
+            return {"override": False}
+        
+        # Extreme divergence: RSI6 tinggi + RSI5m sangat rendah
+        divergence = (rsi6 > 70 and rsi6_5m < 30) or (rsi6 > 65 and rsi6_5m < 25)
+        if not divergence:
+            return {"override": False}
+        
+        # Long liq lebih dekat atau reasonable distance
+        if long_liq >= short_liq * 2:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"EXTREME MULTI-TF DIVERGENCE VACUUM TRAP: "
+                f"RSI6={rsi6:.1f} vs RSI5m={rsi6_5m:.1f} (strong bearish divergence), "
+                f"vol={volume_ratio:.2f}x (ultra dry), down_energy=0 (fake vacuum), "
+                f"long_liq={long_liq:.2f}% closer → bear trap. Force SHORT."
+            ),
+            "priority": -28950
+        }
+
+
 class UltraMicroShortLiqSqueezeOverride:
     """
     PRIORITY -29000 (lebih tinggi dari Exchange Risk Hard Block)
@@ -9839,6 +9877,15 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
     result["reason"] = "[AGGREGATOR] " + " | ".join(reasons) + " | Original: " + context.get("reason", "")
     result["aggregator_reasons"] = reasons
     result["aggregator_votes"] = votes
+    
+    # ================= STEP 3: PERKUAT LOW VOLUME WARNING DI AGGREGATOR / REASON =================
+    # Tambahkan warning jika ada extreme divergence + ultra low vol
+    if volume_ratio < 0.30 and rsi6_5m < 30 and rsi6 > 65:
+        result["reason"] += f" | ⚠️ EXTREME DIVERGENCE + ULTRA LOW VOL → bear trap suspected"
+        # Kurangi LONG vote
+        if "aggregator_votes" in result:
+            result["aggregator_votes"]["LONG"] = max(0, result["aggregator_votes"].get("LONG", 8) - 5)
+    
     return result
 
 
@@ -25671,6 +25718,24 @@ class BinanceAnalyzer:
             result["reason"] = f"[MICRO SHORT BLOWOFF] {micro_blowoff['reason']}"
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = micro_blowoff["priority"]
+            result["entry_allowed"] = True
+            return result
+
+        # ================= ANTI DIVERGENCE VACUUM TRAP (RAVEUSDT PATTERN) =================
+        divergence_trap = ExtremeMultiTFDivergenceVacuumTrap.detect(
+            rsi6=rsi6_val,
+            rsi6_5m=rsi6_5m_val,
+            volume_ratio=volume_ratio,
+            down_energy=down_energy_val,
+            change_5m=change_5m_val,
+            short_liq=short_liq,
+            long_liq=long_liq
+        )
+        if divergence_trap["override"]:
+            result["bias"] = divergence_trap["bias"]
+            result["reason"] = f"[DIVERGENCE VACUUM TRAP] {divergence_trap['reason']}"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = divergence_trap["priority"]
             result["entry_allowed"] = True
             return result
 
