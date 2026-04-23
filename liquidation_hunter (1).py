@@ -29547,13 +29547,14 @@ class BinanceAnalyzer:
                         # ===== HIGH PRIORITY OVERRIDES (cascading if-else) =====
 
                         # ================= LONG LIQ CLOSE FAKE VACUUM DUMP (RAVE & UAI FIX) =================
+                        # Note: greeks_kill_direction belum tersedia di titik ini, pakai empty string
                         long_liq_dump = LongLiqCloseFakeVacuumDump.detect(
                             long_liq=liq["long_dist"],
                             short_liq=liq["short_dist"],
                             volume_ratio=volume_ratio,
                             down_energy=down_energy,
                             change_5m=change_5m,
-                            greeks_kill_direction=result.get("greeks_kill_direction", "")
+                            greeks_kill_direction=""
                         )
                         if not has_extreme_override and long_liq_dump["override"]:
                             final_bias = long_liq_dump["bias"]
