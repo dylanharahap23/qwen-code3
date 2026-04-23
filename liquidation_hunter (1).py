@@ -9832,6 +9832,7 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
     volume_ratio = result.get("volume_ratio", 1.0)
     down_energy = result.get("down_energy", 0.0)
     rsi6_5m = result.get("rsi6_5m", 50.0)
+    rsi6 = result.get("rsi6", 50.0)
     if volume_ratio < 0.70 and down_energy < 0.01 and rsi6_5m > 78:
         if "VACUUM: No sellers" in result.get("reason", ""):
             original_long_votes = votes.get("LONG", 0)
