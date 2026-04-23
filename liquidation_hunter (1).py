@@ -892,6 +892,42 @@ class GammaExtremeMicroShortLiqFakeSqueeze:
         return {"override": False}
 
 
+class LongLiqProximityFallingKnifeTrap:
+    """
+    PRIORITY -30300 (LEBIH TINGGI DARI EXCHANGE RISK HARD BLOCK)
+    Tangkap kasus SPKUSDT ini: long_liq < 1.5% + harga turun + fake vacuum
+    → Falling knife ke long_liq. Force SHORT, override Exchange Risk.
+    """
+    @staticmethod
+    def detect(long_liq: float, change_5m: float, down_energy: float,
+               up_energy: float, volume_ratio: float, exchange_safe_direction: str) -> dict:
+        
+        if long_liq >= 1.5:
+            return {"override": False}
+        
+        if change_5m >= 0:                     # harus turun
+            return {"override": False}
+        
+        if down_energy >= 0.01:                # vacuum palsu
+            return {"override": False}
+        
+        # Volume rendah + long_liq sangat dekat = jebakan klasik
+        if volume_ratio < 0.60 and long_liq < 1.2:
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"LONG LIQ PROXIMITY FALLING KNIFE TRAP: long_liq={long_liq:.2f}% (ultra dekat), "
+                    f"change_5m={change_5m:.2f}% (turun), down_energy=0 (fake vacuum), "
+                    f"vol={volume_ratio:.2f}x → HFT bait LONG lalu dump ke long_liq. "
+                    f"Override Exchange Risk Hard Block. Force SHORT."
+                ),
+                "priority": -30300
+            }
+        
+        return {"override": False}
+
+
 class UltraCloseShortLiqContinuationSqueeze:
     """
     PRIORITY -30100 (LEBIH TINGGI DARI EXCHANGE RISK HARD BLOCK)
@@ -5301,6 +5337,18 @@ class ExchangeRiskScoreHardBlock:
         
         if exchange_risk_score < 7:
             return {"override": False}
+        
+        # 🔥 LECTURER PATCH: Long Liq Proximity Falling Knife Exception
+        # Jika long_liq sangat dekat + harga turun + down_energy = 0,
+        # ini adalah falling knife trap (SPKUSDT pattern), jangan hard block SHORT
+        if (long_liq < 1.5 and change_5m < -1.5 and 
+            funding_rate is not None and funding_rate > 0.0003):
+            # Ini adalah crowded LONG cascade dump scenario
+            # Biarkan detector lain (LongLiqProximityFallingKnifeTrap) yang handle
+            return {
+                "override": False,
+                "reason": f"EXCHANGE RISK EXCEPTION: long_liq={long_liq:.2f}% (dekat), change_5m={change_5m:.2f}% (turun), funding positif → falling knife trap, bukan exchange risk block"
+            }
         
         if exchange_safe_direction == "NEUTRAL" or exchange_safe_direction == "":
             return {"override": False}
@@ -25262,6 +25310,30 @@ class BinanceAnalyzer:
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = deep_oversold_trap["priority"]
             result["entry_allowed"] = True
+            return result
+        
+        # ===== PRIORITY -30300: LONG LIQ PROXIMITY FALLING KNIFE TRAP (SPKUSDT FIX) =====
+        long_liq_knife = LongLiqProximityFallingKnifeTrap.detect(
+            long_liq=long_liq,
+            change_5m=change_5m_val,
+            down_energy=down_energy_val,
+            up_energy=up_energy_val,
+            volume_ratio=volume_ratio,
+            exchange_safe_direction=result.get("exchange_safe_direction", "NEUTRAL")
+        )
+        if long_liq_knife["override"]:
+            final_bias = long_liq_knife["bias"]
+            final_reason = long_liq_knife["reason"]
+            final_confidence = "ABSOLUTE"
+            final_phase = "LONG_LIQ_FALLING_KNIFE"
+            priority = long_liq_knife["priority"]
+            prob_engine.add(final_bias, 8.5)
+            result["bias"] = final_bias
+            result["reason"] = f"[LONG LIQ FALLING KNIFE] {final_reason} | " + result.get("reason", "")
+            result["confidence"] = final_confidence
+            result["priority_level"] = priority
+            result["entry_allowed"] = True
+            result["_liquidity_extreme_override"] = False
             return result
         
         # ===== PRIORITY -30200: GAMMA EXTREME FAKE MICRO SQUEEZE (CHIPUSDT FIX) =====
