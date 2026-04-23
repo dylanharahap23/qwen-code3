@@ -519,6 +519,49 @@ def _check_bias_kill_conflict(data: dict, final_bias: str) -> dict:
 # 3 Layer prioritas tertinggi di awal _apply_stability_filters, sebelum semua detector lain
 
 
+# ========== PREP PHASE EXTREME LOW VOLUME FAKE VACUUM (PRIORITY -30800) ==========
+# PRIORITY TERTINGGI MUTLAK: Khusus tangkap BANANAS31USDT pattern
+class PrepPhaseExtremeLowVolumeFakeVacuum:
+    """
+    PRIORITY -30800 (LEBIH TINGGI DARI SEMUA)
+    Khusus tangkap BANANAS31USDT pattern: PREP phase + volume <0.25x + down_energy=0
+    
+    Pattern ini adalah HFT accumulation trap:
+    - Market dalam PREP phase (ngumpulin liquidity)
+    - Volume sangat rendah (<0.25x) = tidak ada partisipasi asli
+    - down_energy=0 = fake vacuum, seller dihapus untuk jebak LONG
+    - up_energy > 0.5 = ada buy pressure tapi tidak signifikan
+    - change_5m kecil = market flat, waiting game
+    
+    Jika Greeks kill SHORT atau OFI SHORT → ikuti, jangan percaya VACUUM
+    """
+    @staticmethod
+    def detect(market_phase: str, volume_ratio: float, down_energy: float,
+               change_5m: float, up_energy: float, greeks_kill_direction: str,
+               ofi_bias: str) -> dict:
+        
+        if market_phase != "PREP":
+            return {"override": False}
+        if volume_ratio >= 0.25 or down_energy > 0.01:
+            return {"override": False}
+        if up_energy < 0.5 and abs(change_5m) < 1.0:
+            return {"override": False}
+        
+        # Kalau Greeks kill SHORT atau OFI SHORT → ikuti, jangan percaya VACUUM
+        bias = "SHORT" if (greeks_kill_direction == "SHORT" or ofi_bias == "SHORT") else "NEUTRAL"
+        
+        return {
+            "override": True,
+            "bias": bias,
+            "reason": (
+                f"PREP EXTREME LOW VOL FAKE VACUUM: vol={volume_ratio:.2f}x, "
+                f"down_energy=0, phase=PREP, kill={greeks_kill_direction} → "
+                f"HFT lagi ngumpulin korban, jangan ikut VACUUM. Force {bias}"
+            ),
+            "priority": -30800
+        }
+
+
 # ========== LECTURER'S SARAN: LIQUIDITY EXTREME FALSE POSITIVE GUARD ==========
 # PRIORITY -26000 (HIGHEST ABSOLUTE): Cancel _liquidity_extreme_override jika false positive
 # untuk menghindari jebakan HFT pada kasus seperti BEATUSDT
@@ -32315,6 +32358,25 @@ class BinanceAnalyzer:
                 "obv_trend": obv_trend,
             }
             phase_result = detect_market_phase(phase_data)
+            
+            # ==================== GUARD BARU UNTUK PREP PHASE ====================
+            prep_vacuum = PrepPhaseExtremeLowVolumeFakeVacuum.detect(
+                market_phase=phase_result.phase,
+                volume_ratio=volume_ratio,
+                down_energy=down_energy,
+                change_5m=change_5m,
+                up_energy=up_energy,
+                greeks_kill_direction=result.get("greeks_kill_direction", ""),
+                ofi_bias=ofi["bias"]
+            )
+            if prep_vacuum["override"]:
+                result["bias"] = prep_vacuum["bias"]
+                result["confidence"] = "ABSOLUTE"
+                result["reason"] = prep_vacuum["reason"]
+                result["priority_level"] = -30800
+                result["_liquidity_extreme_override"] = False
+                return result   # langsung stop
+            
             result = apply_phase_override(result, phase_result)
 
             # Fix 4: Update bait_start_time untuk Time-Weighted Patience Detector
