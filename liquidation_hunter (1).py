@@ -928,6 +928,43 @@ class LongLiqProximityFallingKnifeTrap:
         return {"override": False}
 
 
+class LongLiqUltraCloseFallingKnifeV3:
+    """
+    PRIORITY -30600 (PALING TINGGI SAAT INI)
+    Versi paling keras untuk TACUSDT & SPKUSDT pattern.
+    long_liq < 1.2% + harga turun + fake vacuum = langsung Force SHORT.
+    """
+    @staticmethod
+    def detect(long_liq: float, change_5m: float, down_energy: float,
+               volume_ratio: float, exchange_risk_score: int,
+               up_energy: float) -> dict:
+        
+        if long_liq >= 1.2:
+            return {"override": False}
+        
+        if change_5m >= -0.5:           # harus ada penurunan
+            return {"override": False}
+        
+        if down_energy >= 0.01:         # fake vacuum
+            return {"override": False}
+        
+        if volume_ratio >= 0.60:
+            return {"override": False}
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"LONG LIQ ULTRA CLOSE FALLING KNIFE V3: long_liq={long_liq:.2f}% (target utama), "
+                f"change_5m={change_5m:.2f}% (jatuh), down_energy=0 (fake vacuum), "
+                f"vol={volume_ratio:.2f}x, risk_score={exchange_risk_score} → "
+                f"HFT classic bait LONG lalu dump ke long_liq. "
+                f"OVERRIDE EXCHANGE RISK HARD BLOCK. Force SHORT."
+            ),
+            "priority": -30600
+        }
+
+
 class LongLiqProximityFallingKnifeTrapV2:
     """
     PRIORITY -30500 (PALING TINGGI SAAT INI)
@@ -9620,6 +9657,19 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
         exchange_safe in ("LONG", "SHORT") and 
         not is_genuine_squeeze and
         not obv_price_divergence_skip):
+        
+        # 🔥 LECTURER FIX 4: Long Liq Ultra Close Falling Knife V3 Exception
+        # Jika long_liq < 1.2% + harga turun + fake vacuum, turunkan exchange risk score drastis
+        if exchange_risk_score >= 6 and exchange_safe == "LONG":
+            long_liq_val = result.get("long_liq", 99.0)
+            change_5m_val = result.get("change_5m", 0.0)
+            down_energy_val = result.get("down_energy", 0.0)
+            volume_ratio_val = result.get("volume_ratio", 1.0)
+            
+            if (long_liq_val < 1.2 and change_5m_val < -1.0 and 
+                down_energy_val < 0.01 and volume_ratio_val < 0.60):
+                exchange_risk_score = 3   # turunkan drastis
+                reasons.append(f"Exchange Risk OVERRIDDEN by Long Liq Falling Knife V3")
         
         # 🔥 LECTURER FIX 3: Perkuat Exchange Risk Exception untuk Long Liq Fake Vacuum
         if exchange_risk_score >= 7 and exchange_safe == "LONG":
@@ -25394,6 +25444,30 @@ class BinanceAnalyzer:
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = deep_oversold_trap["priority"]
             result["entry_allowed"] = True
+            return result
+        
+        # ===== PRIORITY -30600: LONG LIQ ULTRA CLOSE FALLING KNIFE V3 (TACUSDT & SPK FIX) =====
+        long_liq_knife_v3 = LongLiqUltraCloseFallingKnifeV3.detect(
+            long_liq=long_liq,
+            change_5m=change_5m_val,
+            down_energy=down_energy_val,
+            volume_ratio=volume_ratio,
+            exchange_risk_score=result.get("exchange_risk_score", 0),
+            up_energy=up_energy_val
+        )
+        if long_liq_knife_v3["override"]:
+            final_bias = long_liq_knife_v3["bias"]
+            final_reason = long_liq_knife_v3["reason"]
+            final_confidence = "ABSOLUTE"
+            final_phase = "LONG_LIQ_ULTRA_FALLING_KNIFE_V3"
+            priority = long_liq_knife_v3["priority"]
+            prob_engine.add(final_bias, 9.5)   # bobot super maksimal
+            result["bias"] = final_bias
+            result["reason"] = f"[LONG LIQ ULTRA FALLING KNIFE V3] {final_reason} | " + result.get("reason", "")
+            result["confidence"] = final_confidence
+            result["priority_level"] = priority
+            result["entry_allowed"] = True
+            result["_liquidity_extreme_override"] = False
             return result
         
         # ===== PRIORITY -30500: LONG LIQ PROXIMITY FALLING KNIFE V2 (SPKUSDT FIX) =====
