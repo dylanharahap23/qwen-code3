@@ -812,6 +812,52 @@ class MicroShortLiqBlowOffTopTrap:
         }
 
 
+
+class DeepOversoldFakeBounceTrap:
+    """
+    PRIORITY -29000 (sangat tinggi)
+    Tangkap pola UBUSDT: RSI6 < 20 + volume < 0.45x + down_energy=0 + OFI LONG spoof
+    → Fake oversold bounce, HFT akan dump. Force SHORT.
+    """
+    @staticmethod
+    def detect(rsi6: float, volume_ratio: float, down_energy: float,
+               ofi_bias: str, ofi_strength: float, greeks_kill_direction: str,
+               long_liq: float, short_liq: float) -> dict:
+        
+        if rsi6 >= 20:
+            return {"override": False}
+        if volume_ratio >= 0.45:
+            return {"override": False}
+        if down_energy >= 0.01:
+            return {"override": False}
+        
+        # OFI LONG spoof di deep oversold = jebakan klasik
+        ofi_spoof = (ofi_bias == "LONG" and ofi_strength > 0.8)
+        
+        if not ofi_spoof:
+            return {"override": False}
+        
+        # Greeks kill SHORT = konfirmasi dump
+        if greeks_kill_direction == "SHORT":
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"DEEP OVERSOLD FAKE BOUNCE TRAP: RSI6={rsi6:.1f} (deep oversold), "
+                    f"vol={volume_ratio:.2f}x, down_energy=0 (fake vacuum), OFI LONG spoof {ofi_strength:.2f}, "
+                    f"greeks_kill=SHORT, long_liq={long_liq:.2f}% → HFT bait bounce lalu dump. Force SHORT."
+                ),
+                "priority": -29000
+            }
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": f"DEEP OVERSOLD + FAKE VACUUM + OFI SPOOF → bear trap. Force SHORT.",
+            "priority": -29000
+        }
+
+
 class ExtremeRSI5mLowCapBlowOffTrap:
     """
     PRIORITY -28900 (PALING TINGGI SAAT INI)
@@ -16102,6 +16148,10 @@ class OFIExtremeOversoldConfirm:
                 and ofi_bias == "LONG"
                 and ofi_strength > min_ofi_strength
                 and down_energy < 0.1):
+            # Guard: Deep oversold + volume dry + extreme OFI = potential spoof
+            if rsi6 < 18 and volume_ratio < 0.5 and ofi_strength > 0.85:
+                # This could be OFI spoof - let DeepOversoldFakeBounceTrap handle it
+                return {"override": False, "priority": 0}
             return {
                 "override": True,
                 "bias": "LONG",
@@ -25100,6 +25150,25 @@ class BinanceAnalyzer:
             )
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = -28025
+            result["entry_allowed"] = True
+            return result
+        
+        # ===== PRIORITY -29000: DEEP OVERSOLD FAKE BOUNCE TRAP (UBUSDT PATTERN) =====
+        deep_oversold_trap = DeepOversoldFakeBounceTrap.detect(
+            rsi6=rsi6_val,
+            volume_ratio=volume_ratio,
+            down_energy=down_energy_val,
+            ofi_bias=ofi_bias,
+            ofi_strength=ofi_strength,
+            greeks_kill_direction=result.get("greeks_kill_direction", ""),
+            long_liq=long_liq,
+            short_liq=short_liq
+        )
+        if deep_oversold_trap["override"]:
+            result["bias"] = deep_oversold_trap["bias"]
+            result["reason"] = f"[DEEP OVERSOLD TRAP] {deep_oversold_trap['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = deep_oversold_trap["priority"]
             result["entry_allowed"] = True
             return result
         
