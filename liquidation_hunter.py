@@ -1096,6 +1096,87 @@ class BlowOffTopExhaustionGuard:
         }
 
 
+class InstitutionalSellWallCascadeGuard:
+    """
+    PRIORITY -31000 (TERTINGGI, DI ATAS SEMUA ULTRA CLOSE LIQ DETECTOR):
+    
+    Mendeteksi jebakan LONG paling mematikan:
+    - Ask wall raksasa (ask/bid > 10x)
+    - Semua sinyal mikro terlihat bullish (agg tinggi, OFI LONG, no seller)
+    - Tapi ada long_liq sangat dekat (trigger cascade) 
+    - Dan fundamental BEARISH (funding crowded long, algo SHORT, exchange risk tinggi)
+    
+    BASUSDT exact pattern: long_liq=0.3%, up_energy=0.82, agg=1.0, down=0,
+    tapi ask/bid=34.5x, funding=+0.001, algo=SHORT, exchange_risk=9/10.
+    Hasil: LONG -> dump -8%.
+    """
+    @staticmethod
+    def detect(long_liq: float, short_liq: float, 
+               ask_slope: float, bid_slope: float,
+               funding_rate: float, algo_type_bias: str,
+               exchange_risk_score: int,
+               agg: float, ofi_strength: float, 
+               down_energy: float, volume_ratio: float,
+               rsi6: float, market_phase: str) -> dict:
+        
+        # 1. Long liq harus ultra dekat (trigger cascade)
+        if long_liq >= 1.0:
+            return {"override": False}
+        
+        # 2. Ask wall raksasa (minimal 10x lebih besar dari bid)
+        if bid_slope <= 0 or ask_slope <= 0:
+            return {"override": False}
+        ask_bid_ratio = ask_slope / bid_slope
+        if ask_bid_ratio < 10.0:
+            return {"override": False}
+        
+        # 3. Sinyal mikro terlihat bullish (ini yang menipu sistem)
+        fake_bullish = (agg > 0.85 and down_energy < 0.01 and ofi_strength > 0.7)
+        if not fake_bullish:
+            return {"override": False}
+            
+        # 4. Minimal 3 dari 5 konfirmasi bearish fundamental
+        bearish_score = 0
+        reasons = []
+        
+        if funding_rate is not None and funding_rate > 0.0003:
+            bearish_score += 1
+            reasons.append(f"funding={funding_rate:.5f} (crowded LONG)")
+            
+        if algo_type_bias == "SHORT":
+            bearish_score += 1
+            reasons.append(f"algo=SHORT")
+            
+        if exchange_risk_score >= 7:
+            bearish_score += 1
+            reasons.append(f"exchange_risk={exchange_risk_score}/10")
+            
+        if rsi6 < 35 and rsi6 > 15:  # belum oversold ekstrem, masih ada ruang turun
+            bearish_score += 1
+            reasons.append(f"RSI6={rsi6:.1f} (belum capitulation)")
+            
+        if market_phase == "BAIT" and volume_ratio < 0.5:
+            bearish_score += 1
+            reasons.append(f"BAIT phase, vol={volume_ratio:.2f}x")
+            
+        if bearish_score < 3:
+            return {"override": False}
+            
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"INSTITUTIONAL SELL WALL CASCADE: "
+                f"long_liq={long_liq:.2f}% (cascade trigger), "
+                f"ask/bid={ask_bid_ratio:.1f}x (MASSIVE SELL WALL), "
+                f"agg={agg:.2f} + OFI=1.0 + down_energy=0 -> ALL SPOOFED. "
+                f"Bearish confirms ({bearish_score}/5): {', '.join(reasons)}. "
+                f"HFT lure LONG before massive dump. Force SHORT."
+            ),
+            "priority": -31000
+        }
+
+
 class DeepOversoldFakeBounceFallingKnife:
     """
     PRIORITY -30700 (LEBIH TINGGI DARI SEMUA GUARD SEBELUMNYA)
@@ -30175,6 +30256,24 @@ class BinanceAnalyzer:
                             short_liq=liq["short_dist"]
                         )
                         
+                        # ===== BASUSDT FIX: Institutional Sell Wall Cascade Guard (Priority -31000) =====
+                        # Deteksi jebakan LONG dengan ask wall raksasa yang menipu semua sinyal mikro bullish
+                        sell_wall_cascade = InstitutionalSellWallCascadeGuard.detect(
+                            long_liq=liq["long_dist"],
+                            short_liq=liq["short_dist"],
+                            ask_slope=ask_slope,
+                            bid_slope=bid_slope,
+                            funding_rate=funding_rate or 0.0,
+                            algo_type_bias=algo_type["bias"],
+                            exchange_risk_score=0,  # Placeholder, akan diupdate setelah exchange_risk dihitung
+                            agg=agg,
+                            ofi_strength=ofi["strength"],
+                            down_energy=down_energy,
+                            volume_ratio=volume_ratio,
+                            rsi6=rsi6,
+                            market_phase=provisional_market_phase
+                        )
+                        
                         ultra_liq_trap = UltraCloseLiqFakeVacuumTrap.detect(
                             long_liq=liq["long_dist"],
                             short_liq=liq["short_dist"],
@@ -30281,6 +30380,23 @@ class BinanceAnalyzer:
                             final_confidence = "ABSOLUTE"
                             final_phase = "HIGH_UP_ENERGY_FAKE_PUMP"
                             priority = fake_pump["priority"]
+                            prob_engine.add(final_bias, 10.0)
+                            _liquidity_extreme_override = False
+                            priority_guard_hard_return = {
+                                "bias": final_bias,
+                                "reason": final_reason,
+                                "confidence": final_confidence,
+                                "phase": final_phase,
+                                "priority": priority,
+                            }
+                        # ===== BASUSDT FIX: Institutional Sell Wall Cascade (Priority -31000) =====
+                        # Ini adalah guard pamungkas yang mengalahkan semua detector lain termasuk ULTRA CLOSE LIQ
+                        elif sell_wall_cascade["override"]:
+                            final_bias = sell_wall_cascade["bias"]
+                            final_reason = sell_wall_cascade["reason"]
+                            final_confidence = "ABSOLUTE"
+                            final_phase = "INSTITUTIONAL_SELL_WALL_CASCADE"
+                            priority = sell_wall_cascade["priority"]
                             prob_engine.add(final_bias, 10.0)
                             _liquidity_extreme_override = False
                             priority_guard_hard_return = {
