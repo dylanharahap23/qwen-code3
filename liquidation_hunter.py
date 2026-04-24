@@ -986,6 +986,116 @@ class ProtectGenuineShortSqueezeGuard:
         }
 
 
+class FundingLedSqueezeShakeoutGuard:
+    """
+    PRIORITY -30800 (DI ATAS HIGH UP-ENERGY FAKE PUMP):
+    
+    Mencegah false SHORT dari pola absorption (up_energy besar + harga turun) 
+    ketika funding rate sangat negatif dan konsensus institusi mengatakan LONG.
+    
+    Ini adalah "Funding-Led Short Squeeze Shakeout": HFT menurunkan harga 
+    untuk menjebak lebih banyak short sebelum pompa besar.
+    """
+    @staticmethod
+    def detect(up_energy: float, down_energy: float, change_5m: float,
+               funding_rate: float, algo_bias: str, hft_bias: str,
+               exchange_safe: str, rsi6: float, rsi6_5m: float,
+               short_liq: float) -> dict:
+        
+        if funding_rate is None:
+            return {"override": False}
+        
+        # 1. Pola absorption terlihat (yang membuat sistem memaksa SHORT)
+        absorption_pattern = (up_energy > 1.0 and down_energy < 0.1 and change_5m < 0)
+        if not absorption_pattern:
+            return {"override": False}
+            
+        # 2. FUNDING SANGAT NEGATIF (crowded SHORT)
+        if funding_rate >= -0.002:
+            return {"override": False}
+            
+        # 3. KONSENSUS INSTITUSI LONG (minimal 2 dari 3)
+        consensus_long = (
+            (algo_bias == "LONG" and hft_bias == "LONG") or
+            (algo_bias == "LONG" and exchange_safe == "LONG") or
+            (hft_bias == "LONG" and exchange_safe == "LONG")
+        )
+        if not consensus_long:
+            return {"override": False}
+            
+        # 4. RSI tidak overbought (masih ada ruang untuk naik)
+        if rsi6 > 70 or rsi6_5m > 65:
+            return {"override": False}
+            
+        # 5. Target squeeze harus ada (short_liq dekat)
+        if short_liq > 5.0:
+            return {"override": False}
+
+        return {
+            "override": True,
+            "bias": "LONG",
+            "reason": (
+                f"FUNDING-LED SQUEEZE SHAKEOUT: "
+                f"funding={funding_rate:.5f} (crowded SHORT), "
+                f"Algo={algo_bias}, HFT={hft_bias}, Exchange={exchange_safe} -> consensus LONG. "
+                f"Absorption pattern adalah SHAKEOUT, bukan distribusi. Batalkan semua sinyal SHORT, force LONG."
+            ),
+            "priority": -30800
+        }
+
+
+class BlowOffTopExhaustionGuard:
+    """
+    PRIORITY -10190 (DI ATAS PROTECT GENUINE SHORT SQUEEZE -10150):
+    
+    Membatalkan sinyal LONG (termasuk 'Protect Genuine Squeeze') saat 
+    short squeeze sudah mencapai titik exhaustion yang fatal.
+    
+    Kondisi:
+    - RSI6 > 98 ATAU Stoch J > 110 (momentum habis)
+    - Harga sudah naik signifikan (> 4%) menuju short_liq
+    - funding_rate > 0 (crowded LONG, bukan SHORT)
+    - delta_exposure > 0.85 (pasar jenuh LONG)
+    """
+    @staticmethod
+    def detect(short_liq: float, change_5m: float, rsi6: float,
+               rsi6_5m: float, stoch_j: float, funding_rate: float,
+               delta_exposure: float, kill_direction: str) -> dict:
+        
+        if funding_rate is None:
+            return {"override": False}
+        
+        # 1. Short Liq sudah dekat dan harga sudah naik jauh (squeeze sudah terjadi)
+        if not (short_liq < 2.0 and change_5m > 4.0):
+            return {"override": False}
+        
+        # 2. Exhaustion signal: RSI6 > 98 ATAU Stoch J > 110
+        exhaustion_signal = rsi6 > 98 or stoch_j > 110
+        if not exhaustion_signal:
+            return {"override": False}
+        
+        # 3. Pasar jenuh LONG, bukan SHORT yang crowded
+        crowded_long = funding_rate > 0
+        delta_crowded = delta_exposure > 0.85
+        if not (crowded_long and delta_crowded):
+            return {"override": False}
+        
+        # 4. Greeks konfirmasi (opsional, memperkuat)
+        greeks_confirm = (kill_direction == "SHORT")
+        
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"BLOW-OFF TOP EXHAUSTION: short_liq={short_liq:.2f}% tersapu, "
+                f"pump {change_5m:.1f}%, RSI6={rsi6:.1f}, StochJ={stoch_j:.1f} -> MOMENTUM HABIS. "
+                f"funding={funding_rate:.5f} (crowded LONG), delta={delta_exposure:.3f} (pasar jenuh). "
+                f"Ini BLOW-OFF TOP, batalkan semua sinyal LONG. Force SHORT."
+            ),
+            "priority": -10190
+        }
+
+
 class DeepOversoldFakeBounceFallingKnife:
     """
     PRIORITY -30700 (LEBIH TINGGI DARI SEMUA GUARD SEBELUMNYA)
@@ -30046,6 +30156,22 @@ class BinanceAnalyzer:
                             short_liq=liq["short_dist"],
                             long_liq=liq["long_dist"]
                         )
+                        
+                        # ===== KATUSUSDT FIX: Funding-Led Squeeze Shakeout Guard (Priority -30800) =====
+                        # Deteksi absorption pattern yang sebenarnya adalah shakeout sebelum short squeeze
+                        shakeout_guard = FundingLedSqueezeShakeoutGuard.detect(
+                            up_energy=up_energy,
+                            down_energy=down_energy,
+                            change_5m=change_5m,
+                            funding_rate=funding_rate or 0.0,
+                            algo_bias=result.get("algo_type_bias", "NEUTRAL"),
+                            hft_bias=result.get("hft_6pct_bias", "NEUTRAL"),
+                            exchange_safe=result.get("exchange_safe_direction", "NEUTRAL"),
+                            rsi6=rsi6,
+                            rsi6_5m=rsi6_5m,
+                            short_liq=liq["short_dist"]
+                        )
+                        
                         ultra_liq_trap = UltraCloseLiqFakeVacuumTrap.detect(
                             long_liq=liq["long_dist"],
                             short_liq=liq["short_dist"],
@@ -30063,6 +30189,20 @@ class BinanceAnalyzer:
                             ofi_bias=ofi["bias"],
                             market_phase=provisional_market_phase
                         )
+                        
+                        # ===== FOLKSUSDT FIX: Blow-Off Top Exhaustion Guard (Priority -10190) =====
+                        # Deteksi blow-off top saat short squeeze sudah mencapai exhaustion
+                        blowoff_guard = BlowOffTopExhaustionGuard.detect(
+                            short_liq=liq["short_dist"],
+                            change_5m=change_5m,
+                            rsi6=rsi6,
+                            rsi6_5m=rsi6_5m,
+                            stoch_j=stoch_j,
+                            funding_rate=funding_rate or 0.0,
+                            delta_exposure=provisional_delta.get("delta_exposure", 0.0),
+                            kill_direction=provisional_gamma.get("kill_direction", "")
+                        )
+                        
                         # Guard protect squeeze (priority -30700): paksa LONG kalau genuine squeeze
                         if genuine_squeeze["override"]:
                             ultra_liq_trap = {"override": False}  # Batalkan ultra_liq_trap kalau ada genuine squeeze
@@ -30115,7 +30255,24 @@ class BinanceAnalyzer:
 
                         priority_guard_hard_return = None
 
-                        if fake_pump["override"]:
+                        # ===== KATUSUSDT FIX: Funding-Led Squeeze Shakeout Override (Priority -30800) =====
+                        # Ini harus dicek PALING PERTAMA, bahkan sebelum High Up-Energy Fake Pump
+                        if shakeout_guard["override"]:
+                            final_bias = shakeout_guard["bias"]
+                            final_reason = shakeout_guard["reason"]
+                            final_confidence = "ABSOLUTE"
+                            final_phase = "FUNDING_LED_SQUEEZE_SHAKEOUT"
+                            priority = shakeout_guard["priority"]
+                            prob_engine.add(final_bias, 10.0)
+                            _liquidity_extreme_override = False
+                            priority_guard_hard_return = {
+                                "bias": final_bias,
+                                "reason": final_reason,
+                                "confidence": final_confidence,
+                                "phase": final_phase,
+                                "priority": priority,
+                            }
+                        elif fake_pump["override"]:
                             final_bias = fake_pump["bias"]
                             final_reason = fake_pump["reason"]
                             final_confidence = "ABSOLUTE"
@@ -30151,6 +30308,23 @@ class BinanceAnalyzer:
                             final_confidence = "ABSOLUTE"
                             final_phase = "PROTECT_GENUINE_SHORT_SQUEEZE"
                             priority = genuine_squeeze["priority"]
+                            prob_engine.add(final_bias, 10.0)
+                            _liquidity_extreme_override = False
+                            priority_guard_hard_return = {
+                                "bias": final_bias,
+                                "reason": final_reason,
+                                "confidence": final_confidence,
+                                "phase": final_phase,
+                                "priority": priority,
+                            }
+                        # ===== FOLKSUSDT FIX: Blow-Off Top Exhaustion Override (Priority -10190) =====
+                        # Ini membatalkan Protect Genuine Short Squeeze jika kondisi exhaustion terpenuhi
+                        elif blowoff_guard["override"]:
+                            final_bias = blowoff_guard["bias"]
+                            final_reason = blowoff_guard["reason"]
+                            final_confidence = "ABSOLUTE"
+                            final_phase = "BLOW_OFF_TOP_EXHAUSTION"
+                            priority = blowoff_guard["priority"]
                             prob_engine.add(final_bias, 10.0)
                             _liquidity_extreme_override = False
                             priority_guard_hard_return = {
