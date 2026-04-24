@@ -27,4 +27,15 @@ node_modules/
 dist/
 build/
 target/
+
+# Testing
+.coverage
+htmlcov/
+.coverage.*
+.pytest_cache/
+.mypy_cache/
+
+# OS generated
+.DS_Store
+Thumbs.db
 ```

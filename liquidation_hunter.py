@@ -30147,6 +30147,10 @@ class BinanceAnalyzer:
                 priority = overbought_trap["priority"]
                 algo_type = {"bias": "NEUTRAL", "confidence": "MEDIUM"}
                 hft_6pct = {"bias": "NEUTRAL", "reason": ""}
+                # Initialize guard variables to prevent UnboundLocalError in early return paths
+                shakeout_guard = {"override": False}
+                blowoff_guard = {"override": False}
+                sell_wall_cascade = {"override": False}
             else:
                 oversold_trap = OversoldSqueezeTrap.detect(
                     rsi6, liq["long_dist"], liq["short_dist"], volume_ratio,
@@ -30160,6 +30164,10 @@ class BinanceAnalyzer:
                     priority = oversold_trap["priority"]
                     algo_type = {"bias": "NEUTRAL", "confidence": "MEDIUM"}
                     hft_6pct = {"bias": "NEUTRAL", "reason": ""}
+                    # Initialize guard variables to prevent UnboundLocalError in early return paths
+                    shakeout_guard = {"override": False}
+                    blowoff_guard = {"override": False}
+                    sell_wall_cascade = {"override": False}
                 else:
                     empty_book = EmptyBookTrapDetector.detect(
                         down_energy, up_energy, liq["short_dist"], liq["long_dist"],
@@ -30175,6 +30183,10 @@ class BinanceAnalyzer:
                         priority = empty_book["priority"]
                         algo_type = {"bias": "NEUTRAL", "confidence": "MEDIUM"}
                         hft_6pct = {"bias": "NEUTRAL", "reason": ""}
+                        # Initialize guard variables to prevent UnboundLocalError in early return paths
+                        shakeout_guard = {"override": False}
+                        blowoff_guard = {"override": False}
+                        sell_wall_cascade = {"override": False}
                     else:
                         # ===== PROBABILISTIC ENGINE =====
                         prob_engine = ProbabilisticEngine()
@@ -30192,6 +30204,11 @@ class BinanceAnalyzer:
                         near_exhausted = {"override": False}
                         squeeze_trap = {"override": False}
                         overbought_trap_old = {"override": False}
+                        
+                        # Initialize guard variables to prevent UnboundLocalError
+                        shakeout_guard = {"override": False}
+                        blowoff_guard = {"override": False}
+                        sell_wall_cascade = {"override": False}
 
                         # ===== HIGHEST PRIORITY OVERRIDES: LIQUIDITY EXTREME (-30750 and below) =====
                         # Definisikan semua detector terlebih dahulu
