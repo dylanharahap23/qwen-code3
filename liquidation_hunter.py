@@ -29925,6 +29925,7 @@ class BinanceAnalyzer:
             rsi6 = IndicatorCalculator.calculate_rsi(closes_1m, 6)
             rsi14 = IndicatorCalculator.calculate_rsi(closes_1m, 14)
             stoch_k, stoch_d = IndicatorCalculator.calculate_stoch(highs_1m, lows_1m, closes_1m)
+            stoch_j = 3 * stoch_k - 2 * stoch_d  # Untuk Blow-Off Top detection
             obv, obv_trend, obv_value = IndicatorCalculator.calculate_obv(closes_1m, volumes_1m)
             obv_magnitude = (
                 "HIGH" if abs(obv_value) > 50_000_000
