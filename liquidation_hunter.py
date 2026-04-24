@@ -901,38 +901,34 @@ class DeepOversoldFakeBounceTrap:
         }
 
 
-class UltraCloseLiqFakeVacuumTrap:
+class UltraCloseLiqFakeVacuumTrap:   # UPGRADE V2
     """
-    PRIORITY -30750 (PALING TINGGI SAAT INI)
-    Tangkap pola OPGUSDT + LABUSDT:
-    liq salah satu sisi <1.0% + volume <0.5x + down_energy=0 + BAIT
+    PRIORITY -30750
+    Versi refined: Jangan paksa SHORT kalau sudah ada momentum pump kuat
     """
     @staticmethod
     def detect(long_liq: float, short_liq: float, volume_ratio: float,
-               down_energy: float, market_phase: str, change_5m: float,
-               rsi6_5m: float) -> dict:
-
+               down_energy: float, change_5m: float, market_phase: str,
+               rsi6: float) -> dict:
+        
         closest_liq = min(long_liq, short_liq)
         if closest_liq >= 1.0 or volume_ratio >= 0.55 or down_energy > 0.01:
             return {"override": False}
-
-        if market_phase not in ["BAIT", "LOW_CAP_SNIPER"]:
+        
+        if market_phase not in ["BAIT", "LOW_CAP_SNIPER", "PREP"]:
             return {"override": False}
 
-        # Fake vacuum + harga sudah bergerak berlawanan = jebakan
-        if (long_liq < 1.0 and change_5m < -0.5) or (short_liq < 1.0 and change_5m > 0.5):
-            bias = "LONG" if long_liq < short_liq else "SHORT"
-            return {
-                "override": True,
-                "bias": bias,
-                "reason": (
-                    f"ULTRA CLOSE LIQ FAKE VACUUM: {long_liq:.2f}% / {short_liq:.2f}% liq, "
-                    f"vol={volume_ratio:.2f}x, down_energy=0 -> HFT bait, force {bias}"
-                ),
-                "priority": -30750
-            }
+        # === TAMBAHAN BARU: JANGAN PAKSA SHORT KALAU SUDAH PUMP ===
+        if change_5m > 1.5 and rsi6 > 75:   # momentum pump + overbought
+            return {"override": False}       # biarkan genuine squeeze jalan
 
-        return {"override": False}
+        bias = "LONG" if long_liq < short_liq else "SHORT"
+        return {
+            "override": True,
+            "bias": bias,
+            "reason": f"ULTRA CLOSE LIQ FAKE VACUUM V2: {long_liq:.2f}% / {short_liq:.2f}% liq, vol={volume_ratio:.2f}x, change={change_5m:.2f}% → HFT bait, force {bias}",
+            "priority": -30750
+        }
 
 
 class HighUpEnergyFakePumpGuard:
@@ -30000,7 +29996,7 @@ class BinanceAnalyzer:
                             down_energy=down_energy,
                             market_phase=provisional_market_phase,
                             change_5m=change_5m,
-                            rsi6_5m=rsi6_5m
+                            rsi6=rsi6  # V2: ganti dari rsi6_5m ke rsi6
                         )
                         genuine_squeeze = ProtectGenuineShortSqueezeGuard.detect(
                             short_liq=liq["short_dist"],
@@ -30010,6 +30006,9 @@ class BinanceAnalyzer:
                             ofi_bias=ofi["bias"],
                             market_phase=provisional_market_phase
                         )
+                        # Guard protect squeeze (priority -30700): paksa LONG kalau genuine squeeze
+                        if genuine_squeeze["override"]:
+                            ultra_liq_trap = {"override": False}  # Batalkan ultra_liq_trap kalau ada genuine squeeze
                         oversold_knife = DeepOversoldFakeBounceFallingKnife.detect(
                             rsi6=rsi6,
                             rsi6_5m=rsi6_5m,

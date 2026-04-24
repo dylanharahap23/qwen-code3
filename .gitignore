@@ -1,103 +1,30 @@
 ```
-# Environment files
-.env
-.env.local
-*.env.*
-
-# Logs and temporary files
-*.log
-*.tmp
-*.swp
-
-# Editors
-.vscode/
-.idea/
-
 # Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-.Python
-venv/
-.venv/
-env/
-ENV/
-pip-log.txt
-pip-delete-this-directory.txt
-.tox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.log
-.git/modules/
-.DS_Store
-Thumbs.db
 
-# Build and distribution artifacts
+# Logs and temp files
+*.log
+*.tmp
+
+# Environment
+.env
+.env.local
+*.env.*
+
+# Editors
+.vscode/
+.idea/
+
+# Dependencies
+.venv/
+venv/
+node_modules/
+
+# Build artifacts
 dist/
 build/
-*.egg
-*.egg-info/
-.eggs/
-eggs/
-parts/
-var/
-sdist/
-develop-eggs/
-.installed.cfg
-lib/
-lib64/
-wheels/
-share/python-wheels/
-*.so
-.Python
-.pyx.py
-*.c
-*.cpp
-*.h
-*.hpp
-*.o
-*.obj
-*.out
-*.exe
-*.dll
-*.so
-*.a
-*.lib
-*.dylib
-*.jar
-*.war
-*.class
-*.elc
-*.o
-*.a
-*.lib
-*.dylib
-*.dll
-*.exe
-*.out
-*.obj
-*.pyc
-*.pyo
-*.pyd
-*.so
-*.egg-info
-*.egg
-*.nib
-*.plist
-*.db
-*.db-journal
-*.lock
-*.tmp
-*.temp
-*.log
-*.swp
-*.swo
-*~
-.DS_Store
-Thumbs.db
+target/
 ```
