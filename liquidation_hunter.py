@@ -30159,14 +30159,16 @@ class BinanceAnalyzer:
                         
                         # ===== KATUSUSDT FIX: Funding-Led Squeeze Shakeout Guard (Priority -30800) =====
                         # Deteksi absorption pattern yang sebenarnya adalah shakeout sebelum short squeeze
+                        # Gunakan variabel lokal algo_type, hft_6pct yang sudah diinitialize di atas
+                        # exchange_risk akan dihitung nanti, gunakan placeholder untuk sementara
                         shakeout_guard = FundingLedSqueezeShakeoutGuard.detect(
                             up_energy=up_energy,
                             down_energy=down_energy,
                             change_5m=change_5m,
                             funding_rate=funding_rate or 0.0,
-                            algo_bias=result.get("algo_type_bias", "NEUTRAL"),
-                            hft_bias=result.get("hft_6pct_bias", "NEUTRAL"),
-                            exchange_safe=result.get("exchange_safe_direction", "NEUTRAL"),
+                            algo_bias=algo_type["bias"],
+                            hft_bias=hft_6pct["bias"],
+                            exchange_safe="NEUTRAL",  # Akan diupdate setelah exchange_risk dihitung
                             rsi6=rsi6,
                             rsi6_5m=rsi6_5m,
                             short_liq=liq["short_dist"]
@@ -32512,6 +32514,22 @@ class BinanceAnalyzer:
                 funding_rate, liq["short_dist"], liq["long_dist"],
                 volume_ratio, change_5m, oi_delta
             )
+            
+            # ===== KATUSUSDT FIX: Re-evaluate shakeout guard dengan exchange_safe yang sebenarnya =====
+            # Jika shakeout_guard sebelumnya tidak override, cek lagi dengan exchange_safe_direction yang benar
+            if not shakeout_guard.get("override", False):
+                shakeout_guard = FundingLedSqueezeShakeoutGuard.detect(
+                    up_energy=up_energy,
+                    down_energy=down_energy,
+                    change_5m=change_5m,
+                    funding_rate=funding_rate or 0.0,
+                    algo_bias=algo_type["bias"],
+                    hft_bias=hft_6pct["bias"],
+                    exchange_safe=exchange_risk["safe_direction"],
+                    rsi6=rsi6,
+                    rsi6_5m=rsi6_5m,
+                    short_liq=liq["short_dist"]
+                )
             
             # LECTURER FIX v10: Generate unique analysis_id untuk tracking
             analysis_id = str(uuid.uuid4())
