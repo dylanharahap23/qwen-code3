@@ -7050,6 +7050,45 @@ class VegaFadeOverride:
         }
 
 
+class OFIDominantVegaFadeVeto:
+    """
+    PRIORITY -10031 (lebih tinggi dari Vega Fade & Reverse Bait)
+    Blokir Vega Fade kalau OFI sangat kuat berlawanan + kondisi jebakan
+    """
+    @staticmethod
+    def detect(ofi_bias: str, ofi_strength: float,
+               greeks_vega_active: bool, greeks_bias: str,
+               volume_ratio: float, gamma_executing: bool,
+               change_5m: float) -> dict:
+        
+        if not greeks_vega_active:
+            return {"override": False}
+        if ofi_strength < 0.85 or volume_ratio >= 0.70:
+            return {"override": False}
+        if gamma_executing:                     # genuine squeeze → biarkan
+            return {"override": False}
+        
+        # Vega Fade LONG tapi OFI SHORT kuat → paksa SHORT
+        if greeks_bias == "LONG" and ofi_bias == "SHORT":
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"OFI DOMINANT VEGA FADE VETO: OFI SHORT {ofi_strength:.2f} > Vega Fade LONG (vol={volume_ratio:.2f}x)",
+                "priority": -10031
+            }
+        
+        # Vega Fade SHORT tapi OFI LONG kuat → paksa LONG
+        if greeks_bias == "SHORT" and ofi_bias == "LONG":
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": f"OFI DOMINANT VEGA FADE VETO: OFI LONG {ofi_strength:.2f} > Vega Fade SHORT",
+                "priority": -10031
+            }
+        
+        return {"override": False}
+
+
 class NoSellerNoBuyerOverride:
     """
     🔥 PRIORITY -20000: Jika down_energy == 0 → TIDAK ADA SELLER → LONG.
@@ -24376,6 +24415,24 @@ class BinanceAnalyzer:
                 result["priority_level"] = vega_fade["priority"]
                 result["entry_allowed"] = True
                 return result  # Keluar lebih awal, tidak perlu filter lain
+        
+        # ===== PRIORITY -10031: OFI DOMINANT VEGA FADE VETO (FIX MOVRUSDT & ZKPUSDT) =====
+        ofi_veto = OFIDominantVegaFadeVeto.detect(
+            ofi_bias=result.get("ofi_bias", "NEUTRAL"),
+            ofi_strength=result.get("ofi_strength", 0.0),
+            greeks_vega_active=result.get("greeks_vega_active", False),
+            greeks_bias=result.get("greeks_bias", "NEUTRAL"),
+            volume_ratio=volume_ratio,
+            gamma_executing=result.get("greeks_gamma_executing", False),
+            change_5m=change_5m_val
+        )
+        if ofi_veto["override"]:
+            result["bias"] = ofi_veto["bias"]
+            result["reason"] = f"[OFI VETO] {ofi_veto['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = ofi_veto["priority"]
+            result["_liquidity_extreme_override"] = False
+            return result   # langsung stop
         
         # ========== STEP 3: CONFLICT DETECTION (GREEKS vs FINAL BIAS) ==========
         greeks_bias = result.get("greeks_bias", "NEUTRAL")
