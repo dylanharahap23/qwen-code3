@@ -21,4 +21,10 @@ __pycache__/
 # Dependencies
 .venv/
 venv/
+node_modules/
+
+# Build artifacts
+dist/
+build/
+target/
 ```

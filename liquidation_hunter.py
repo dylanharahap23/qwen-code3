@@ -24221,6 +24221,43 @@ class BinanceAnalyzer:
         price = float(result.get("price", 0.0))
         change_5m = float(result.get("change_5m", 0.0))
         
+        # ===== ALIAS UNTUK BACKWARD COMPATIBILITY =====
+        # Buat alias _val untuk semua variabel agar kode lama tetap bekerja
+        agg_val = agg
+        up_energy_val = up_energy
+        down_energy_val = down_energy
+        ofi_bias_val = ofi_bias
+        ofi_strength_val = ofi_strength
+        algo_bias_val = algo_bias
+        hft_bias_val = hft_bias
+        volume_ratio_val = volume_ratio
+        rsi6_val = rsi6
+        rsi14_val = rsi14
+        rsi6_5m_val = rsi6_5m
+        funding_rate_val = funding_rate
+        short_liq_val = short_liq
+        long_liq_val = long_liq
+        obv_trend_val = obv_trend
+        obv_value_val = obv_value
+        ask_slope_val = ask_slope
+        bid_slope_val = bid_slope
+        latest_volume_val = latest_volume
+        volume_ma10_val = volume_ma10
+        market_phase_val = market_phase
+        exchange_risk_score_val = exchange_risk_score
+        exchange_safe_val = exchange_safe
+        greeks_kill_val = greeks_kill
+        who_dies_val = who_dies
+        vega_active_val = vega_active
+        gamma_executing_val = gamma_executing
+        gamma_exec_score_val = gamma_exec_score
+        delta_exposure_val = delta_exposure
+        stoch_k_val = stoch_k
+        stoch_d_val = stoch_d
+        stoch_j_val = stoch_j
+        price_val = price
+        change_5m_val = change_5m
+        
         # ========== LANGKAH 7 : PREP PHASE HARD BLOCK ===========
         # Prioritas -20000 (sangat tinggi), hanya dikalahkan oleh -10110 (Ultra-Low Vol Veto)
         if market_phase == "PREP":
