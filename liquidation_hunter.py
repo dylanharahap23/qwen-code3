@@ -2311,18 +2311,29 @@ class ExhaustedPumpVolumeDryReversal:
 class AdversarialCloserLiquidity:
     """
     PRIORITY -29500: paksa arah ke likuiditas terdekat saat rasio ekstrem dan volume rendah.
+    
+    TAHAP 3.1: Hanya override jika gamma_executing=True ATAU volume spike > 1.5x
     """
     @staticmethod
-    def detect(short_liq: float, long_liq: float, volume_ratio: float) -> dict:
+    def detect(short_liq: float, long_liq: float, volume_ratio: float,
+               gamma_executing: bool = False, latest_volume: float = 0,
+               volume_ma10: float = 1) -> dict:
         if short_liq <= 0 or long_liq <= 0:
             return {"override": False}
+        
+        # TAHAP 3.1: Hanya override jika gamma_executing=True ATAU volume spike > 1.5x
+        vol_spike = latest_volume / max(volume_ma10, 1) if volume_ma10 > 0 else 0
+        if not (gamma_executing or vol_spike > 1.5):
+            return {"override": False}
+        
         if short_liq < 2.0 and long_liq / short_liq > 5.0 and volume_ratio < 0.8:
             return {
                 "override": True,
                 "bias": "LONG",
                 "reason": (
                     f"SHORT liq {short_liq:.2f}% << long {long_liq:.2f}% "
-                    f"(ratio {long_liq/short_liq:.1f}x), vol {volume_ratio:.2f}x -> force LONG"
+                    f"(ratio {long_liq/short_liq:.1f}x), vol {volume_ratio:.2f}x, "
+                    f"gamma_exec={gamma_executing}, vol_spike={vol_spike:.2f}x -> force LONG"
                 ),
                 "priority": -29500
             }
@@ -2332,7 +2343,8 @@ class AdversarialCloserLiquidity:
                 "bias": "SHORT",
                 "reason": (
                     f"LONG liq {long_liq:.2f}% << short {short_liq:.2f}% "
-                    f"(ratio {short_liq/long_liq:.1f}x), vol {volume_ratio:.2f}x -> force SHORT"
+                    f"(ratio {short_liq/long_liq:.1f}x), vol {volume_ratio:.2f}x, "
+                    f"gamma_exec={gamma_executing}, vol_spike={vol_spike:.2f}x -> force SHORT"
                 ),
                 "priority": -29500
             }
@@ -7319,7 +7331,14 @@ class NoSellerNoBuyerOverride:
         # ========== ARIAUSDT GUARD: algo+hft both SHORT + OBV negatif = manufactured vacuum ==========
         # Jika algo DAN hft keduanya SHORT, dan OBV negatif, maka down_energy=0 adalah jebakan
         if down_energy < 0.01:
-            if (market_phase == "BAIT" and volume_ratio < 0.7):
+            # TAHAP 1.2: GUARD TAMBAHAN untuk BAIT phase
+            if market_phase == "BAIT" and volume_ratio < 0.7:
+                # Hanya izinkan jika ada konfirmasi exchange atau OBV
+                short_liq_local = short_liq if short_liq is not None else 99.0
+                long_liq_local = long_liq if long_liq is not None else 99.0
+                if down_energy < 0.01 and short_liq_local < long_liq_local:
+                    if result.get("exchange_safe_direction") != "LONG" and obv_trend not in ("POSITIVE_EXTREME", "POSITIVE"):
+                        return {"override": False}
                 genuine_short_squeeze = (short_liq < long_liq and short_liq < 2.0)
                 if not genuine_short_squeeze:
                     return {"override": False}
@@ -10025,17 +10044,30 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
     
     if (short_liq_abs < 1.0 and short_liq_abs < long_liq_abs and greeks_kill == "LONG") or \
        (long_liq_abs < 1.0 and long_liq_abs < short_liq_abs and greeks_kill == "SHORT"):
-        result["bias"] = greeks_kill
-        result["confidence"] = "ABSOLUTE"
-        result["priority_level"] = -40000
-        result["entry_allowed"] = True
-        result["reason"] = f"[LIQ PROXIMITY ABSOLUTE] Target liq <1.0% (short={short_liq_abs:.2f}%, long={long_liq_abs:.2f}%), kill direction={greeks_kill}. No gate can override."
-        result["aggregator_reasons"] = ["LIQUIDITY PROXIMITY ABSOLUTE: Forced " + greeks_kill]
-        result["aggregator_votes"] = {"LIQ_ABSOLUTE": greeks_kill}
-        # Clear potential conflict fields
-        result["bias_kill_conflict"] = {"has_conflict": False}
-        result["dual_liq_trap"] = {"dual_liq_trap": False}
-        return result
+        # TAHAP 3.2: Syarat tambahan: gamma executing atau volume spike > 1.3x
+        gamma_exec = result.get("greeks_gamma_executing", False)
+        vol_spike = result.get("latest_volume", 0) / max(result.get("volume_ma10", 1), 1)
+        liq_ok = False
+        if (short_liq_abs < 1.0 and short_liq_abs < long_liq_abs and greeks_kill == "LONG"):
+            liq_ok = True
+        elif (long_liq_abs < 1.0 and long_liq_abs < short_liq_abs and greeks_kill == "SHORT"):
+            liq_ok = True
+
+        if liq_ok and (gamma_exec or vol_spike > 1.3):
+            result["bias"] = greeks_kill
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = -40000
+            result["entry_allowed"] = True
+            result["reason"] = f"[LIQ PROXIMITY ABSOLUTE] Target liq <1.0% (short={short_liq_abs:.2f}%, long={long_liq_abs:.2f}%), kill direction={greeks_kill}. Gamma exec={gamma_exec}, vol_spike={vol_spike:.2f}x. No gate can override."
+            result["aggregator_reasons"] = ["LIQUIDITY PROXIMITY ABSOLUTE: Forced " + greeks_kill]
+            result["aggregator_votes"] = {"LIQ_ABSOLUTE": greeks_kill}
+            # Clear potential conflict fields
+            result["bias_kill_conflict"] = {"has_conflict": False}
+            result["dual_liq_trap"] = {"dual_liq_trap": False}
+            return result
+        else:
+            # Jangan override, biarkan keputusan lain
+            pass
     
     # ================================================================
     # 🛡️ PERBAIKAN 1: PRE-KILL EXCEPTION (Overrides Exchange Gate, Priority -30500)
@@ -24177,6 +24209,65 @@ class BinanceAnalyzer:
         if result.get("algo_type_bias", "NEUTRAL") != json_algo:
             result["algo_type_bias"] = json_algo
         
+        # ==================== TAHAP 2: 4 GUARD ANTI-JEBAKAN UTAMA ====================
+        
+        # === GUARD 1: ENERGY DIVERGENCE (Cegah Kasus APEUSDT) ===
+        # Saat harga turun drastis tapi up_energy >> down_energy, itu adalah divergence bullish – jangan pernah SHORT.
+        if result.get("bias") == "SHORT" and result.get("up_energy", 0) > 3.0 and result.get("down_energy", 0) < 0.1:
+            result["bias"] = "LONG"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = -10200
+            result["reason"] = "[ENERGY DIVERGENCE] High up_energy while price dropping → bullish reversal, override SHORT. " + result.get("reason", "")
+            result["entry_allowed"] = True
+            return result
+        
+        # === GUARD 2: RSI Multi-TF Overbought/Oversold Filter (Cegah Pump/Dump Palsu) ===
+        rsi6 = result.get("rsi6", 50)
+        rsi14 = result.get("rsi14", 50)
+        rsi5m = result.get("rsi6_5m", 50)
+        change_5m = result.get("change_5m", 0)
+
+        # Overbought multi-TF → batalkan LONG
+        if result.get("bias") == "LONG" and rsi6 > 90 and rsi5m > 80 and change_5m > 2:
+            result["bias"] = "SHORT"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = -10180
+            result["reason"] = f"[RSI MULTI-TF OVERBOUGHT] RSI6>90, RSI5m>80, price pumped → fake pump, force SHORT. " + result.get("reason", "")
+            result["entry_allowed"] = True
+            return result
+        # Oversold multi-TF → batalkan SHORT
+        if result.get("bias") == "SHORT" and rsi6 < 10 and rsi5m < 20 and change_5m < -2:
+            result["bias"] = "LONG"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = -10180
+            result["reason"] = f"[RSI MULTI-TF OVERSOLD] RSI6<10, RSI5m<20, price crashed → capitulation bounce, force LONG. " + result.get("reason", "")
+            result["entry_allowed"] = True
+            return result
+        
+        # === GUARD 3: Order Book Slope – Ask Wall Raksasa Membatalkan LONG ===
+        # Cegah sinyal LONG ketika ask_slope / bid_slope > 5.0 (ini jebakan EVAAUSDT).
+        if result.get("bias") == "LONG":
+            ask_slope = result.get("ask_slope", 0)
+            bid_slope = result.get("bid_slope", 1)
+            if bid_slope > 0 and ask_slope / bid_slope > 5.0:
+                result["bias"] = "SHORT"
+                result["confidence"] = "ABSOLUTE"
+                result["priority_level"] = -10170
+                result["reason"] = "[ASK WALL DOMINANCE] Massive ask wall detected → fake LONG signal, force SHORT. " + result.get("reason", "")
+                result["entry_allowed"] = True
+                return result
+        
+        # === GUARD 4: Exchange Safe Direction Hard Block yang Lebih Cerdas ===
+        # Jika exchange_safe_direction berlawanan dengan bias, dan volume lagi kering, langsung paksa.
+        if result.get("exchange_risk_score", 0) >= 6 and result.get("exchange_safe_direction") != result.get("bias"):
+            if volume_ratio < 0.6:   # pasar tipis, exchange lebih tahu
+                result["bias"] = result["exchange_safe_direction"]
+                result["confidence"] = "ABSOLUTE"
+                result["priority_level"] = -10150
+                result["reason"] = f"[EXCHANGE HARD BLOCK] High risk + thin market (vol={volume_ratio:.2f}x) → follow exchange ({result['exchange_safe_direction']}). " + result.get("reason", "")
+                result["entry_allowed"] = True
+                return result
+        
         # ========== PRIORITY -10200: CAPITULATION BOUNCE ABSOLUTE ==========
         # Jika RSI6 < 15 (capitulation), change_5m < -5% (dump besar),
         # OBV POSITIVE_EXTREME (akumulasi institusi), dan long_liq < 10% (target dekat),
@@ -24663,6 +24754,36 @@ class BinanceAnalyzer:
                 f"gerakan palsu, NO TRADE | " + result.get("reason", "")
             )
             return result
+        
+        # === TAMBAHAN: BAIT PHASE ABSOLUTE GUARD (TAHAP 1.1) ===
+        if market_phase == "BAIT":
+            # Kumpulkan konfirmasi independen
+            independent_confirmations = 0
+            # 1. Exchange Risk Score tinggi & safe direction konsisten
+            if result.get("exchange_risk_score", 0) >= 6 and result.get("exchange_safe_direction") == result.get("bias"):
+                independent_confirmations += 1
+            # 2. Order book slope searah (bid > ask untuk LONG, ask > bid untuk SHORT)
+            bid_slope = result.get("bid_slope", 0)
+            ask_slope = result.get("ask_slope", 0)
+            if (result.get("bias") == "LONG" and bid_slope > ask_slope * 1.2) or \
+               (result.get("bias") == "SHORT" and ask_slope > bid_slope * 1.2):
+                independent_confirmations += 1
+            # 3. Volume spike real (latest_volume > volume_ma10 * 1.5)
+            if result.get("latest_volume", 0) > result.get("volume_ma10", 1) * 1.5:
+                independent_confirmations += 1
+            # 4. OBV extreme & searah
+            obv = result.get("obv_trend")
+            if (result.get("bias") == "LONG" and obv in ("POSITIVE_EXTREME", "POSITIVE")) or \
+               (result.get("bias") == "SHORT" and obv in ("NEGATIVE_EXTREME", "NEGATIVE")):
+                independent_confirmations += 1
+
+            if independent_confirmations < 2:
+                result["bias"] = "NEUTRAL"
+                result["confidence"] = "BLOCK"
+                result["entry_allowed"] = False
+                result["priority_level"] = -10050
+                result["reason"] = f"[BAIT ABSOLUTE GUARD] BAIT phase + hanya {independent_confirmations}/2 konfirmasi → NO TRADE. " + result.get("reason", "")
+                return result
         
         # ========== STEP 4: PRE-KILL READINESS CHECK ==========
         pre_kill = result.get("greeks_pre_kill", {})
@@ -25334,7 +25455,10 @@ class BinanceAnalyzer:
         adv_closer = AdversarialCloserLiquidity.detect(
             short_liq=short_liq,
             long_liq=long_liq,
-            volume_ratio=volume_ratio
+            volume_ratio=volume_ratio,
+            gamma_executing=result.get("greeks_gamma_executing", False),
+            latest_volume=result.get("latest_volume", 0),
+            volume_ma10=result.get("volume_ma10", 1)
         )
         if adv_closer["override"]:
             result["bias"] = adv_closer["bias"]
