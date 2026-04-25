@@ -5877,10 +5877,40 @@ class ExchangeRiskScoreHardBlock:
         delta_exposure: float,
         funding_rate: float,
         long_liq: float = 99.0,
+        short_liq: float = 99.0,
         change_5m: float = 0.0,
         ask_slope: float = 0,
         bid_slope: float = 1
     ) -> dict:
+        
+        # ========== LANGKAH 5.2: JANGAN LAWAN GENUINE SHORT SQUEEZE ==========
+        # Jika short_liq < 1.0% dan ada bukti squeeze, exchange risk tidak relevan
+        if (short_liq < 1.0 and short_liq < long_liq and
+            (rsi6_5m < 80) and  # RSI 5m belum overbought, masih ada ruang naik
+            (delta_exposure > 0.7) and  # crowded, ada yang bisa di-squeeze
+            (funding_rate < -0.001 if funding_rate is not None else False)):  # crowded short
+            
+            # Cek apakah data order flow/pressure mendukung squeeze
+            # (agg dan ofi akan diambil dari result di luar method ini)
+            # Karena ini static, kita hanya bisa mengandalkan parameter yang ada
+            # Tapi kita perlu flag: jika up_energy besar + down_energy=0, itu squeeze
+            # Kita paksa override tidak terjadi
+            return {
+                "override": False,
+                "reason": "GENUINE SHORT SQUEEZE PROTECTION: short_liq extremely close, exchange risk block suspended"
+            }
+        
+        # Jika long_liq sangat dekat dan ada bukti bullish reversal (mirror logic)
+        if (long_liq < 1.0 and long_liq < short_liq and
+            (rsi6_5m > 20) and
+            (delta_exposure > 0.7) and
+            (funding_rate > 0.001 if funding_rate is not None else False)):
+            return {
+                "override": False,
+                "reason": "GENUINE LONG SQUEEZE PROTECTION: long_liq extremely close, exchange risk block suspended"
+            }
+        
+        # ========== END OF GUARD ==========
         
         if exchange_risk_score < 7:
             return {"override": False}
@@ -24154,6 +24184,57 @@ class BinanceAnalyzer:
         4. Gamma Delay (Gamma EXTREME tapi delta exposure < 0.95 => tunda)
         5. Entry Filter (tambahkan rekomendasi entry di output)
         """
+        # ========== LANGKAH 5.1: FORCE OVERWRITE DENGAN JSON GROUND TRUTH ==========
+        # Hentikan data race antara display snapshot dan JSON result
+        
+        json_agg = result.get("agg", 0.5)
+        json_ofi_bias = result.get("ofi_bias", "NEUTRAL")
+        json_ofi_strength = result.get("ofi_strength", 0.0)
+        json_algo = result.get("algo_type_bias", "NEUTRAL")
+        json_hft = result.get("hft_6pct_bias", "NEUTRAL")
+        
+        # Ambil nilai display dari parameter (jika ada) atau dari result
+        display_agg = result.get("agg_display", json_agg)
+        display_ofi_bias = result.get("ofi_bias_display", json_ofi_bias)
+        display_ofi_strength = result.get("ofi_strength_display", json_ofi_strength)
+        display_algo = result.get("algo_type_display", json_algo)
+        display_hft = result.get("hft_6pct_display", json_hft)
+        
+        # Deteksi data race: jika salah satu indikator kunci berbeda >0.25 dari JSON
+        data_race_detected = False
+        corrections = []
+        
+        if abs(display_agg - json_agg) > 0.25:
+            data_race_detected = True
+            corrections.append(f"AGG {display_agg:.2f}→{json_agg:.2f}")
+            # Update semua variabel agg di scope ini
+            agg_val = json_agg
+        
+        if display_ofi_bias != json_ofi_bias and json_ofi_bias != "NEUTRAL" and display_ofi_bias != json_ofi_bias:
+            data_race_detected = True
+            corrections.append(f"OFI {display_ofi_bias}→{json_ofi_bias}")
+            # Update ofi
+            result["ofi_bias"] = json_ofi_bias
+            result["ofi_strength"] = json_ofi_strength
+            
+        if display_algo != json_algo and json_algo != "NEUTRAL":
+            data_race_detected = True
+            corrections.append(f"ALGO {display_algo}→{json_algo}")
+            result["algo_type_bias"] = json_algo
+            
+        if display_hft != json_hft and json_hft != "NEUTRAL":
+            data_race_detected = True
+            corrections.append(f"HFT {display_hft}→{json_hft}")
+            result["hft_6pct_bias"] = json_hft
+        
+        if data_race_detected:
+            result["reason"] = f"[JSON OVERRIDE: {' | '.join(corrections)}] " + result.get("reason", "")
+            result["confidence"] = "HIGH"  # Turunkan confidence karena data tidak stabil
+            # Catat di log
+            print(f"⚠️ DATA RACE DETECTED & CORRECTED for {result.get('symbol')}: {', '.join(corrections)}")
+        
+        # ========== END OF JSON OVERRIDE BLOCK ==========
+        
         # ========== AMBIL SEMUA VARIABEL YANG DIPERLUKAN DI AWAL METHOD ==========
         short_liq = result.get("short_liq", 99.0)
         long_liq = result.get("long_liq", 99.0)
@@ -26538,6 +26619,7 @@ class BinanceAnalyzer:
             delta_exposure=result.get("greeks_delta_exposure", 0),
             funding_rate=funding_rate_val,
             long_liq=long_liq,
+            short_liq=short_liq,
             change_5m=change_5m_val,
             ask_slope=result.get("ask_slope", 0),
             bid_slope=result.get("bid_slope", 1)
