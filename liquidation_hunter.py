@@ -24264,6 +24264,14 @@ class BinanceAnalyzer:
         who_dies_first = who_dies  # Alias untuk parameter detector
         kill_direction = greeks_kill  # Alias untuk parameter detector
         
+        # ===== VARIABEL TAMBAHAN UNTUK DETECTOR (FIX: delta_crowded dan lainnya) =====
+        delta_crowded = result.get("greeks_delta_crowded", "NEUTRAL")
+        gamma_intensity = result.get("greeks_gamma_intensity", "LOW")
+        kill_speed = result.get("greeks_kill_speed", 0.0)
+        rsi6_val = rsi6  # Sudah ada di atas, pastikan konsisten
+        rsi6_5m_val = rsi6_5m  # Sudah ada di atas, pastikan konsisten
+        rsi14_val = rsi14  # Sudah ada di atas, pastikan konsisten
+        
         # ========== LANGKAH 7 : PREP PHASE HARD BLOCK ===========
         # Prioritas -20000 (sangat tinggi), hanya dikalahkan oleh -10110 (Ultra-Low Vol Veto)
         if market_phase == "PREP":
