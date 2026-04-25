@@ -24184,16 +24184,21 @@ class BinanceAnalyzer:
         4. Gamma Delay (Gamma EXTREME tapi delta exposure < 0.95 => tunda)
         5. Entry Filter (tambahkan rekomendasi entry di output)
         """
-        # ========== AMBIL SEMUA VARIABEL PENTING DARI result SEKALI DI AWAL ==========
+        # ===== AMBIL SEMUA DARI result, BUKAN DARI PARAMETER =====
+        # Ini adalah Single Source of Truth - semua variabel harus dari result dictionary
+        agg = float(result.get("agg", 0.5))
+        ofi_bias = str(result.get("ofi_bias", "NEUTRAL"))
+        ofi_strength = float(result.get("ofi_strength", 0.0))
+        algo_bias = str(result.get("algo_type_bias", "NEUTRAL"))
+        hft_bias = str(result.get("hft_6pct_bias", "NEUTRAL"))
+        
+        # Variabel lainnya juga dari result
         price = result.get("price", 0.0)
         change_5m = result.get("change_5m", 0.0)
-        volume_ratio = result.get("volume_ratio", 1.0)   # ← INI YANG MEMPERBAIKI ERROR
+        volume_ratio = result.get("volume_ratio", 1.0)
         rsi6 = result.get("rsi6", 50.0)
         rsi14 = result.get("rsi14", 50.0)
         rsi6_5m = result.get("rsi6_5m", 50.0)
-        agg = result.get("agg", 0.5)
-        ofi_bias = result.get("ofi_bias", "NEUTRAL")
-        ofi_strength = result.get("ofi_strength", 0.0)
         down_energy = result.get("down_energy", 0.0)
         up_energy = result.get("up_energy", 0.0)
         funding_rate = result.get("funding_rate", 0.0)
@@ -24213,60 +24218,7 @@ class BinanceAnalyzer:
         vega_active = result.get("greeks_vega_active", False)
         gamma_executing = result.get("greeks_gamma_executing", False)
         delta_exposure = result.get("greeks_delta_exposure", 0.0)
-        algo_bias = result.get("algo_type_bias", "NEUTRAL")
-        hft_bias = result.get("hft_6pct_bias", "NEUTRAL")
         stoch_j = result.get("stoch_j", 50.0)
-
-        # ========== LANGKAH 5.1: FORCE OVERWRITE DENGAN JSON GROUND TRUTH ==========
-        # Hentikan data race antara display snapshot dan JSON result
-        
-        json_agg = result.get("agg", 0.5)
-        json_ofi_bias = result.get("ofi_bias", "NEUTRAL")
-        json_ofi_strength = result.get("ofi_strength", 0.0)
-        json_algo = result.get("algo_type_bias", "NEUTRAL")
-        json_hft = result.get("hft_6pct_bias", "NEUTRAL")
-        
-        # Ambil nilai display dari parameter (jika ada) atau dari result
-        display_agg = result.get("agg_display", json_agg)
-        display_ofi_bias = result.get("ofi_bias_display", json_ofi_bias)
-        display_ofi_strength = result.get("ofi_strength_display", json_ofi_strength)
-        display_algo = result.get("algo_type_display", json_algo)
-        display_hft = result.get("hft_6pct_display", json_hft)
-        
-        # Deteksi data race: jika salah satu indikator kunci berbeda >0.25 dari JSON
-        data_race_detected = False
-        corrections = []
-        
-        if abs(display_agg - json_agg) > 0.25:
-            data_race_detected = True
-            corrections.append(f"AGG {display_agg:.2f}→{json_agg:.2f}")
-            # Update semua variabel agg di scope ini
-            agg = json_agg
-        
-        if display_ofi_bias != json_ofi_bias and json_ofi_bias != "NEUTRAL" and display_ofi_bias != json_ofi_bias:
-            data_race_detected = True
-            corrections.append(f"OFI {display_ofi_bias}→{json_ofi_bias}")
-            # Update ofi
-            result["ofi_bias"] = json_ofi_bias
-            result["ofi_strength"] = json_ofi_strength
-            
-        if display_algo != json_algo and json_algo != "NEUTRAL":
-            data_race_detected = True
-            corrections.append(f"ALGO {display_algo}→{json_algo}")
-            result["algo_type_bias"] = json_algo
-            
-        if display_hft != json_hft and json_hft != "NEUTRAL":
-            data_race_detected = True
-            corrections.append(f"HFT {display_hft}→{json_hft}")
-            result["hft_6pct_bias"] = json_hft
-        
-        if data_race_detected:
-            result["reason"] = f"[JSON OVERRIDE: {' | '.join(corrections)}] " + result.get("reason", "")
-            result["confidence"] = "HIGH"  # Turunkan confidence karena data tidak stabil
-            # Catat di log
-            print(f"⚠️ DATA RACE DETECTED & CORRECTED for {result.get('symbol')}: {', '.join(corrections)}")
-        
-        # ========== END OF JSON OVERRIDE BLOCK ==========
         # ========== LANGKAH 7 : PREP PHASE HARD BLOCK ==========
         # Prioritas -20000 (sangat tinggi), hanya dikalahkan oleh -10110 (Ultra-Low Vol Veto)
         market_phase = result.get("market_phase", "UNKNOWN")
@@ -24333,11 +24285,8 @@ class BinanceAnalyzer:
         # FIX: Definisi dictionary liq untuk kompatibilitas dengan detector yang masih menggunakan liq["..."]
         liq = {"short_dist": short_liq, "long_dist": long_liq}
         
-        agg_json_val = result.get("agg", 0.5)
-        agg_display_val = result.get("agg_display", agg_json_val)
-        agg_val = agg_json_val
-        ofi_bias = result.get("ofi_bias", "NEUTRAL")
-        ofi_strength = result.get("ofi_strength", 0.0)
+        # Gunakan variabel yang sudah diambil dari result di awal fungsi
+        # Tidak perlu re-declare agg, ofi_bias, dll karena sudah ada di scope
         volume_ratio = result.get("volume_ratio", 1.0)
         rsi6_val = result.get("rsi6", 50.0)
         rsi6_5m_val = result.get("rsi6_5m", 50.0)
@@ -24361,25 +24310,6 @@ class BinanceAnalyzer:
         new_bias = result["bias"]
         now = time.time()
         market_phase = phase_result.phase if phase_result else "UNKNOWN"
-        
-        # ===== DATA CONSISTENCY GUARD (PRIORITY -30000) =====
-        # LECTURER FIX #1: Force use JSON real values and correct contradictions
-        json_agg = result.get("agg", agg_val)
-        json_algo = result.get("algo_type_bias", result.get("algo_bias", "NEUTRAL"))
-        json_hft = result.get("hft_6pct_bias", "NEUTRAL")
-        
-        # Jika显示 agg 与 JSON agg 差距 >0.3，强制使用 JSON agg
-        if abs(agg_val - json_agg) > 0.3:
-            result["reason"] = f"[AGG CORRECTED {agg_val:.2f}→{json_agg:.2f}] " + result.get("reason", "")
-            agg_val = json_agg
-            # 同时修正 ofi_bias（如果 ofi 是从显示快照算出的）
-            if ofi_bias == "LONG" and agg_val < 0.5:
-                ofi_bias = "SHORT"
-                ofi_strength = 0.5
-        
-        # Jika algo 显示与 JSON 矛盾，采用 JSON
-        if result.get("algo_type_bias", "NEUTRAL") != json_algo:
-            result["algo_type_bias"] = json_algo
         
         # ==================== TAHAP 2: 4 GUARD ANTI-JEBAKAN UTAMA ====================
         
@@ -33176,6 +33106,32 @@ class BinanceAnalyzer:
             # Rekam bias akhir untuk simbol ini sebelum stability filters
             if final_bias in ("LONG", "SHORT"):
                 AdversarialRotationDetector.record_signal(self.symbol, final_bias)
+            
+            # ===== PAKSA SATU SUMBER KEBENARAN (SINGLE SOURCE OF TRUTH) =====
+            # Ambil nilai dari result dictionary utama (JSON ground truth)
+            # Jangan gunakan variabel lokal yang mungkin berbeda snapshot
+            primary_agg = float(result.get("agg", 0.5))
+            primary_ofi_bias = str(result.get("ofi_bias", "NEUTRAL"))
+            primary_ofi_strength = float(result.get("ofi_strength", 0.0))
+            primary_algo = str(result.get("algo_type_bias", "NEUTRAL"))
+            primary_hft = str(result.get("hft_6pct_bias", "NEUTRAL"))
+            
+            # Timpa SEMUA variabel lokal dengan nilai dari result
+            agg = primary_agg
+            flow = primary_agg   # biasanya flow = agg
+            ofi["bias"] = primary_ofi_bias
+            ofi["strength"] = primary_ofi_strength
+            algo_type["bias"] = primary_algo
+            hft_6pct["bias"] = primary_hft
+            
+            # Pastikan result juga konsisten
+            result["agg"] = primary_agg
+            result["flow"] = primary_agg
+            result["ofi_bias"] = primary_ofi_bias
+            result["ofi_strength"] = primary_ofi_strength
+            result["algo_type_bias"] = primary_algo
+            result["hft_6pct_bias"] = primary_hft
+            # ================================================================
             
             result = self._apply_stability_filters(result, phase_result, {})
             
