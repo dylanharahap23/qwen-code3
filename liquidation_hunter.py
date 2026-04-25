@@ -24184,63 +24184,48 @@ class BinanceAnalyzer:
         4. Gamma Delay (Gamma EXTREME tapi delta exposure < 0.95 => tunda)
         5. Entry Filter (tambahkan rekomendasi entry di output)
         """
-        # ===== AMBIL SEMUA DARI result, BUKAN DARI PARAMETER =====
-        # Ini adalah Single Source of Truth - semua variabel harus dari result dictionary
+        # ===== SINGLE SOURCE OF TRUTH: AMBIL SEMUA DARI result SEKALI DI AWAL =====
+        # Ini adalah JSON ground truth - semua variabel harus dari result dictionary
         agg = float(result.get("agg", 0.5))
-        agg_val = agg  # Alias untuk kompatibilitas dengan kode lama
         ofi_bias = str(result.get("ofi_bias", "NEUTRAL"))
         ofi_strength = float(result.get("ofi_strength", 0.0))
         algo_bias = str(result.get("algo_type_bias", "NEUTRAL"))
         hft_bias = str(result.get("hft_6pct_bias", "NEUTRAL"))
+        volume_ratio = float(result.get("volume_ratio", 1.0))
+        rsi6 = float(result.get("rsi6", 50.0))
+        rsi14 = float(result.get("rsi14", 50.0))
+        rsi6_5m = float(result.get("rsi6_5m", 50.0))
+        down_energy = float(result.get("down_energy", 0.0))
+        up_energy = float(result.get("up_energy", 0.0))
+        funding_rate = float(result.get("funding_rate", 0.0))
+        short_liq = float(result.get("short_liq", 99.0))
+        long_liq = float(result.get("long_liq", 99.0))
+        obv_trend = str(result.get("obv_trend", "NEUTRAL"))
+        obv_value = float(result.get("obv_value", 0.0))
+        ask_slope = float(result.get("ask_slope", 0.0))
+        bid_slope = float(result.get("bid_slope", 1.0))
+        latest_volume = float(result.get("latest_volume", 0.0))
+        volume_ma10 = float(result.get("volume_ma10", 1.0))
+        market_phase = str(result.get("market_phase", "UNKNOWN"))
+        exchange_risk_score = int(result.get("exchange_risk_score", 0))
+        exchange_safe = str(result.get("exchange_safe_direction", "NEUTRAL"))
+        greeks_kill = str(result.get("greeks_kill_direction", "NEUTRAL"))
+        who_dies = str(result.get("greeks_who_dies_first", ""))
+        vega_active = bool(result.get("greeks_vega_active", False))
+        gamma_executing = bool(result.get("greeks_gamma_executing", False))
+        gamma_exec_score = float(result.get("greeks_gamma_exec_score", 0))
+        delta_exposure = float(result.get("greeks_delta_exposure", 0.0))
+        stoch_k = float(result.get("stoch_k", 50.0))
+        stoch_d = float(result.get("stoch_d", 50.0))
+        stoch_j = float(result.get("stoch_j", 50.0))
+        price = float(result.get("price", 0.0))
+        change_5m = float(result.get("change_5m", 0.0))
         
-        # Variabel lainnya juga dari result (dengan suffix _val untuk kompatibilitas)
-        price = result.get("price", 0.0)
-        change_5m = result.get("change_5m", 0.0)
-        change_5m_val = change_5m  # Alias
-        volume_ratio = result.get("volume_ratio", 1.0)
-        rsi6 = result.get("rsi6", 50.0)
-        rsi6_val = rsi6  # Alias
-        rsi14 = result.get("rsi14", 50.0)
-        rsi14_val = rsi14  # Alias
-        rsi6_5m = result.get("rsi6_5m", 50.0)
-        rsi6_5m_val = rsi6_5m  # Alias
-        down_energy = result.get("down_energy", 0.0)
-        down_energy_val = down_energy  # Alias
-        up_energy = result.get("up_energy", 0.0)
-        up_energy_val = up_energy  # Alias
-        funding_rate = result.get("funding_rate", 0.0)
-        funding_rate_val = funding_rate  # Alias
-        short_liq = result.get("short_liq", 99.0)
-        long_liq = result.get("long_liq", 99.0)
-        obv_trend = result.get("obv_trend", "NEUTRAL")
-        obv_value = result.get("obv_value", 0.0)
-        ask_slope = result.get("ask_slope", 0.0)
-        bid_slope = result.get("bid_slope", 1.0)
-        latest_volume = result.get("latest_volume", 0.0)
-        volume_ma10 = result.get("volume_ma10", 1.0)
-        market_phase = result.get("market_phase", "UNKNOWN")
-        exchange_risk_score = result.get("exchange_risk_score", 0)
-        exchange_safe = result.get("exchange_safe_direction", "NEUTRAL")
-        greeks_kill = result.get("greeks_kill_direction", "NEUTRAL")
-        who_dies = result.get("greeks_who_dies_first", "")
-        vega_active = result.get("greeks_vega_active", False)
-        gamma_executing = result.get("greeks_gamma_executing", False)
-        delta_exposure = result.get("greeks_delta_exposure", 0.0)
-        stoch_j = result.get("stoch_j", 50.0)
-        stoch_k_val = result.get("stoch_k", 50.0)
-        stoch_d_val = result.get("stoch_d", 50.0)
-        stoch_j_val = stoch_j  # Alias
-        # ========== LANGKAH 7 : PREP PHASE HARD BLOCK ==========
+        # ========== LANGKAH 7 : PREP PHASE HARD BLOCK ===========
         # Prioritas -20000 (sangat tinggi), hanya dikalahkan oleh -10110 (Ultra-Low Vol Veto)
-        market_phase = result.get("market_phase", "UNKNOWN")
         if market_phase == "PREP":
-            # Cek apakah ada bukti eksekusi yang TIDAK BISA DIBOHONGI
-            gamma_executing = result.get("greeks_gamma_executing", False)
-            gamma_exec_score = result.get("greeks_gamma_exec_score", 0)
-            latest_vol = result.get("latest_volume", 0)
-            vol_ma10 = result.get("volume_ma10", 1)
-            vol_spike = latest_vol / vol_ma10 if vol_ma10 > 0 else 1.0
-            short_liq = result.get("short_liq", 99)
+            # Hitung vol_spike
+            vol_spike = latest_volume / volume_ma10 if volume_ma10 > 0 else 1.0
 
             # Syarat untuk MENEMBUS PREP block:
             # 1. Gamma executing dengan score ≥ 4 DAN
@@ -24292,31 +24277,6 @@ class BinanceAnalyzer:
                     return result
 
         # ========== END OF LANGKAH 6 ==========
-        
-        # FIX: Definisi dictionary liq untuk kompatibilitas dengan detector yang masih menggunakan liq["..."]
-        liq = {"short_dist": short_liq, "long_dist": long_liq}
-        
-        # Gunakan variabel yang sudah diambil dari result di awal fungsi
-        # Tidak perlu re-declare agg, ofi_bias, dll karena sudah ada di scope
-        volume_ratio = result.get("volume_ratio", 1.0)
-        rsi6_val = result.get("rsi6", 50.0)
-        rsi6_5m_val = result.get("rsi6_5m", 50.0)
-        rsi14_val = result.get("rsi14", 50.0)
-        change_5m_val = result.get("change_5m", 0.0)
-        down_energy_val = result.get("down_energy", 0.0)
-        up_energy_val = result.get("up_energy", 0.0)
-        funding_rate_val = result.get("funding_rate", 0.0)
-        obv_trend = result.get("obv_trend", "NEUTRAL")
-        obv_value = result.get("obv_value", 0.0)
-        stoch_k_val = result.get("stoch_k", 50.0)
-        stoch_d_val = result.get("stoch_d", 50.0)
-        stoch_j_val = result.get("stoch_j", 50.0)
-        kill_direction = result.get("greeks_kill_direction", "")
-        who_dies_first = result.get("greeks_who_dies_first", "")
-        delta_crowded = result.get("greeks_delta_crowded", "NEUTRAL")
-        gamma_executing = result.get("greeks_gamma_executing", False)
-        kill_speed = result.get("greeks_kill_speed", 0.0)
-        gamma_intensity = result.get("greeks_gamma_intensity", "LOW")
         
         new_bias = result["bias"]
         now = time.time()
@@ -24385,8 +24345,8 @@ class BinanceAnalyzer:
         # Jika RSI6 < 15 (capitulation), change_5m < -5% (dump besar),
         # OBV POSITIVE_EXTREME (akumulasi institusi), dan long_liq < 10% (target dekat),
         # maka ini adalah capitulation bottom. PAKSA LONG, batalkan semua sinyal SHORT.
-        if (rsi6_val < 15 and 
-            change_5m_val < -5.0 and 
+        if (rsi6 < 15 and 
+            change_5m < -5.0 and 
             obv_trend == "POSITIVE_EXTREME" and 
             obv_value > 100_000_000 and  # minimal 100 juta volume akumulasi
             long_liq < 10.0 and
@@ -24396,8 +24356,8 @@ class BinanceAnalyzer:
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = -10200
             result["reason"] = (
-                f"[CAPITULATION BOUNCE ABSOLUTE] RSI6={rsi6_val:.1f} (<15 capitulation), "
-                f"price dropped {change_5m_val:.1f}%, OBV POSITIVE_EXTREME ({obv_value:,.0f} accumulation), "
+                f"[CAPITULATION BOUNCE ABSOLUTE] RSI6={rsi6:.1f} (<15 capitulation), "
+                f"price dropped {change_5m:.1f}%, OBV POSITIVE_EXTREME ({obv_value:,.0f} accumulation), "
                 f"long_liq={long_liq:.2f}%, volume={volume_ratio:.2f}x (exhaustion). "
                 f"HFT akan sweep long_liq lalu pump. Batalkan SEMUA sinyal SHORT, force LONG. | "
                 + result.get("reason", "")
@@ -24409,17 +24369,15 @@ class BinanceAnalyzer:
         # Jika short_liq super dekat (<1.5%) TAPI ada ask wall dominan (>5x bid) 
         # dan long_liq juga dalam jangkauan (<5%), maka short_liq adalah UMPAN.
         # Ini adalah fake squeeze, paksa SHORT.
-        ask_slope_val = result.get("ask_slope", 0.0)
-        bid_slope_val = result.get("bid_slope", 1.0)
-        if bid_slope_val > 0:
-            ask_bid_ratio = ask_slope_val / bid_slope_val
+        if bid_slope > 0:
+            ask_bid_ratio = ask_slope / bid_slope
         else:
             ask_bid_ratio = 999.0
 
         if (short_liq < 1.5 and 
             ask_bid_ratio > 5.0 and 
             long_liq < 5.0 and
-            result.get("exchange_safe_direction") == "SHORT"):
+            exchange_safe == "SHORT"):
             
             result["bias"] = "SHORT"
             result["confidence"] = "ABSOLUTE"
@@ -24439,13 +24397,13 @@ class BinanceAnalyzer:
         genuine_squeeze = GenuineShortSqueezeAbsolute.detect(
             short_liq=short_liq,
             long_liq=long_liq,
-            down_energy=down_energy_val,
-            up_energy=up_energy_val,
-            agg=agg_val,
+            down_energy=down_energy,
+            up_energy=up_energy,
+            agg=agg,
             ofi_bias=ofi_bias,
             ofi_strength=ofi_strength,
-            funding_rate=funding_rate_val,
-            change_5m=change_5m_val,
+            funding_rate=funding_rate,
+            change_5m=change_5m,
             volume_ratio=volume_ratio
         )
         if genuine_squeeze["override"]:
@@ -24458,15 +24416,15 @@ class BinanceAnalyzer:
         
         # ========== PRIORITY -10055: ASK WALL + RSI5M OVERBOUGHT TRAP ==========
         ask_wall_trap = AskWallRSI5mOverboughtTrap.detect(
-            ask_slope=result.get("ask_slope", 0),
-            bid_slope=result.get("bid_slope", 1),
-            rsi6_5m=rsi6_5m_val,
+            ask_slope=ask_slope,
+            bid_slope=bid_slope,
+            rsi6_5m=rsi6_5m,
             short_liq=short_liq,
             long_liq=long_liq,
             volume_ratio=volume_ratio,
-            change_5m=change_5m_val,
+            change_5m=change_5m,
             ofi_bias=ofi_bias,
-            agg=agg_val
+            agg=agg
         )
         if ask_wall_trap["override"]:
             result["bias"] = ask_wall_trap["bias"]
@@ -24487,12 +24445,12 @@ class BinanceAnalyzer:
         # Dipasang sebelum Vega Fade dan sebelum guard kill-direction lama.
         rsi5m_vega_blocker = RSI5mOverboughtVegaFadeBlocker.detect(
             market_phase=market_phase,
-            vega_active=result.get("greeks_vega_active", False),
+            vega_active=vega_active,
             vega_score=result.get("greeks_vega_score", 0),
-            rsi6_5m=rsi6_5m_val,
-            change_5m=change_5m_val,
-            kill_direction=kill_direction,
-            down_energy=down_energy_val,
+            rsi6_5m=rsi6_5m,
+            change_5m=change_5m,
+            kill_direction=greeks_kill,
+            down_energy=down_energy,
             volume_ratio=volume_ratio,
             gamma_executing=gamma_executing
         )
@@ -24505,10 +24463,10 @@ class BinanceAnalyzer:
             return result
 
         up_energy_absorbed = UpEnergyAbsorbedBearish.detect(
-            up_energy=up_energy_val,
-            change_5m=change_5m_val,
+            up_energy=up_energy,
+            change_5m=change_5m,
             volume_ratio=volume_ratio,
-            rsi6_5m=rsi6_5m_val
+            rsi6_5m=rsi6_5m
         )
         if up_energy_absorbed["override"]:
             result["bias"] = up_energy_absorbed["bias"]
@@ -24519,9 +24477,9 @@ class BinanceAnalyzer:
             return result
 
         rsi_tf_vega_trap = RsiTfDivergenceVegaTrap.detect(
-            rsi6=rsi6_val,
-            rsi6_5m=rsi6_5m_val,
-            vega_active=result.get("greeks_vega_active", False),
+            rsi6=rsi6,
+            rsi6_5m=rsi6_5m,
+            vega_active=vega_active,
             market_phase=market_phase,
             volume_ratio=volume_ratio
         )
@@ -24534,10 +24492,10 @@ class BinanceAnalyzer:
             return result
 
         kill_direction_ob_guard = KillDirectionOverboughtGuard.detect(
-            kill_direction=kill_direction,
-            rsi6_5m=rsi6_5m_val,
+            kill_direction=greeks_kill,
+            rsi6_5m=rsi6_5m,
             gamma_executing=gamma_executing,
-            kill_speed=kill_speed
+            kill_speed=result.get("greeks_kill_speed", 0.0)
         )
         if kill_direction_ob_guard["override"]:
             result["bias"] = kill_direction_ob_guard["bias"]
@@ -24552,22 +24510,19 @@ class BinanceAnalyzer:
         # sangat dominan ke satu arah (agg ekstrem + OFI + no opposite energy),
         # maka abaikan konsensus Algo/HFT, ikuti order flow.
         liq_diff = abs(short_liq - long_liq)
-        ofi_bias = result.get("ofi_bias", "NEUTRAL")
-        ofi_strength = result.get("ofi_strength", 0.0)
-        agg_val = result.get("agg", 0.5)
         
         if liq_diff < 1.0:  # likuiditas hampir simetris
             # Kasus 1: Order flow sangat bullish -> paksa LONG (abaikan SHORT)
-            if (agg_val > 0.85 and 
+            if (agg > 0.85 and 
                 ofi_bias == "LONG" and ofi_strength > 0.7 and 
-                down_energy_val < 0.01 and up_energy_val > 0.1):
+                down_energy < 0.01 and up_energy > 0.1):
                 
                 result["bias"] = "LONG"
                 result["confidence"] = "ABSOLUTE"
                 result["priority_level"] = -10180
                 result["reason"] = (
                     f"[SYMMETRIC LIQ + STRONG BUY] short_liq={short_liq:.2f}% vs long_liq={long_liq:.2f}% "
-                    f"(diff {liq_diff:.2f}%), agg={agg_val:.2f} (100% buy), OFI LONG {ofi_strength:.2f}, "
+                    f"(diff {liq_diff:.2f}%), agg={agg:.2f} (100% buy), OFI LONG {ofi_strength:.2f}, "
                     f"down_energy=0 → HFT akumulasi, ignore Algo/HFT SHORT, force LONG. | "
                     + result.get("reason", "")
                 )
@@ -24575,16 +24530,16 @@ class BinanceAnalyzer:
                 return result
                 
             # Kasus 2: Order flow sangat bearish -> paksa SHORT (abaikan LONG)
-            if (agg_val < 0.15 and 
+            if (agg < 0.15 and 
                 ofi_bias == "SHORT" and ofi_strength > 0.7 and 
-                up_energy_val < 0.01 and down_energy_val > 0.1):
+                up_energy < 0.01 and down_energy > 0.1):
                 
                 result["bias"] = "SHORT"
                 result["confidence"] = "ABSOLUTE"
                 result["priority_level"] = -10180
                 result["reason"] = (
                     f"[SYMMETRIC LIQ + STRONG SELL] short_liq={short_liq:.2f}% vs long_liq={long_liq:.2f}% "
-                    f"(diff {liq_diff:.2f}%), agg={agg_val:.2f} (100% sell), OFI SHORT {ofi_strength:.2f}, "
+                    f"(diff {liq_diff:.2f}%), agg={agg:.2f} (100% sell), OFI SHORT {ofi_strength:.2f}, "
                     f"up_energy=0 → HFT distribusi, ignore Algo/HFT LONG, force SHORT. | "
                     + result.get("reason", "")
                 )
@@ -24628,21 +24583,19 @@ class BinanceAnalyzer:
         # Jika short_liq super dekat TAPI RSI5m sudah overbought ekstrem (>85) 
         # DAN exchange_safe = SHORT, maka short_liq adalah UMPAN.
         # Batalkan semua sinyal LONG, force SHORT.
-        exchange_safe = result.get("exchange_safe_direction", "NEUTRAL")
-        
         if (short_liq < 1.5 and 
-            rsi6_5m_val > 85 and 
+            rsi6_5m > 85 and 
             exchange_safe == "SHORT" and
-            funding_rate_val > 0.0001):  # crowded long, bukan short squeeze
+            funding_rate > 0.0001):  # crowded long, bukan short squeeze
             
             result["bias"] = "SHORT"
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = -10130
             result["reason"] = (
                 f"[EXTREME OB SHORT LIQ TRAP] short_liq={short_liq:.2f}% (umpan), "
-                f"RSI5m={rsi6_5m_val:.1f} (>85 overbought), "
-                f"exchange_safe={exchange_safe}, stoch_j={stoch_j_val:.1f}, "
-                f"funding={funding_rate_val:.6f} → ini jebakan LONG sebelum dump. "
+                f"RSI5m={rsi6_5m:.1f} (>85 overbought), "
+                f"exchange_safe={exchange_safe}, stoch_j={stoch_j:.1f}, "
+                f"funding={funding_rate:.6f} → ini jebakan LONG sebelum dump. "
                 f"Batalkan semua sinyal LONG, force SHORT. | " + result.get("reason", "")
             )
             result["entry_allowed"] = True
@@ -24651,37 +24604,36 @@ class BinanceAnalyzer:
         # ========== PRIORITY -10120: MOMENTUM CONTINUATION OVERRIDE (BATALKAN VEGA FADE) ==========
         # Jika harga sudah bergerak signifikan (>1.5%) dan OFI/Agg mengkonfirmasi arah,
         # serta ada target likuiditas yang mendukung, maka ikuti momentum (jangan fade).
-        momentum_trigger = abs(change_5m_val) > 1.5
+        momentum_trigger = abs(change_5m) > 1.5
         if momentum_trigger:
-            ofi_bias = result.get("ofi_bias", "NEUTRAL")
-            ofi_strength = result.get("ofi_strength", 0.0)
-            agg_val = result.get("agg", 0.5)
+            ofi_bias_local = result.get("ofi_bias", "NEUTRAL")
+            ofi_strength_local = result.get("ofi_strength", 0.0)
             
             # Tentukan arah momentum
-            if change_5m_val < -1.5:
+            if change_5m < -1.5:
                 # Harga turun signifikan -> cek apakah OFI SHORT kuat dan long_liq dekat
-                if (ofi_bias == "SHORT" and ofi_strength > 0.7 and 
-                    agg_val < 0.4 and long_liq < 3.0):
+                if (ofi_bias_local == "SHORT" and ofi_strength_local > 0.7 and 
+                    agg < 0.4 and long_liq < 3.0):
                     result["bias"] = "SHORT"
                     result["confidence"] = "ABSOLUTE"
                     result["priority_level"] = -10120
                     result["reason"] = (
-                        f"[MOMENTUM CONTINUATION] price down {change_5m_val:.1f}%, "
-                        f"OFI SHORT {ofi_strength:.2f}, Agg={agg_val:.2f}, long_liq={long_liq:.2f}% → "
+                        f"[MOMENTUM CONTINUATION] price down {change_5m:.1f}%, "
+                        f"OFI SHORT {ofi_strength_local:.2f}, Agg={agg:.2f}, long_liq={long_liq:.2f}% → "
                         f"real dump, batalkan Vega Fade, force SHORT. | " + result.get("reason", "")
                     )
                     result["entry_allowed"] = True
                     return result
-            elif change_5m_val > 1.5:
+            elif change_5m > 1.5:
                 # Harga naik signifikan -> cek apakah OFI LONG kuat dan short_liq dekat
-                if (ofi_bias == "LONG" and ofi_strength > 0.7 and 
-                    agg_val > 0.6 and short_liq < 3.0):
+                if (ofi_bias_local == "LONG" and ofi_strength_local > 0.7 and 
+                    agg > 0.6 and short_liq < 3.0):
                     result["bias"] = "LONG"
                     result["confidence"] = "ABSOLUTE"
                     result["priority_level"] = -10120
                     result["reason"] = (
-                        f"[MOMENTUM CONTINUATION] price up {change_5m_val:.1f}%, "
-                        f"OFI LONG {ofi_strength:.2f}, Agg={agg_val:.2f}, short_liq={short_liq:.2f}% → "
+                        f"[MOMENTUM CONTINUATION] price up {change_5m:.1f}%, "
+                        f"OFI LONG {ofi_strength_local:.2f}, Agg={agg:.2f}, short_liq={short_liq:.2f}% → "
                         f"real pump, batalkan Vega Fade, force LONG. | " + result.get("reason", "")
                     )
                     result["entry_allowed"] = True
@@ -24694,10 +24646,10 @@ class BinanceAnalyzer:
         delta_exposure = result.get("greeks_delta_exposure", 0.0)
         
         if (short_liq < 2.5 and 
-            change_5m_val > 3.0 and 
-            rsi6_5m_val < 85 and
-            up_energy_val > 1.0 and          # threshold minimal untuk buy pressure nyata
-            agg_val > 0.55 and               # sedikit dinaikkan dari 0.5
+            change_5m > 3.0 and 
+            rsi6_5m < 85 and
+            up_energy > 1.0 and          # threshold minimal untuk buy pressure nyata
+            agg > 0.55 and               # sedikit dinaikkan dari 0.5
             delta_exposure > 0.8):           # crowded LONG sebagai bahan bakar
             
             result["bias"] = "LONG"
@@ -24705,8 +24657,8 @@ class BinanceAnalyzer:
             result["priority_level"] = -10165
             result["reason"] = (
                 f"[ADVERSARIAL SQUEEZE CONT] short_liq={short_liq:.2f}% masih dekat, "
-                f"price up {change_5m_val:.1f}%, RSI5m={rsi6_5m_val:.1f} (<85), "
-                f"up_energy={up_energy_val:.2f}, agg={agg_val:.2f}, delta_exposure={delta_exposure:.3f} → "
+                f"price up {change_5m:.1f}%, RSI5m={rsi6_5m:.1f} (<85), "
+                f"up_energy={up_energy:.2f}, agg={agg:.2f}, delta_exposure={delta_exposure:.3f} → "
                 f"squeeze masih aktif. Abaikan exchange_safe SHORT, force LONG. | "
                 + result.get("reason", "")
             )
@@ -24717,25 +24669,22 @@ class BinanceAnalyzer:
         # Jika exchange_safe = SHORT, funding positif (>0.0005), short_liq dekat TAPI
         # delta_exposure tinggi (crowded LONG) dan who_dies_first = LONG_TRADERS,
         # maka short_liq adalah umpan. Ini adalah distribusi puncak, bukan squeeze.
-        exchange_safe = result.get("exchange_safe_direction", "NEUTRAL")
-        funding_rate_val = result.get("funding_rate", 0.0)
-        delta_exposure = result.get("greeks_delta_exposure", 0.0)
         who_dies = result.get("greeks_who_dies_first", "")
         
         if (exchange_safe == "SHORT" and 
-            funding_rate_val > 0.0005 and 
+            funding_rate > 0.0005 and 
             delta_exposure > 0.8 and
             who_dies == "LONG_TRADERS" and
             short_liq < 2.0 and
-            change_5m_val > 3.0):  # harga sudah naik signifikan
+            change_5m > 3.0):  # harga sudah naik signifikan
             
             result["bias"] = "SHORT"
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = -10160
             result["reason"] = (
-                f"[EXCHANGE WARNING BLOW-OFF] exchange_safe=SHORT, funding={funding_rate_val:.6f} (crowded LONG), "
+                f"[EXCHANGE WARNING BLOW-OFF] exchange_safe=SHORT, funding={funding_rate:.6f} (crowded LONG), "
                 f"delta_exposure={delta_exposure:.3f}, who_dies={who_dies}, short_liq={short_liq:.2f}% (umpan). "
-                f"Harga sudah naik {change_5m_val:.1f}% → ini distribusi puncak, bukan squeeze. Force SHORT. | "
+                f"Harga sudah naik {change_5m:.1f}% → ini distribusi puncak, bukan squeeze. Force SHORT. | "
                 + result.get("reason", "")
             )
             result["entry_allowed"] = True
@@ -24746,21 +24695,20 @@ class BinanceAnalyzer:
         # dan exchange_safe/funding mengonfirmasi crowded long → ini adalah distribusi puncak.
         # Batalkan semua sinyal LONG, force SHORT.
         if (short_liq < 1.5 and 
-            abs(change_5m_val) > 8.0 and 
-            rsi6_5m_val > 90 and
+            abs(change_5m) > 8.0 and 
+            rsi6_5m > 90 and
             delta_exposure > 0.85):
             
             # Konfirmasi tambahan: exchange warning atau funding positif
-            exchange_safe = result.get("exchange_safe_direction", "NEUTRAL")
-            if exchange_safe == "SHORT" or funding_rate_val > 0.0005:
+            if exchange_safe == "SHORT" or funding_rate > 0.0005:
                 result["bias"] = "SHORT"
                 result["confidence"] = "ABSOLUTE"
                 result["priority_level"] = -10170
                 result["reason"] = (
                     f"[BLOW-OFF TOP BAIT] short_liq={short_liq:.2f}% (umpan), "
-                    f"pump {change_5m_val:.1f}%, RSI5m={rsi6_5m_val:.1f} (>90), "
+                    f"pump {change_5m:.1f}%, RSI5m={rsi6_5m:.1f} (>90), "
                     f"delta_exposure={delta_exposure:.3f}, exchange_safe={exchange_safe}, "
-                    f"funding={funding_rate_val:.6f} → tidak ada ruang naik, distribusi puncak. "
+                    f"funding={funding_rate:.6f} → tidak ada ruang naik, distribusi puncak. "
                     f"Batalkan semua sinyal LONG, force SHORT. | " + result.get("reason", "")
                 )
                 result["entry_allowed"] = True
@@ -24770,11 +24718,10 @@ class BinanceAnalyzer:
         # Jika short_liq sangat dekat (<1.5%), pasar sangat crowded LONG (delta_exposure > 0.85),
         # dan harga sudah mulai naik, maka ini adalah SHORT SQUEEZE AKTIF.
         # JANGAN FADE, ikuti momentum ke LONG.
-        delta_exposure = result.get("greeks_delta_exposure", 0.0)
         if (short_liq < 1.5 and 
             delta_exposure > 0.85 and 
-            change_5m_val > 0.5 and
-            funding_rate_val > 0.0001):  # crowded long, bukan genuine reversal
+            change_5m > 0.5 and
+            funding_rate > 0.0001):  # crowded long, bukan genuine reversal
             
             result["bias"] = "LONG"
             result["confidence"] = "ABSOLUTE"
@@ -24782,7 +24729,7 @@ class BinanceAnalyzer:
             result["reason"] = (
                 f"[CROWDED SHORT SQUEEZE] short_liq={short_liq:.2f}% ultra close, "
                 f"delta_exposure={delta_exposure:.3f} (extremely crowded LONG), "
-                f"price already up {change_5m_val:.1f}% → short squeeze ACTIVE. "
+                f"price already up {change_5m:.1f}% → short squeeze ACTIVE. "
                 f"Override all BAIT/Vega signals, force LONG. | " + result.get("reason", "")
             )
             result["entry_allowed"] = True
@@ -24792,15 +24739,15 @@ class BinanceAnalyzer:
         if not result.get("_block_vega_fade"):
             vega_fade = VegaFadeOverride.detect(
                 market_phase=market_phase,
-                vega_active=result.get("greeks_vega_active", False),
+                vega_active=vega_active,
                 vega_score=result.get("greeks_vega_score", 0),
                 volume_ratio=volume_ratio,
-                change_5m=change_5m_val,
-                rsi6_5m=result.get("rsi6_5m", 50.0),
-                exchange_safe=result.get("exchange_safe_direction", "NEUTRAL"),
-                ofi_bias=result.get("ofi_bias", "NEUTRAL"),
-                ofi_strength=result.get("ofi_strength", 0.0),
-                agg=result.get("agg", 0.5)
+                change_5m=change_5m,
+                rsi6_5m=rsi6_5m,
+                exchange_safe=exchange_safe,
+                ofi_bias=ofi_bias,
+                ofi_strength=ofi_strength,
+                agg=agg
             )
             if vega_fade["override"]:
                 result["bias"] = vega_fade["bias"]
@@ -24812,13 +24759,13 @@ class BinanceAnalyzer:
         
         # ===== PRIORITY -10031: OFI DOMINANT VEGA FADE VETO (FIX MOVRUSDT & ZKPUSDT) =====
         ofi_veto = OFIDominantVegaFadeVeto.detect(
-            ofi_bias=result.get("ofi_bias", "NEUTRAL"),
-            ofi_strength=result.get("ofi_strength", 0.0),
-            greeks_vega_active=result.get("greeks_vega_active", False),
+            ofi_bias=ofi_bias,
+            ofi_strength=ofi_strength,
+            greeks_vega_active=vega_active,
             greeks_bias=result.get("greeks_bias", "NEUTRAL"),
             volume_ratio=volume_ratio,
-            gamma_executing=result.get("greeks_gamma_executing", False),
-            change_5m=change_5m_val
+            gamma_executing=gamma_executing,
+            change_5m=change_5m
         )
         if ofi_veto["override"]:
             result["bias"] = ofi_veto["bias"]
@@ -24918,8 +24865,8 @@ class BinanceAnalyzer:
         # 1. TAUSDT Pattern: Long liq closer but zero sellers → force LONG
         long_liq_zero_seller = LongLiqCloserButZeroSellers.detect(
             long_liq=long_liq, short_liq=short_liq,
-            down_energy=down_energy_val, up_energy=up_energy_val,
-            change_5m=change_5m_val, rsi6=rsi6_val, volume_ratio=volume_ratio
+            down_energy=down_energy, up_energy=up_energy,
+            change_5m=change_5m, rsi6=rsi6, volume_ratio=volume_ratio
         )
         if long_liq_zero_seller["override"]:
             result["bias"] = long_liq_zero_seller["bias"]
@@ -24931,12 +24878,12 @@ class BinanceAnalyzer:
 
         # ===== PRIORITY -28020: CAPITULATION EXHAUSTION BOUNCE (ORDIUSDT FIX) =====
         cap_exhaustion = CapitulationExhaustionBounce.detect(
-            rsi6=rsi6_val,
-            up_energy=up_energy_val,
-            down_energy=down_energy_val,
+            rsi6=rsi6,
+            up_energy=up_energy,
+            down_energy=down_energy,
             volume_ratio=volume_ratio,
-            change_5m=change_5m_val,
-            rsi6_5m=rsi6_5m_val,
+            change_5m=change_5m,
+            rsi6_5m=rsi6_5m,
             long_liq=long_liq
         )
         if cap_exhaustion["override"]:
@@ -24949,9 +24896,9 @@ class BinanceAnalyzer:
 
         # 2. SIRENUSDT Pattern: Extreme overbought post-squeeze → force SHORT
         extreme_ob_reversal = ExtremeOverboughtPostSqueezeReversal.detect(
-            rsi6=rsi6_val, rsi6_5m=rsi6_5m_val,
-            short_liq=short_liq, change_5m=change_5m_val,
-            volume_ratio=volume_ratio, agg=agg_val
+            rsi6=rsi6, rsi6_5m=rsi6_5m,
+            short_liq=short_liq, change_5m=change_5m,
+            volume_ratio=volume_ratio, agg=agg
         )
         if extreme_ob_reversal["override"]:
             result["bias"] = extreme_ob_reversal["bias"]
@@ -24964,13 +24911,13 @@ class BinanceAnalyzer:
         # 3. AIOTUSDT Pattern: Ultra low volume + OBV extreme → force opposite
         ultra_low_obv_rev = UltraLowVolumeOBVExtremeReversal.detect(
             volume_ratio=volume_ratio, obv_trend=obv_trend,
-            change_5m=change_5m_val, agg=agg_val,
+            change_5m=change_5m, agg=agg,
             short_liq=short_liq, long_liq=long_liq,
-            funding_rate=funding_rate_val,
-            greeks_kill_direction=kill_direction,
+            funding_rate=funding_rate,
+            greeks_kill_direction=greeks_kill,
             ofi_bias=ofi_bias,
-            ofi_strength=result.get("ofi_strength", 0.0),
-            rsi6_5m=result.get("rsi6_5m", 50.0)
+            ofi_strength=ofi_strength,
+            rsi6_5m=rsi6_5m
         )
         if ultra_low_obv_rev["override"]:
             result["bias"] = ultra_low_obv_rev["bias"]
