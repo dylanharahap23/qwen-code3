@@ -24187,21 +24187,29 @@ class BinanceAnalyzer:
         # ===== AMBIL SEMUA DARI result, BUKAN DARI PARAMETER =====
         # Ini adalah Single Source of Truth - semua variabel harus dari result dictionary
         agg = float(result.get("agg", 0.5))
+        agg_val = agg  # Alias untuk kompatibilitas dengan kode lama
         ofi_bias = str(result.get("ofi_bias", "NEUTRAL"))
         ofi_strength = float(result.get("ofi_strength", 0.0))
         algo_bias = str(result.get("algo_type_bias", "NEUTRAL"))
         hft_bias = str(result.get("hft_6pct_bias", "NEUTRAL"))
         
-        # Variabel lainnya juga dari result
+        # Variabel lainnya juga dari result (dengan suffix _val untuk kompatibilitas)
         price = result.get("price", 0.0)
         change_5m = result.get("change_5m", 0.0)
+        change_5m_val = change_5m  # Alias
         volume_ratio = result.get("volume_ratio", 1.0)
         rsi6 = result.get("rsi6", 50.0)
+        rsi6_val = rsi6  # Alias
         rsi14 = result.get("rsi14", 50.0)
+        rsi14_val = rsi14  # Alias
         rsi6_5m = result.get("rsi6_5m", 50.0)
+        rsi6_5m_val = rsi6_5m  # Alias
         down_energy = result.get("down_energy", 0.0)
+        down_energy_val = down_energy  # Alias
         up_energy = result.get("up_energy", 0.0)
+        up_energy_val = up_energy  # Alias
         funding_rate = result.get("funding_rate", 0.0)
+        funding_rate_val = funding_rate  # Alias
         short_liq = result.get("short_liq", 99.0)
         long_liq = result.get("long_liq", 99.0)
         obv_trend = result.get("obv_trend", "NEUTRAL")
@@ -24219,6 +24227,9 @@ class BinanceAnalyzer:
         gamma_executing = result.get("greeks_gamma_executing", False)
         delta_exposure = result.get("greeks_delta_exposure", 0.0)
         stoch_j = result.get("stoch_j", 50.0)
+        stoch_k_val = result.get("stoch_k", 50.0)
+        stoch_d_val = result.get("stoch_d", 50.0)
+        stoch_j_val = stoch_j  # Alias
         # ========== LANGKAH 7 : PREP PHASE HARD BLOCK ==========
         # Prioritas -20000 (sangat tinggi), hanya dikalahkan oleh -10110 (Ultra-Low Vol Veto)
         market_phase = result.get("market_phase", "UNKNOWN")
