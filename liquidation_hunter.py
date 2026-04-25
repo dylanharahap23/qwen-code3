@@ -24236,6 +24236,8 @@ class BinanceAnalyzer:
         # ========== END OF JSON OVERRIDE BLOCK ==========
         
         # ========== LANGKAH 6: ULTRA‑LOW VOLUME SPOOFING VETO ==========
+        volume_ratio = result.get("volume_ratio", 1.0)   # Ambil volume_ratio dari result
+        
         # Hanya relevan jika volume ultra‑rendah
         if volume_ratio < 0.25:
             agg_json = result.get("agg", 0.5)
