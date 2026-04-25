@@ -24258,6 +24258,9 @@ class BinanceAnalyzer:
         price_val = price
         change_5m_val = change_5m
         
+        # ===== ALIAS TAMBAHAN UNTUK VARIABEL YANG DIPAKAI DI DETECTOR =====
+        agg_json_val = agg  # agg_json_val adalah alias untuk agg (sumber tunggal dari result)
+        
         # ========== LANGKAH 7 : PREP PHASE HARD BLOCK ===========
         # Prioritas -20000 (sangat tinggi), hanya dikalahkan oleh -10110 (Ultra-Low Vol Veto)
         if market_phase == "PREP":
