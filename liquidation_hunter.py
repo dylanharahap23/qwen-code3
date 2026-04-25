@@ -10025,6 +10025,21 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
     
     Integrated with 7 Lecturer Rules for adversarial pattern protection.
     """
+    # ================================================================
+    # 🛡️ SOLUSI 2: PREP PHASE HARD BLOCK DI AGGREGATOR
+    # Cek market_phase di awal, sebelum voting apapun
+    # Jika PREP, langsung block tanpa proses voting
+    # ================================================================
+    if result.get("market_phase") == "PREP":
+        result["bias"] = "NEUTRAL"
+        result["confidence"] = "BLOCK"
+        result["entry_allowed"] = False
+        result["priority_level"] = -20000
+        result["reason"] = f"[AGGREGATOR] PREP phase – no trade | " + result.get("reason", "")
+        result["aggregator_reasons"] = ["PREP PHASE BLOCK: No trade allowed in accumulation phase"]
+        result["aggregator_votes"] = {"PREP_BLOCK": "NEUTRAL"}
+        return result
+    
     if expert_opinions is None:
         expert_opinions = []
     reasons = []
@@ -10415,12 +10430,18 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
     ofi_bias = context.get("ofi_bias", "NEUTRAL")
     ofi_strength = context.get("ofi_strength", 0.0)
     
+    # 🛡️ SOLUSI 3: Turunkan bobot HFT TRACE pada fase PREP
+    # Jika market_phase == "PREP", bagi bobot HFT dengan 4 (dari 8.0 jadi 2.0)
+    hft_weight = 8.0
+    if context.get("market_phase") == "PREP":
+        hft_weight = 2.0  # Turunkan drastis agar tidak override PREP block
+    
     if agg_val > 0.85 and ofi_bias == "LONG" and ofi_strength > 0.7:
-        votes["LONG"] += 8.0
-        reasons.append("HFT TRACE: Aggressive buying consensus")
+        votes["LONG"] += hft_weight
+        reasons.append(f"HFT TRACE: Aggressive buying consensus (weight={hft_weight})")
     if agg_val < 0.15 and ofi_bias == "SHORT" and ofi_strength > 0.7:
-        votes["SHORT"] += 8.0
-        reasons.append("HFT TRACE: Aggressive selling consensus")
+        votes["SHORT"] += hft_weight
+        reasons.append(f"HFT TRACE: Aggressive selling consensus (weight={hft_weight})")
     
     # Debug print untuk memastikan suara masuk
     print(f"[DEBUG VOTES] After Tier 2 (HFT): LONG={votes['LONG']}, SHORT={votes['SHORT']}, agg={agg_val:.2f}, ofi={ofi_bias}, strength={ofi_strength:.2f}")
