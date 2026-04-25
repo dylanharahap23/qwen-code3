@@ -24235,6 +24235,43 @@ class BinanceAnalyzer:
         
         # ========== END OF JSON OVERRIDE BLOCK ==========
         
+        # ========== LANGKAH 6: ULTRA‑LOW VOLUME SPOOFING VETO ==========
+        # Hanya relevan jika volume ultra‑rendah
+        if volume_ratio < 0.25:
+            agg_json = result.get("agg", 0.5)
+            ofi_bias_json = result.get("ofi_bias", "NEUTRAL")
+            ofi_strength_json = result.get("ofi_strength", 0.0)
+            algo_bias_json = result.get("algo_type_bias", "NEUTRAL")
+            greeks_kill = result.get("greeks_kill_direction", "NEUTRAL")
+
+            # Apakah sinyal mikro mencurigakan? (OFI atau Agg ekstrem)
+            micro_suspicious = (
+                (ofi_strength_json > 0.95 and ofi_bias_json != "NEUTRAL") or
+                (agg_json > 0.95 or agg_json < 0.05)
+            )
+
+            if micro_suspicious:
+                # Cari arah fundamental (prioritas Algo > Greeks)
+                fundamental_bias = "NEUTRAL"
+                if algo_bias_json != "NEUTRAL":
+                    fundamental_bias = algo_bias_json
+                elif greeks_kill != "NEUTRAL":
+                    fundamental_bias = greeks_kill
+
+                # Jika fundamental bertentangan dengan sinyal mikro → veto mikro
+                if fundamental_bias != "NEUTRAL" and fundamental_bias != ofi_bias_json:
+                    result["bias"] = fundamental_bias
+                    result["confidence"] = "ABSOLUTE"
+                    result["priority_level"] = -10100   # tinggi, mengalahkan banyak detector
+                    result["reason"] = (
+                        f"[ULTRA LOW VOL SPOOF VETO] Vol {volume_ratio:.2f}x, "
+                        f"OFI/Agg ekstrem ({ofi_bias_json} {ofi_strength_json:.2f}, agg {agg_json:.2f}) "
+                        f"tapi Algo/Greeks={fundamental_bias}. Sinyal mikro adalah spoof. "
+                        f"Paksa {fundamental_bias}. | " + result.get("reason", "")
+                    )
+                    return result  # langsung return, tidak perlu proses lebih lanjut
+        # ========== END OF SPOOF VETO ==========
+        
         # ========== AMBIL SEMUA VARIABEL YANG DIPERLUKAN DI AWAL METHOD ==========
         short_liq = result.get("short_liq", 99.0)
         long_liq = result.get("long_liq", 99.0)
