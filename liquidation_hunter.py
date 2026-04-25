@@ -24184,6 +24184,39 @@ class BinanceAnalyzer:
         4. Gamma Delay (Gamma EXTREME tapi delta exposure < 0.95 => tunda)
         5. Entry Filter (tambahkan rekomendasi entry di output)
         """
+        # ========== AMBIL SEMUA VARIABEL PENTING DARI result SEKALI DI AWAL ==========
+        price = result.get("price", 0.0)
+        change_5m = result.get("change_5m", 0.0)
+        volume_ratio = result.get("volume_ratio", 1.0)   # ← INI YANG MEMPERBAIKI ERROR
+        rsi6 = result.get("rsi6", 50.0)
+        rsi14 = result.get("rsi14", 50.0)
+        rsi6_5m = result.get("rsi6_5m", 50.0)
+        agg = result.get("agg", 0.5)
+        ofi_bias = result.get("ofi_bias", "NEUTRAL")
+        ofi_strength = result.get("ofi_strength", 0.0)
+        down_energy = result.get("down_energy", 0.0)
+        up_energy = result.get("up_energy", 0.0)
+        funding_rate = result.get("funding_rate", 0.0)
+        short_liq = result.get("short_liq", 99.0)
+        long_liq = result.get("long_liq", 99.0)
+        obv_trend = result.get("obv_trend", "NEUTRAL")
+        obv_value = result.get("obv_value", 0.0)
+        ask_slope = result.get("ask_slope", 0.0)
+        bid_slope = result.get("bid_slope", 1.0)
+        latest_volume = result.get("latest_volume", 0.0)
+        volume_ma10 = result.get("volume_ma10", 1.0)
+        market_phase = result.get("market_phase", "UNKNOWN")
+        exchange_risk_score = result.get("exchange_risk_score", 0)
+        exchange_safe = result.get("exchange_safe_direction", "NEUTRAL")
+        greeks_kill = result.get("greeks_kill_direction", "NEUTRAL")
+        who_dies = result.get("greeks_who_dies_first", "")
+        vega_active = result.get("greeks_vega_active", False)
+        gamma_executing = result.get("greeks_gamma_executing", False)
+        delta_exposure = result.get("greeks_delta_exposure", 0.0)
+        algo_bias = result.get("algo_type_bias", "NEUTRAL")
+        hft_bias = result.get("hft_6pct_bias", "NEUTRAL")
+        stoch_j = result.get("stoch_j", 50.0)
+
         # ========== LANGKAH 5.1: FORCE OVERWRITE DENGAN JSON GROUND TRUTH ==========
         # Hentikan data race antara display snapshot dan JSON result
         
@@ -24208,7 +24241,7 @@ class BinanceAnalyzer:
             data_race_detected = True
             corrections.append(f"AGG {display_agg:.2f}→{json_agg:.2f}")
             # Update semua variabel agg di scope ini
-            agg_val = json_agg
+            agg = json_agg
         
         if display_ofi_bias != json_ofi_bias and json_ofi_bias != "NEUTRAL" and display_ofi_bias != json_ofi_bias:
             data_race_detected = True
@@ -24238,22 +24271,13 @@ class BinanceAnalyzer:
         # ========== LANGKAH 6 (FINAL) : ULTRA-LOW VOLUME SPOOFING VETO ==========
         # Prioritas -10110 (lebih tinggi dari Algo+HFT Consensus -10100)
         if volume_ratio < 0.25:
-            agg_json = result.get("agg", 0.5)
-            ofi_bias_json = result.get("ofi_bias", "NEUTRAL")
-            ofi_strength_json = result.get("ofi_strength", 0.0)
-            algo_bias_json = result.get("algo_type_bias", "NEUTRAL")
-            greeks_kill = result.get("greeks_kill_direction", "NEUTRAL")
-            hft_bias_json = result.get("hft_6pct_bias", "NEUTRAL")
-
-            micro_extreme = (ofi_strength_json > 0.95 and ofi_bias_json != "NEUTRAL") or \
-                            (agg_json > 0.95 or agg_json < 0.05)
+            micro_extreme = (ofi_strength > 0.95 and ofi_bias != "NEUTRAL") or \
+                            (agg > 0.95 or agg < 0.05)
             if micro_extreme:
-                # Tentukan arah fundamental: prioritas Algo > Greeks > HFT
-                fundamental = algo_bias_json if algo_bias_json != "NEUTRAL" else \
+                fundamental = algo_bias if algo_bias != "NEUTRAL" else \
                               greeks_kill if greeks_kill != "NEUTRAL" else \
-                              hft_bias_json
-
-                if fundamental != "NEUTRAL" and fundamental != ofi_bias_json:
+                              hft_bias
+                if fundamental != "NEUTRAL" and fundamental != ofi_bias:
                     # Veto! Mikro bertentangan dengan fundamental
                     result["bias"] = fundamental
                     result["confidence"] = "ABSOLUTE"
@@ -24261,17 +24285,13 @@ class BinanceAnalyzer:
                     result["entry_allowed"] = True
                     result["reason"] = (
                         f"[ULTRA LOW VOL SPOOF VETO] Vol {volume_ratio:.2f}x, "
-                        f"OFI/Agg ekstrem ({ofi_bias_json} {ofi_strength_json:.2f}, agg {agg_json:.2f}) "
+                        f"OFI/Agg ekstrem ({ofi_bias} {ofi_strength:.2f}, agg {agg:.2f}) "
                         f"tapi fundamental={fundamental}. Sinyal mikro adalah spoof. "
                         f"Paksa {fundamental}. | " + result.get("reason", "")
                     )
                     return result
 
         # ========== END OF LANGKAH 6 ==========
-        
-        # ========== AMBIL SEMUA VARIABEL YANG DIPERLUKAN DI AWAL METHOD ==========
-        short_liq = result.get("short_liq", 99.0)
-        long_liq = result.get("long_liq", 99.0)
         
         # FIX: Definisi dictionary liq untuk kompatibilitas dengan detector yang masih menggunakan liq["..."]
         liq = {"short_dist": short_liq, "long_dist": long_liq}
