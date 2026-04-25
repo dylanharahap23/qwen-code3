@@ -24235,44 +24235,39 @@ class BinanceAnalyzer:
         
         # ========== END OF JSON OVERRIDE BLOCK ==========
         
-        # ========== LANGKAH 6: ULTRA‑LOW VOLUME SPOOFING VETO ==========
-        volume_ratio = result.get("volume_ratio", 1.0)   # Ambil volume_ratio dari result
-        
-        # Hanya relevan jika volume ultra‑rendah
+        # ========== LANGKAH 6 (FINAL) : ULTRA-LOW VOLUME SPOOFING VETO ==========
+        # Prioritas -10110 (lebih tinggi dari Algo+HFT Consensus -10100)
         if volume_ratio < 0.25:
             agg_json = result.get("agg", 0.5)
             ofi_bias_json = result.get("ofi_bias", "NEUTRAL")
             ofi_strength_json = result.get("ofi_strength", 0.0)
             algo_bias_json = result.get("algo_type_bias", "NEUTRAL")
             greeks_kill = result.get("greeks_kill_direction", "NEUTRAL")
+            hft_bias_json = result.get("hft_6pct_bias", "NEUTRAL")
 
-            # Apakah sinyal mikro mencurigakan? (OFI atau Agg ekstrem)
-            micro_suspicious = (
-                (ofi_strength_json > 0.95 and ofi_bias_json != "NEUTRAL") or
-                (agg_json > 0.95 or agg_json < 0.05)
-            )
+            micro_extreme = (ofi_strength_json > 0.95 and ofi_bias_json != "NEUTRAL") or \
+                            (agg_json > 0.95 or agg_json < 0.05)
+            if micro_extreme:
+                # Tentukan arah fundamental: prioritas Algo > Greeks > HFT
+                fundamental = algo_bias_json if algo_bias_json != "NEUTRAL" else \
+                              greeks_kill if greeks_kill != "NEUTRAL" else \
+                              hft_bias_json
 
-            if micro_suspicious:
-                # Cari arah fundamental (prioritas Algo > Greeks)
-                fundamental_bias = "NEUTRAL"
-                if algo_bias_json != "NEUTRAL":
-                    fundamental_bias = algo_bias_json
-                elif greeks_kill != "NEUTRAL":
-                    fundamental_bias = greeks_kill
-
-                # Jika fundamental bertentangan dengan sinyal mikro → veto mikro
-                if fundamental_bias != "NEUTRAL" and fundamental_bias != ofi_bias_json:
-                    result["bias"] = fundamental_bias
+                if fundamental != "NEUTRAL" and fundamental != ofi_bias_json:
+                    # Veto! Mikro bertentangan dengan fundamental
+                    result["bias"] = fundamental
                     result["confidence"] = "ABSOLUTE"
-                    result["priority_level"] = -10100   # tinggi, mengalahkan banyak detector
+                    result["priority_level"] = -10110
+                    result["entry_allowed"] = True
                     result["reason"] = (
                         f"[ULTRA LOW VOL SPOOF VETO] Vol {volume_ratio:.2f}x, "
                         f"OFI/Agg ekstrem ({ofi_bias_json} {ofi_strength_json:.2f}, agg {agg_json:.2f}) "
-                        f"tapi Algo/Greeks={fundamental_bias}. Sinyal mikro adalah spoof. "
-                        f"Paksa {fundamental_bias}. | " + result.get("reason", "")
+                        f"tapi fundamental={fundamental}. Sinyal mikro adalah spoof. "
+                        f"Paksa {fundamental}. | " + result.get("reason", "")
                     )
-                    return result  # langsung return, tidak perlu proses lebih lanjut
-        # ========== END OF SPOOF VETO ==========
+                    return result
+
+        # ========== END OF LANGKAH 6 ==========
         
         # ========== AMBIL SEMUA VARIABEL YANG DIPERLUKAN DI AWAL METHOD ==========
         short_liq = result.get("short_liq", 99.0)
@@ -24598,35 +24593,34 @@ class BinanceAnalyzer:
                 result["entry_allowed"] = True
                 return result
         
-        # ========== PRIORITY -10100: ALGO+HFT CONSENSUS OVERRIDE (BATALKAN VEGA FADE) ==========
-        # Jika Algo dan HFT keduanya sepakat LONG/SHORT, dan ada target likuiditas di bawah 3%,
-        # maka abaikan semua sinyal fade (termasuk Vega) dan ikuti konsensus.
+        # ========== PRIORITY -10100: ALGO+HFT CONSENSUS OVERRIDE (DIPERBAIKI) ==========
+        # Hanya aktif jika pasar tidak dalam fase BAIT, atau jika BAIT tapi didukung Greeks
         algo_bias = result.get("algo_type_bias", "NEUTRAL")
         hft_bias = result.get("hft_6pct_bias", "NEUTRAL")
-        consensus_direction = None
         if algo_bias == hft_bias and algo_bias in ("LONG", "SHORT"):
-            consensus_direction = algo_bias
+            short_liq = result.get("short_liq", 99)
+            long_liq = result.get("long_liq", 99)
+            market_phase = result.get("market_phase", "UNKNOWN")
+            greeks_kill = result.get("greeks_kill_direction", "NEUTRAL")
+            who_dies = result.get("greeks_who_dies_first", "")
+            vega_active = result.get("greeks_vega_active", False)
 
-        if consensus_direction:
-            # Cek apakah ada target likuiditas yang mendukung
-            if consensus_direction == "LONG" and short_liq < 3.0:
-                result["bias"] = "LONG"
+            # Syarat 1: target likuiditas mendukung
+            target_ok = (algo_bias == "LONG" and short_liq < 3.0) or (algo_bias == "SHORT" and long_liq < 3.0)
+
+            # Syarat 2: fase pasar harus KILL, atau jika BAIT, Greeks harus searah
+            phase_ok = (market_phase != "BAIT") or (greeks_kill == algo_bias)
+
+            # Syarat 3: jika Vega aktif & who_dies BOTH_POSSIBLE, jangan force
+            no_vega_ambiguity = not (vega_active and who_dies == "BOTH_POSSIBLE")
+
+            if target_ok and phase_ok and no_vega_ambiguity:
+                result["bias"] = algo_bias
                 result["confidence"] = "ABSOLUTE"
                 result["priority_level"] = -10100
                 result["reason"] = (
-                    f"[ALGO+HFT CONSENSUS] Algo={algo_bias}, HFT={hft_bias} sepakat LONG. "
-                    f"short_liq={short_liq:.2f}% (<3%) → batalkan semua sinyal fade, force LONG. | "
-                    + result.get("reason", "")
-                )
-                result["entry_allowed"] = True
-                return result
-            elif consensus_direction == "SHORT" and long_liq < 3.0:
-                result["bias"] = "SHORT"
-                result["confidence"] = "ABSOLUTE"
-                result["priority_level"] = -10100
-                result["reason"] = (
-                    f"[ALGO+HFT CONSENSUS] Algo={algo_bias}, HFT={hft_bias} sepakat SHORT. "
-                    f"long_liq={long_liq:.2f}% (<3%) → batalkan semua sinyal fade, force SHORT. | "
+                    f"[ALGO+HFT CONSENSUS] Algo={algo_bias}, HFT={hft_bias} sepakat {algo_bias}. "
+                    f"short_liq={short_liq:.2f}%, long_liq={long_liq:.2f}% → batalkan semua sinyal fade, force {algo_bias}. | "
                     + result.get("reason", "")
                 )
                 result["entry_allowed"] = True
