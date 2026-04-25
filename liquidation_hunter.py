@@ -24267,6 +24267,43 @@ class BinanceAnalyzer:
             print(f"⚠️ DATA RACE DETECTED & CORRECTED for {result.get('symbol')}: {', '.join(corrections)}")
         
         # ========== END OF JSON OVERRIDE BLOCK ==========
+        # ========== LANGKAH 7 : PREP PHASE HARD BLOCK ==========
+        # Prioritas -20000 (sangat tinggi), hanya dikalahkan oleh -10110 (Ultra-Low Vol Veto)
+        market_phase = result.get("market_phase", "UNKNOWN")
+        if market_phase == "PREP":
+            # Cek apakah ada bukti eksekusi yang TIDAK BISA DIBOHONGI
+            gamma_executing = result.get("greeks_gamma_executing", False)
+            gamma_exec_score = result.get("greeks_gamma_exec_score", 0)
+            latest_vol = result.get("latest_volume", 0)
+            vol_ma10 = result.get("volume_ma10", 1)
+            vol_spike = latest_vol / vol_ma10 if vol_ma10 > 0 else 1.0
+            short_liq = result.get("short_liq", 99)
+
+            # Syarat untuk MENEMBUS PREP block:
+            # 1. Gamma executing dengan score ≥ 4 DAN
+            # 2. Volume spike ≥ 2.5x DAN
+            # 3. short_liq < 0.5% (target ultra‑dekat, tidak mungkin dipalsukan)
+            genuine_kill = (
+                gamma_executing and
+                gamma_exec_score >= 4 and
+                vol_spike >= 2.5 and
+                short_liq < 0.5
+            )
+
+            if not genuine_kill:
+                result["bias"] = "NEUTRAL"
+                result["confidence"] = "BLOCK"
+                result["entry_allowed"] = False
+                result["priority_level"] = -20000
+                result["reason"] = (
+                    f"[PREP HARD BLOCK] Market dalam fase PREP (akumulasi). "
+                    f"gamma_exec={gamma_executing}, exec_score={gamma_exec_score}, "
+                    f"vol_spike={vol_spike:.1f}x, short_liq={short_liq:.2f}%. "
+                    f"Tidak ada bukti eksekusi nyata → NO TRADE. | "
+                    + result.get("reason", "")
+                )
+                return result
+        # ========== END OF PREP HARD BLOCK ==========
         
         # ========== LANGKAH 6 (FINAL) : ULTRA-LOW VOLUME SPOOFING VETO ==========
         # Prioritas -10110 (lebih tinggi dari Algo+HFT Consensus -10100)
