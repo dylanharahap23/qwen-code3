@@ -922,7 +922,12 @@ class UltraCloseLiqFakeVacuumTrap:   # UPGRADE V2
         if change_5m > 1.5 and rsi6 > 75:   # momentum pump + overbought
             return {"override": False}       # biarkan genuine squeeze jalan
 
-        bias = "LONG" if long_liq < short_liq else "SHORT"
+        # Perbaikan logika: long_liq dekat → harga harus turun → SHORT
+        # short_liq dekat → harga harus naik → LONG
+        if long_liq < short_liq:
+            bias = "SHORT"
+        else:
+            bias = "LONG"
         return {
             "override": True,
             "bias": bias,
