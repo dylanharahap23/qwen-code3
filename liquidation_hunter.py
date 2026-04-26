@@ -10356,6 +10356,58 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
     # -----------------------------------------------------------------
     votes = {"LONG": 0.0, "SHORT": 0.0}
     context = result
+    
+    # ========== LECTURER FIX: WEIGHTED CONFLICT RESOLUTION FOR EXTREME RSI ==========
+    # Weighted conflict resolution untuk kasus RSI ekstrem vs exchange risk
+    rsi6 = result.get("rsi6", 50)
+    exchange_score = result.get("exchange_risk_score", 0)
+    exchange_bias = result.get("exchange_safe_direction", "NEUTRAL")
+    long_liq = result.get("long_liq", 99)
+    short_liq = result.get("short_liq", 99)
+
+    # Bobot: RSI ekstrem > 90 atau < 10 memiliki bobot tinggi
+    rsi_extreme_score = 0
+    if rsi6 < 10:
+        rsi_extreme_score = 4  # sangat oversold
+        rsi_direction = "LONG"
+    elif rsi6 > 90:
+        rsi_extreme_score = 4  # sangat overbought
+        rsi_direction = "SHORT"
+    else:
+        rsi_direction = None
+
+    # Jika ada konflik antara exchange bias dan RSI ekstrem
+    if rsi_direction and exchange_bias != rsi_direction and exchange_score >= 6:
+        # Bobot liquidity proximity juga
+        liq_proximity_bias = "LONG" if short_liq < long_liq else "SHORT"
+        liq_proximity_score = 3 if min(short_liq, long_liq) < 1.5 else 1
+        
+        # Hitung weighted vote
+        long_votes = 0
+        short_votes = 0
+        if rsi_direction == "LONG":
+            long_votes += rsi_extreme_score
+        else:
+            short_votes += rsi_extreme_score
+        
+        if exchange_bias == "LONG":
+            long_votes += exchange_score // 2  # exchange risk score dibagi 2
+        else:
+            short_votes += exchange_score // 2
+        
+        if liq_proximity_bias == "LONG":
+            long_votes += liq_proximity_score
+        else:
+            short_votes += liq_proximity_score
+        
+        if long_votes > short_votes:
+            result["bias"] = "LONG"
+            result["confidence"] = "ABSOLUTE"
+            result["reason"] = f"[WEIGHTED CONFLICT] RSI={rsi6:.1f} ekstrem + liq proximity → override exchange bias | " + result.get("reason", "")
+        elif short_votes > long_votes:
+            result["bias"] = "SHORT"
+            result["confidence"] = "ABSOLUTE"
+            result["reason"] = f"[WEIGHTED CONFLICT] RSI={rsi6:.1f} ekstrem + liq proximity → override exchange bias | " + result.get("reason", "")
 
     # ================================================================
     # 🧩 RULE 5: Regime-Phase Conflict Block (Early Stage Check)
@@ -24022,10 +24074,65 @@ class BinanceAnalyzer:
         self.last_flip_time = None              # timestamp flip terakhir
         self.flip_count = 0                     # hitungan flip dalam window
         self.last_signal_bias = None            # bias sinyal terakhir (untuk deteksi flip)
+        
+        # LECTURER FIX: Atomic snapshot state
+        self._last_snapshot = None
 
     def __del__(self):
         if hasattr(self, 'ws') and self.ws is not None:
             self.ws.stop()
+
+    def freeze_state(self, result: dict) -> dict:
+        """Membekukan semua state penting dalam satu snapshot atomic"""
+        import copy
+        snapshot = copy.deepcopy(result)
+        snapshot["_snapshot_timestamp"] = time.time()
+        return snapshot
+
+    def resolve_priority_chain(self, snapshot: dict) -> dict:
+        """
+        Menyelesaikan konflik bias berdasarkan priority ladder.
+        Override detection berdasarkan priority tertinggi.
+        """
+        # Priority ladder (semakin negatif semakin tinggi prioritas)
+        candidates = []
+        
+        # 1. Exchange Hard Block (priority -30000)
+        exchange_bias = snapshot.get("exchange_safe_direction")
+        exchange_score = snapshot.get("exchange_risk_score", 0)
+        if exchange_score >= 7 and exchange_bias in ("LONG", "SHORT"):
+            candidates.append((-30000, exchange_bias, "EXCHANGE_HARD_BLOCK"))
+        
+        # 2. Liquidity Proximity Absolute (priority -40000) - sudah ada di aggregator
+        # 3. Greeks Override (priority -9995)
+        greeks_bias = snapshot.get("greeks_bias")
+        if snapshot.get("greeks_override") and greeks_bias in ("LONG", "SHORT"):
+            candidates.append((-9995, greeks_bias, "GREEKS_OVERRIDE"))
+        
+        # 4. Pre-Kill Sweep (priority -10009.5)
+        if snapshot.get("_pre_kill_sweep_detected"):
+            pre_kill_bias = snapshot.get("_pre_kill_sweep_bias")
+            if pre_kill_bias in ("LONG", "SHORT"):
+                candidates.append((-10009.5, pre_kill_bias, "PRE_KILL_SWEEP"))
+        
+        # 5. UltraCloseLiqFakeVacuum (priority -30750)
+        if snapshot.get("phase") == "ULTRA_LIQ_FAKE_VACUUM":
+            bias = snapshot.get("bias")
+            if bias in ("LONG", "SHORT"):
+                candidates.append((-30750, bias, "FAKE_VACUUM"))
+        
+        # Pilih prioritas tertinggi (paling negatif)
+        if candidates:
+            candidates.sort(key=lambda x: x[0])  # ascending (paling negatif dulu)
+            priority, bias, source = candidates[0]
+            snapshot["bias"] = bias
+            snapshot["_resolved_by"] = source
+            snapshot["_resolved_priority"] = priority
+        else:
+            # Fallback ke bias biasa
+            pass
+        
+        return snapshot
 
     def _is_agg_sustained(self, agg_current: float, threshold: float = 0.75, min_period: int = 5) -> bool:
         """Cek apakah agg >= threshold selama minimal min_period candle terakhir (dalam history)"""
@@ -33240,7 +33347,20 @@ class BinanceAnalyzer:
             with open("debug.log", "a") as f:
                 f.write(f"{result.get('timestamp', 'N/A')} | bias: {result['bias']} | locked: {result.get('_final_bias_locked')} | analysis_id: {result.get('analysis_id', 'N/A')}\n")
 
-            return result
+            # ========== LECTURER FIX: ATOMIC SNAPSHOT & PRIORITY CHAIN RESOLUTION ==========
+            # Bekukan state dalam snapshot atomic sebelum return
+            snapshot = self.freeze_state(result)
+            snapshot = self.resolve_priority_chain(snapshot)
+            
+            # Simpan snapshot untuk referensi
+            self._last_snapshot = snapshot
+            
+            # Gunakan snapshot untuk render teks DAN JSON
+            # Tampilkan ke konsol menggunakan snapshot
+            OutputFormatter.print_signal(snapshot)
+            
+            # Return snapshot sebagai hasil final
+            return snapshot
 
         except Exception as e:
             print(f"❌ Error analyzing {self.symbol}: {e}")
@@ -33558,7 +33678,8 @@ def main():
         print(f"   Consistency Check: {'✅ PASS' if is_consistent else '⚠️ FAIL'}")
         
         # Tampilkan display HANYA SETELAH validasi
-        OutputFormatter.print_signal(result)
+        # LECTURER FIX: Snapshot sudah di-print di dalam analyze(), skip double print
+        # OutputFormatter.print_signal(result)  # Commented out - already printed in analyze()
         print_greeks_section(result)
         
         # LECTURER FIX v10: Jika sinyal tidak konsisten, jangan lanjut ke eksekusi
@@ -33604,6 +33725,7 @@ def api_mode(symbol: str) -> str:
         # LECTURER FIX v10: Validasi konsistensi sebelum return JSON
         is_consistent = validate_signal_consistency(result)
         result["signal_consistent"] = is_consistent  # Tambahkan field validasi ke JSON
+        # Result sudah merupakan snapshot dari analyze(), jadi langsung return
         return json.dumps(result, indent=2, default=str)
     return json.dumps({"error": f"Failed to analyze {symbol}"})
 
