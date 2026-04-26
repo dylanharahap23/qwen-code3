@@ -901,35 +901,34 @@ class DeepOversoldFakeBounceTrap:
         }
 
 
-class UltraCloseLiqFakeVacuumTrap:   # UPGRADE V2
+class UltraCloseLiqFakeVacuumTrap:
     """
     PRIORITY -30750
     Versi refined: Jangan paksa SHORT kalau sudah ada momentum pump kuat
     """
     @staticmethod
     def detect(long_liq: float, short_liq: float, volume_ratio: float,
-               down_energy: float, change_5m: float, market_phase: str,
+               down_energy: float, market_phase: str, change_5m: float,
                rsi6: float) -> dict:
         
-        if volume_ratio >= 0.55 or down_energy > 0.01:
+        closest_liq = min(long_liq, short_liq)
+        if closest_liq >= 1.0 or volume_ratio >= 0.55 or down_energy > 0.01:
             return {"override": False}
         
         if market_phase not in ["BAIT", "LOW_CAP_SNIPER", "PREP"]:
             return {"override": False}
-        
-        # Jangan override jika sudah terjadi pump besar (momentum nyata)
-        if change_5m > 1.5 and rsi6 > 75:
-            return {"override": False}
-        
-        # 🔥 PERBAIKAN UTAMA: long_liq lebih dekat -> SHORT
-        if long_liq < short_liq and long_liq < 2.0:
+
+        # === TAMBAHAN BARU: JANGAN PAKSA SHORT KALAU SUDAH PUMP ===
+        if change_5m > 1.5 and rsi6 > 75:   # momentum pump + overbought
+            return {"override": False}       # biarkan genuine squeeze jalan
+
+        # 🔥 PERBAIKAN UTAMA: long_liq lebih dekat -> SHORT, short_liq lebih dekat -> LONG
+        if long_liq < short_liq:
             bias = "SHORT"
-            reason = f"LONG liq lebih dekat ({long_liq:.2f}%), vol={volume_ratio:.2f}x, down_energy=0 → HFT akan turun, force SHORT"
-        elif short_liq < long_liq and short_liq < 2.0:
+            reason = f"LONG liq lebih dekat ({long_liq:.2f}%) daripada short liq ({short_liq:.2f}%), vol={volume_ratio:.2f}x, down_energy=0 → HFT akan turun, force SHORT"
+        else:
             bias = "LONG"
             reason = f"SHORT liq lebih dekat ({short_liq:.2f}%), vol={volume_ratio:.2f}x, down_energy=0 → HFT akan naik, force LONG"
-        else:
-            return {"override": False}
         
         return {
             "override": True,
@@ -24586,50 +24585,41 @@ class BinanceAnalyzer:
             return result
 
         # ========== PRIORITY -10180: SYMMETRIC LIQUIDITY + STRONG ORDER FLOW ==========
-        # Jika short_liq dan long_liq hampir simetris (<1% beda), dan order flow
-        # sangat dominan ke satu arah (agg ekstrem + OFI + no opposite energy),
-        # maka abaikan konsensus Algo/HFT, ikuti order flow.
+        # Hanya aktif jika selisih likuiditas kecil (<1%)
         liq_diff = abs(short_liq - long_liq)
-        
-        if liq_diff < 1.0:  # likuiditas hampir simetris
-            # Kasus 1: Order flow sangat bullish -> paksa LONG (abaikan SHORT)
-            if (agg > 0.85 and 
-                ofi_bias == "LONG" and ofi_strength > 0.7 and 
-                down_energy < 0.01 and up_energy > 0.1):
-                
-                # 🔥 PERBAIKAN: Jangan paksa LONG jika long_liq lebih dekat
-                if long_liq < short_liq:
-                    # Biarkan detector lain (misal liquidity proximity) yang menentukan
-                    pass
-                else:
+        if liq_diff < 1.0:
+            # Kasus 1: Order flow sangat bullish -> paksa LONG HANYA jika short_liq lebih dekat
+            if (agg_val > 0.85 and ofi_bias == "LONG" and ofi_strength > 0.7 and 
+                down_energy_val < 0.01 and up_energy_val > 0.1):
+                if short_liq < long_liq:
                     result["bias"] = "LONG"
                     result["confidence"] = "ABSOLUTE"
                     result["priority_level"] = -10180
                     result["reason"] = (
                         f"[SYMMETRIC LIQ + STRONG BUY] short_liq={short_liq:.2f}% vs long_liq={long_liq:.2f}% "
-                        f"(diff {liq_diff:.2f}%), agg={agg:.2f} (100% buy), OFI LONG {ofi_strength:.2f}, "
+                        f"(diff {liq_diff:.2f}%), agg={agg_val:.2f} (100% buy), OFI LONG {ofi_strength:.2f}, "
                         f"down_energy=0 → HFT akumulasi, ignore Algo/HFT SHORT, force LONG. | "
                         + result.get("reason", "")
                     )
                     result["entry_allowed"] = True
                     return result
-                
-            # Kasus 2: Order flow sangat bearish -> paksa SHORT (abaikan LONG)
-            if (agg < 0.15 and 
-                ofi_bias == "SHORT" and ofi_strength > 0.7 and 
-                up_energy < 0.01 and down_energy > 0.1):
-                
-                result["bias"] = "SHORT"
-                result["confidence"] = "ABSOLUTE"
-                result["priority_level"] = -10180
-                result["reason"] = (
-                    f"[SYMMETRIC LIQ + STRONG SELL] short_liq={short_liq:.2f}% vs long_liq={long_liq:.2f}% "
-                    f"(diff {liq_diff:.2f}%), agg={agg:.2f} (100% sell), OFI SHORT {ofi_strength:.2f}, "
-                    f"up_energy=0 → HFT distribusi, ignore Algo/HFT LONG, force SHORT. | "
-                    + result.get("reason", "")
-                )
-                result["entry_allowed"] = True
-                return result
+                # Jika long_liq lebih dekat, jangan paksa LONG, biarkan detector lain
+            
+            # Kasus 2: Order flow sangat bearish -> paksa SHORT HANYA jika long_liq lebih dekat
+            if (agg_val < 0.15 and ofi_bias == "SHORT" and ofi_strength > 0.7 and 
+                up_energy_val < 0.01 and down_energy_val > 0.1):
+                if long_liq < short_liq:
+                    result["bias"] = "SHORT"
+                    result["confidence"] = "ABSOLUTE"
+                    result["priority_level"] = -10180
+                    result["reason"] = (
+                        f"[SYMMETRIC LIQ + STRONG SELL] long_liq={long_liq:.2f}% vs short_liq={short_liq:.2f}% "
+                        f"(diff {liq_diff:.2f}%), agg={agg_val:.2f} (100% sell), OFI SHORT {ofi_strength:.2f}, "
+                        f"up_energy=0 → HFT distribusi, ignore Algo/HFT LONG, force SHORT. | "
+                        + result.get("reason", "")
+                    )
+                    result["entry_allowed"] = True
+                    return result
         
         # ========== PRIORITY -10100: ALGO+HFT CONSENSUS OVERRIDE (DIPERBAIKI) ==========
         # Hanya aktif jika pasar tidak dalam fase BAIT, atau jika BAIT tapi didukung Greeks
