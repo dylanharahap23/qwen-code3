@@ -10,13 +10,27 @@ __pycache__/
 venv/
 .env
 .env.local
-.env.*
+*.env.*
 
 # Logs
 *.log
 
-# Temporary files
+# Editors
+.vscode/
+.idea/
+
+# Temp files
 *.tmp
 *.swp
-*~
+*.swo
+
+# Coverage
+.coverage
+coverage/
+htmlcov/
+
+# Build artifacts
+dist/
+build/
+target/
 ```
