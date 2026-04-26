@@ -914,11 +914,12 @@ class UltraCloseLiqFakeVacuumTrap:
                down_energy: float, market_phase: str, change_5m: float,
                rsi6: float, rsi6_5m: float = 50.0, funding_rate: float = 0.0) -> dict:
         
-        closest_liq = min(long_liq, short_liq)
-        if closest_liq >= 1.0 or volume_ratio >= 0.55 or down_energy > 0.01:
+        # FIX 3: Pensiunkan detector ini untuk BAIT & PREP phase
+        if market_phase in ("PREP", "BAIT"):
             return {"override": False}
         
-        if market_phase not in ["BAIT", "LOW_CAP_SNIPER", "PREP"]:
+        closest_liq = min(long_liq, short_liq)
+        if closest_liq >= 1.0 or volume_ratio >= 0.55 or down_energy > 0.01:
             return {"override": False}
 
         # Jangan override jika sudah ada pump besar (momentum nyata)
@@ -9906,7 +9907,8 @@ def _greeks_absolute_score(
             }
         
         # Cek konflik dengan kill direction
-        if kill_direction != "NEUTRAL" and fade_direction != kill_direction:
+        # FIX 2: Jangan ikuti Vega-Kill Conflict jika who_dies_first == BOTH_POSSIBLE
+        if kill_direction != "NEUTRAL" and fade_direction != kill_direction and who_dies_first_local != "BOTH_POSSIBLE":
             
             # GUARD BARU: Jika OBV magnitude sangat besar dan agg sangat tinggi,
             # kill_direction mungkin salah — percaya Vega fade (arah aslinya)
@@ -24425,13 +24427,14 @@ class BinanceAnalyzer:
         rsi6_5m_val = rsi6_5m  # Sudah ada di atas, pastikan konsisten
         rsi14_val = rsi14  # Sudah ada di atas, pastikan konsisten
         
-        # ========== LANGKAH 7 : PREP PHASE HARD BLOCK ===========
+        # ========== LANGKAH 7 : PREP/BAIT PHASE HARD BLOCK ===========
         # Prioritas -20000 (sangat tinggi), hanya dikalahkan oleh -10110 (Ultra-Low Vol Veto)
-        if market_phase == "PREP":
+        # FIX 1: Perluas block untuk BAIT phase juga
+        if market_phase in ("PREP", "BAIT"):
             # Hitung vol_spike
             vol_spike = latest_volume / volume_ma10 if volume_ma10 > 0 else 1.0
 
-            # Syarat untuk MENEMBUS PREP block:
+            # Syarat untuk MENEMBUS PREP/BAIT block:
             # 1. Gamma executing dengan score ≥ 4 DAN
             # 2. Volume spike ≥ 2.5x DAN
             # 3. short_liq < 0.5% (target ultra‑dekat, tidak mungkin dipalsukan)
@@ -24448,14 +24451,14 @@ class BinanceAnalyzer:
                 result["entry_allowed"] = False
                 result["priority_level"] = -20000
                 result["reason"] = (
-                    f"[PREP HARD BLOCK] Market dalam fase PREP (akumulasi). "
+                    f"[{market_phase} HARD BLOCK] Market dalam fase {market_phase} (akumulasi/fake move). "
                     f"gamma_exec={gamma_executing}, exec_score={gamma_exec_score}, "
                     f"vol_spike={vol_spike:.1f}x, short_liq={short_liq:.2f}%. "
                     f"Tidak ada bukti eksekusi nyata → NO TRADE. | "
                     + result.get("reason", "")
                 )
                 return result
-        # ========== END OF PREP HARD BLOCK ==========
+        # ========== END OF PREP/BAIT HARD BLOCK ==========
         
         # ========== LANGKAH 6 (FINAL) : ULTRA-LOW VOLUME SPOOFING VETO ==========
         # Prioritas -10110 (lebih tinggi dari Algo+HFT Consensus -10100)
