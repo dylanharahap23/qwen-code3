@@ -904,12 +904,15 @@ class DeepOversoldFakeBounceTrap:
 class UltraCloseLiqFakeVacuumTrap:
     """
     PRIORITY -30750
-    Versi refined: Jangan paksa SHORT kalau sudah ada momentum pump kuat
+    Versi refined dengan guard: Jangan paksa LONG jika short_liq dekat tapi
+    - RSI 5m > 75 (overbought)
+    - ATAU funding_rate > 0.0003 (crowded long)
+    - ATAU change_5m sudah > short_liq * 1.5 (sweep sudah terjadi)
     """
     @staticmethod
     def detect(long_liq: float, short_liq: float, volume_ratio: float,
                down_energy: float, market_phase: str, change_5m: float,
-               rsi6: float) -> dict:
+               rsi6: float, rsi6_5m: float = 50.0, funding_rate: float = 0.0) -> dict:
         
         closest_liq = min(long_liq, short_liq)
         if closest_liq >= 1.0 or volume_ratio >= 0.55 or down_energy > 0.01:
@@ -918,17 +921,29 @@ class UltraCloseLiqFakeVacuumTrap:
         if market_phase not in ["BAIT", "LOW_CAP_SNIPER", "PREP"]:
             return {"override": False}
 
-        # === TAMBAHAN BARU: JANGAN PAKSA SHORT KALAU SUDAH PUMP ===
-        if change_5m > 1.5 and rsi6 > 75:   # momentum pump + overbought
-            return {"override": False}       # biarkan genuine squeeze jalan
+        # Jangan override jika sudah ada pump besar (momentum nyata)
+        if change_5m > 1.5 and rsi6 > 75:
+            return {"override": False}
+
+        # 🔥 GUARD KRITIS: Jika short_liq dekat (target LONG) tapi kondisi overbought & crowded long
+        if short_liq < long_liq and short_liq < 1.0:
+            # Cegah LONG jika:
+            # - RSI 5m overbought (>75) dan funding positif
+            if rsi6_5m > 75 and funding_rate > 0.0003:
+                return {"override": False}
+            # - Atau jika harga sudah naik melebihi short_liq (sweep selesai)
+            if change_5m > short_liq * 1.2:
+                return {"override": False}
 
         # 🔥 PERBAIKAN UTAMA: long_liq lebih dekat -> SHORT, short_liq lebih dekat -> LONG
         if long_liq < short_liq:
             bias = "SHORT"
-            reason = f"LONG liq lebih dekat ({long_liq:.2f}%) daripada short liq ({short_liq:.2f}%), vol={volume_ratio:.2f}x, down_energy=0 → HFT akan turun, force SHORT"
-        else:
+            reason = f"LONG liq lebih dekat ({long_liq:.2f}%), vol={volume_ratio:.2f}x, down_energy=0 → HFT akan turun, force SHORT"
+        elif short_liq < long_liq:
             bias = "LONG"
             reason = f"SHORT liq lebih dekat ({short_liq:.2f}%), vol={volume_ratio:.2f}x, down_energy=0 → HFT akan naik, force LONG"
+        else:
+            return {"override": False}
         
         return {
             "override": True,
@@ -10795,6 +10810,9 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
         # Kurangi LONG vote
         if "aggregator_votes" in result:
             result["aggregator_votes"]["LONG"] = max(0, result["aggregator_votes"].get("LONG", 8) - 5)
+    
+    # 🔥 PASTIKAN _final_bias_locked SELALU DI-SET SEBELUM RETURN
+    result["_final_bias_locked"] = result["bias"]
     
     return result
 
@@ -30557,7 +30575,9 @@ class BinanceAnalyzer:
                             down_energy=down_energy,
                             market_phase=provisional_market_phase,
                             change_5m=change_5m,
-                            rsi6=rsi6  # V2: ganti dari rsi6_5m ke rsi6
+                            rsi6=rsi6,
+                            rsi6_5m=rsi6_5m if rsi6_5m is not None else 50.0,
+                            funding_rate=funding_rate if funding_rate is not None else 0.0
                         )
                         genuine_squeeze = ProtectGenuineShortSqueezeGuard.detect(
                             short_liq=liq["short_dist"],
@@ -33396,6 +33416,10 @@ class OutputFormatter:
         # ✅ SOLUSI KONSISTENSI: Gunakan bias dari _final_bias_locked jika ada
         # Ini memastikan bias yang dicetak sama dengan yang sudah di-lock setelah arbitrate_final_decision
         bias = result.get("_final_bias_locked", result.get("bias", "NEUTRAL"))
+        
+        # 🔥 PAKSA konsisten dengan JSON: gunakan _final_bias_locked jika ada
+        if result.get("bias") != bias:
+            print(f"⚠️ Konsol dikoreksi: {result.get('bias')} → {bias} (sesuai JSON)")
         
         print("="*80)
         print(f"🔥 {result.get('symbol', 'UNKNOWN')} @ {result.get('timestamp', '')}")
