@@ -24597,17 +24597,22 @@ class BinanceAnalyzer:
                 ofi_bias == "LONG" and ofi_strength > 0.7 and 
                 down_energy < 0.01 and up_energy > 0.1):
                 
-                result["bias"] = "LONG"
-                result["confidence"] = "ABSOLUTE"
-                result["priority_level"] = -10180
-                result["reason"] = (
-                    f"[SYMMETRIC LIQ + STRONG BUY] short_liq={short_liq:.2f}% vs long_liq={long_liq:.2f}% "
-                    f"(diff {liq_diff:.2f}%), agg={agg:.2f} (100% buy), OFI LONG {ofi_strength:.2f}, "
-                    f"down_energy=0 → HFT akumulasi, ignore Algo/HFT SHORT, force LONG. | "
-                    + result.get("reason", "")
-                )
-                result["entry_allowed"] = True
-                return result
+                # 🔥 PERBAIKAN: Jangan paksa LONG jika long_liq lebih dekat
+                if long_liq < short_liq:
+                    # Biarkan detector lain (misal liquidity proximity) yang menentukan
+                    pass
+                else:
+                    result["bias"] = "LONG"
+                    result["confidence"] = "ABSOLUTE"
+                    result["priority_level"] = -10180
+                    result["reason"] = (
+                        f"[SYMMETRIC LIQ + STRONG BUY] short_liq={short_liq:.2f}% vs long_liq={long_liq:.2f}% "
+                        f"(diff {liq_diff:.2f}%), agg={agg:.2f} (100% buy), OFI LONG {ofi_strength:.2f}, "
+                        f"down_energy=0 → HFT akumulasi, ignore Algo/HFT SHORT, force LONG. | "
+                        + result.get("reason", "")
+                    )
+                    result["entry_allowed"] = True
+                    return result
                 
             # Kasus 2: Order flow sangat bearish -> paksa SHORT (abaikan LONG)
             if (agg < 0.15 and 
