@@ -33205,10 +33205,8 @@ class BinanceAnalyzer:
             # ========== FINAL BIAS LOCK ==========
             # Setelah aggregator, bias TIDAK BOLEH diubah lagi
             # Simpan final_bias untuk validasi konsistensi
-            final_bias_after_aggregator = result.get("bias", "NEUTRAL")
-            result["_final_bias_locked"] = final_bias_after_aggregator
             
-            # Validasi: pastikan tidak ada kontradiksi internal
+            # Validasi: pastikan tidak ada kontradiksi internal SEBELUM lock
             # LECTURER FIX v10: validate_signal_consistency sekarang hanya cek kontradiksi berbahaya
             # NEUTRAL dan BLOCK confidence adalah status VALID, bukan error
             if not validate_signal_consistency(result):
@@ -33217,6 +33215,10 @@ class BinanceAnalyzer:
                 result["confidence"] = "BLOCK"
                 result["reason"] = "[CONSISTENCY CHECK FAILED] Internal signal contradiction detected. Forcing NEUTRAL. | " + result.get("reason", "")
                 result["entry_allowed"] = False
+            
+            # NOW lock the final bias AFTER all modifications are done
+            final_bias_after_aggregator = result.get("bias", "NEUTRAL")
+            result["_final_bias_locked"] = final_bias_after_aggregator
             
             # 🔥 LOGGING TIMESTAMP UNTUK MELACAK PERBEDAAN
             # Tulis ke debug.log untuk membandingkan timestamp konsol vs JSON
