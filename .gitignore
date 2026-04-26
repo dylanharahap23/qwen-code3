@@ -10,30 +10,13 @@ __pycache__/
 venv/
 .env
 .env.local
-*.env.*
+.env.*
 
 # Logs
 *.log
 
-# Editors
-.vscode/
-.idea/
-
-# Dependencies
-node_modules/
-
-# Build artifacts
-dist/
-build/
-target/
-
-# Testing
-.coverage
-htmlcov/
-.coverage.*
-.tox/
-
-# System
-.DS_Store
-Thumbs.db
+# Temporary files
+*.tmp
+*.swp
+*~
 ```
