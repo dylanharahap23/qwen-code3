@@ -911,27 +911,30 @@ class UltraCloseLiqFakeVacuumTrap:   # UPGRADE V2
                down_energy: float, change_5m: float, market_phase: str,
                rsi6: float) -> dict:
         
-        closest_liq = min(long_liq, short_liq)
-        if closest_liq >= 1.0 or volume_ratio >= 0.55 or down_energy > 0.01:
+        if volume_ratio >= 0.55 or down_energy > 0.01:
             return {"override": False}
         
         if market_phase not in ["BAIT", "LOW_CAP_SNIPER", "PREP"]:
             return {"override": False}
-
-        # === TAMBAHAN BARU: JANGAN PAKSA SHORT KALAU SUDAH PUMP ===
-        if change_5m > 1.5 and rsi6 > 75:   # momentum pump + overbought
-            return {"override": False}       # biarkan genuine squeeze jalan
-
-        # Perbaikan logika: long_liq dekat → harga harus turun → SHORT
-        # short_liq dekat → harga harus naik → LONG
-        if long_liq < short_liq:
+        
+        # Jangan override jika sudah terjadi pump besar (momentum nyata)
+        if change_5m > 1.5 and rsi6 > 75:
+            return {"override": False}
+        
+        # 🔥 PERBAIKAN UTAMA: long_liq lebih dekat -> SHORT
+        if long_liq < short_liq and long_liq < 2.0:
             bias = "SHORT"
-        else:
+            reason = f"LONG liq lebih dekat ({long_liq:.2f}%), vol={volume_ratio:.2f}x, down_energy=0 → HFT akan turun, force SHORT"
+        elif short_liq < long_liq and short_liq < 2.0:
             bias = "LONG"
+            reason = f"SHORT liq lebih dekat ({short_liq:.2f}%), vol={volume_ratio:.2f}x, down_energy=0 → HFT akan naik, force LONG"
+        else:
+            return {"override": False}
+        
         return {
             "override": True,
             "bias": bias,
-            "reason": f"ULTRA CLOSE LIQ FAKE VACUUM V2: {long_liq:.2f}% / {short_liq:.2f}% liq, vol={volume_ratio:.2f}x, change={change_5m:.2f}% → HFT bait, force {bias}",
+            "reason": reason,
             "priority": -30750
         }
 
@@ -33214,6 +33217,11 @@ class BinanceAnalyzer:
                 result["confidence"] = "BLOCK"
                 result["reason"] = "[CONSISTENCY CHECK FAILED] Internal signal contradiction detected. Forcing NEUTRAL. | " + result.get("reason", "")
                 result["entry_allowed"] = False
+            
+            # 🔥 LOGGING TIMESTAMP UNTUK MELACAK PERBEDAAN
+            # Tulis ke debug.log untuk membandingkan timestamp konsol vs JSON
+            with open("debug.log", "a") as f:
+                f.write(f"{result.get('timestamp', 'N/A')} | bias: {result['bias']} | locked: {result.get('_final_bias_locked')} | analysis_id: {result.get('analysis_id', 'N/A')}\n")
 
             return result
 
@@ -33388,6 +33396,10 @@ class OutputFormatter:
         # LECTURER FIX v10: Tampilkan analysis_id untuk tracking
         analysis_id = result.get('analysis_id', 'N/A')
         
+        # ✅ SOLUSI KONSISTENSI: Gunakan bias dari _final_bias_locked jika ada
+        # Ini memastikan bias yang dicetak sama dengan yang sudah di-lock setelah arbitrate_final_decision
+        bias = result.get("_final_bias_locked", result.get("bias", "NEUTRAL"))
+        
         print("="*80)
         print(f"🔥 {result.get('symbol', 'UNKNOWN')} @ {result.get('timestamp', '')}")
         print(f"💰 Price: ${result.get('price', 0):.4f}")
@@ -33395,7 +33407,6 @@ class OutputFormatter:
         print("="*80)
 
         print(f"\n{'='*40}")
-        bias = result.get('bias', 'NEUTRAL')
         bias_color = "🟢" if bias == "LONG" else "🔴" if bias == "SHORT" else "🟡"
         conf = result.get('confidence', 'MEDIUM')
         conf_icon = {"ABSOLUTE": "⚡⚡⚡", "HIGH": "🔥🔥🔥", "MEDIUM": "🔥🔥", "LOW": "🔥"}.get(conf, "🔥")
