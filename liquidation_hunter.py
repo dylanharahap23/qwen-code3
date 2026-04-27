@@ -10565,6 +10565,21 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
     votes = {"LONG": 0.0, "SHORT": 0.0}
     context = result
     
+    # ========== FIX 2: BAIT VACUUM PENALTY (Saran Dosen) ==========
+    market_phase_vote = result.get("market_phase", "UNKNOWN")
+    volume_ratio_vote = result.get("volume_ratio", 1.0)
+    down_energy_vote = result.get("down_energy", 0.0)
+    up_energy_vote = result.get("up_energy", 0.0)
+    
+    if market_phase_vote == "BAIT" and volume_ratio_vote < 0.5:
+        if down_energy_vote < 0.01 and up_energy_vote > 0:
+            # Vacuum di BAIT phase dengan volume rendah = jebakan HFT
+            votes["LONG"] = 0.0
+            votes["SHORT"] += 5.0
+            reasons.append("BAIT_VACUUM_PENALTY: vacuum dalam low volume = fake")
+            # Tandai agar tidak ada vote tambahan dari vacuum nanti
+            result["_bait_vacuum_penalty_applied"] = True
+    
     # ========== LECTURER FIX: WEIGHTED CONFLICT RESOLUTION FOR EXTREME RSI ==========
     # Weighted conflict resolution untuk kasus RSI ekstrem vs exchange risk
     rsi6 = result.get("rsi6", 50)
@@ -10705,7 +10720,11 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
         ofi_bias = context.get("ofi_bias", "NEUTRAL")
         ofi_strength = context.get("ofi_strength", 0.0)
         agg_val = context.get("agg", 0.5)
-        if ofi_bias == "SHORT" and ofi_strength > 0.5 and agg_val < 0.4:
+        # ========== FIX 2: Cek apakah BAIT VACUUM PENALTY sudah diterapkan ==========
+        if result.get("_bait_vacuum_penalty_applied"):
+            # Sudah di-handle oleh BAIT VACUUM PENALTY, jangan tambah vote LONG lagi
+            pass
+        elif ofi_bias == "SHORT" and ofi_strength > 0.5 and agg_val < 0.4:
             # Sinyal jual terlalu kuat, vacuum tidak reliable
             votes["SHORT"] += 6.0
             reasons.append("VACUUM OVERRULED BY STRONG SELL PRESSURE")
@@ -33703,6 +33722,19 @@ class BinanceAnalyzer:
 
             # ========== GREEKS FINAL SCREENER INTEGRATION ==========
             result = greeks_final_screen(result)
+
+            # ========== FIX 3: Greeks Vega di BAIT Phase tidak boleh unlock (Saran Dosen) ==========
+            if result.get("greeks_vega_active", False) and result.get("market_phase") == "BAIT":
+                # Vega spike di BAIT phase = volatilitas palsu untuk memancing retail
+                # Greeks tidak boleh override ke arah yang berlawanan dengan fade
+                result["greeks_override"] = False
+                result["greeks_override_allowed"] = False
+                # Tambahkan informasi ke reason
+                current_reason = result.get("reason", "")
+                result["reason"] = f"[GREEKS_BAIT_VEGA_BLOCKED] Vega aktif di BAIT phase = jebakan, override ditolak. {current_reason}"
+                # Turunkan confidence jika perlu
+                if result.get("confidence") == "ABSOLUTE":
+                    result["confidence"] = "HIGH"
 
             # ========== GAMMA SPOOFING DETECTOR (setelah Greeks) ==========
             # CATATAN: Detector ini sekarang HANYA menambah flag, tidak mengubah bias langsung
