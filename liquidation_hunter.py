@@ -10395,18 +10395,21 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
     squeeze_locked = result.get("_squeeze_validity_gate_triggered", False)
     liq_absolute = result.get("_liq_absolute_lock", False)
 
+    # Initialize variables that may be used regardless of gate locks
+    exchange_risk_score = result.get("exchange_risk_score", 0)
+    exchange_safe = result.get("exchange_safe_direction", "NEUTRAL")
+    greeks_bias = result.get("greeks_bias", "NEUTRAL")
+    rsi6_val = result.get("rsi6", 50.0)
+    short_liq = result.get("short_liq", 99.0)
+    delta_exposure = result.get("greeks_delta_exposure", 0.0)
+    is_genuine_squeeze = False
+
     if hawkes_locked or squeeze_locked or liq_absolute:
         # Skip exchange hard block, hormati gate yang lebih tinggi
         reasons.append("[EXCHANGE_BLOCK_SKIPPED] Higher priority gate already locked")
         # JANGAN return, lanjut ke proses lain
     else:
-        exchange_risk_score = result.get("exchange_risk_score", 0)
-        exchange_safe = result.get("exchange_safe_direction", "NEUTRAL")
-        greeks_bias = result.get("greeks_bias", "NEUTRAL")
         rsi14_val = result.get("rsi14", 50.0)
-        rsi6_val = result.get("rsi6", 50.0)
-        short_liq = result.get("short_liq", 99.0)
-        delta_exposure = result.get("greeks_delta_exposure", 0.0)
         up_energy_val = result.get("up_energy", 0.0)
         
         # 🛡️ PERBAIKAN 2: Exchange Risk Score Dinamis (Anti-Manipulasi Threshold)
