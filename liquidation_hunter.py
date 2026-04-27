@@ -24129,6 +24129,18 @@ class BinanceAnalyzer:
         
         # LECTURER FIX: Atomic snapshot state
         self._last_snapshot = None
+        
+        # ========== HAWKES PROCESS PARAMETERS ==========
+        self.hawkes_mu = 0.05          # baseline intensity (event/detik)
+        self.hawkes_alpha = 0.3        # jump size
+        self.hawkes_beta = 0.5         # decay rate (1/detik)
+        self.hawkes_R = 0.0            # recursive sum e^(-beta*(t-t_i))
+        self.hawkes_last_t = time.time()
+        self.hawkes_intensity = self.hawkes_mu
+        self.hawkes_branching = 0.0
+        
+        # Tambahkan storage untuk trade timestamps
+        self.hawkes_trade_times = []   # list of timestamps
 
     def __del__(self):
         if hasattr(self, 'ws') and self.ws is not None:
@@ -24204,6 +24216,41 @@ class BinanceAnalyzer:
         if abs(change_5m) > 8.0:
             return True
         return False
+
+    def update_hawkes(self, trades: List[Dict]):
+        """Update Hawkes intensity berdasarkan trade timestamps."""
+        now = time.time()
+        
+        # Ambil timestamp dari trades (dalam detik)
+        new_times = []
+        for t in trades:
+            # Binance trade format: 'T' = trade time in ms
+            trade_time = t.get('T', 0)
+            if trade_time:
+                new_times.append(float(trade_time) / 1000.0)
+        
+        if not new_times:
+            return
+        
+        # Decay existing R
+        dt = now - self.hawkes_last_t
+        self.hawkes_R *= (2.718281828 ** (-self.hawkes_beta * dt))
+        
+        # Add new events (gunakan rata-rata waktu baru) -> sebenarnya harus sequential
+        # Untuk efisiensi, kita gunakan pendekatan: tambahkan alpha untuk setiap trade yang terjadi
+        # setelah last update, dengan decay sesuai selisih waktu dari last_t
+        for t_i in new_times:
+            if t_i > self.hawkes_last_t:
+                d = t_i - self.hawkes_last_t
+                self.hawkes_R *= (2.718281828 ** (-self.hawkes_beta * d))
+                self.hawkes_R += 1.0
+                self.hawkes_last_t = t_i
+        
+        # Hitung intensity
+        self.hawkes_intensity = self.hawkes_mu + self.hawkes_alpha * self.hawkes_R
+        
+        # Update branching ratio
+        self.hawkes_branching = self.hawkes_alpha / self.hawkes_beta
 
     def _validate_gamma_execution(self, result: dict) -> dict:
         """
@@ -30437,6 +30484,10 @@ class BinanceAnalyzer:
                 ws_order_book = ws_data["order_book"]
 
             trades = ws_trades if ws_trades else (trades_rest or [])
+            
+            # Update Hawkes Process
+            self.update_hawkes(trades)
+            
             if ws_order_book and ws_order_book.get("bids"):
                 order_book = ws_order_book
 
@@ -33517,7 +33568,12 @@ class BinanceAnalyzer:
             "position_multiplier": 1.0,
             # Adversarial Rotation fields (akan diisi oleh analyze() jika ada data)
             "rotation_risk": None,
-            "rotation_consecutive": 0
+            "rotation_consecutive": 0,
+            # Hawkes Process fields
+            "hawkes_intensity": round(self.hawkes_intensity, 4),
+            "hawkes_branching": round(self.hawkes_branching, 4),
+            "hawkes_R": round(self.hawkes_R, 4),
+            "hawkes_baseline": self.hawkes_mu
         }
 
         return result
@@ -33550,7 +33606,12 @@ class BinanceAnalyzer:
             "position_multiplier": 1.0,
             # Adversarial Rotation fields (not applicable for latency result)
             "rotation_risk": None,
-            "rotation_consecutive": 0
+            "rotation_consecutive": 0,
+            # Hawkes Process fields
+            "hawkes_intensity": round(self.hawkes_intensity, 4),
+            "hawkes_branching": round(self.hawkes_branching, 4),
+            "hawkes_R": round(self.hawkes_R, 4),
+            "hawkes_baseline": self.hawkes_mu
         }
         return result
 
