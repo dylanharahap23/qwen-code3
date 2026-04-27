@@ -128,19 +128,81 @@ class PostSqueezeExhaustionDetector:
         gamma_executing = data.get("greeks_gamma_executing", False)
         ofi_bias = data.get("ofi_bias", "NEUTRAL")
 
-        # Syarat exhaustion: sudah bergerak >7%, volume rendah, OBV tidak konfirmasi, aggressor lemah
-        if (change_5m > 7.0 and
-            volume_ratio < 0.7 and
-            obv_trend in ("NEUTRAL", "NEGATIVE_EXTREME") and
-            agg < 0.4 and
-            not gamma_executing and
-            ofi_bias == "SHORT"):
+        # Hitung exhaustion score (6 sinyal, butuh minimal 4 untuk block, 3 untuk warning)
+        moved_far = change_5m > 7.0
+        low_vol = volume_ratio < 0.7
+        obv_weak = obv_trend in ("NEUTRAL", "NEGATIVE", "NEGATIVE_EXTREME")
+        flow_weak = agg < 0.4
+        gamma_dead = not gamma_executing
+        ofi_bearish = ofi_bias == "SHORT"
+        
+        exhaustion_score = sum([moved_far, low_vol, obv_weak, flow_weak, gamma_dead, ofi_bearish])
+        
+        # Relax kondisi: score >= 3 sudah warning, >= 4 untuk block override
+        if exhaustion_score >= 4:
+            new_bias = "SHORT" if data.get("bias") == "LONG" else "LONG"
             return {
                 "override": True,
-                "new_bias": "SHORT",
-                "reason": "POST_SQUEEZE_EXHAUSTION: move sudah terjadi, fuel habis, reversal imminent"
+                "new_bias": new_bias,
+                "reason": f"POST_SQUEEZE_EXHAUSTION (score={exhaustion_score}/6): move sudah terjadi, fuel habis, reversal imminent",
+                "score": exhaustion_score
             }
-        return {"override": False}
+        elif exhaustion_score >= 3:
+            return {
+                "override": False,
+                "warning": True,
+                "reason": f"POST_SQUEEZE_EXHAUSTION WARNING (score={exhaustion_score}/6): waspada reversal",
+                "score": exhaustion_score
+            }
+        return {"override": False, "score": exhaustion_score}
+
+
+# ================= POST-KILL FOLLOW TIMER =================
+class PostKillFollowTimer:
+    """
+    Setelah kill phase selesai, tunggu konfirmasi sebelum switch arah.
+    Mencegah masuk di arah kill yang sudah selesai.
+    Digunakan untuk handle kasus seperti DAMUSDT di mana price perlu konfirmasi setelah kill.
+    """
+    def __init__(self):
+        self.kill_events = {}  # {symbol: {time, direction, price}}
+    
+    def register_kill(self, symbol: str, kill_direction: str, price: float):
+        """Catat kill event untuk tracking."""
+        self.kill_events[symbol] = {
+            "time": time.time(),
+            "direction": kill_direction,
+            "entry_price": price,
+            "confirmed": False
+        }
+    
+    def should_follow(self, symbol: str, current_price: float) -> dict:
+        """
+        Cek apakah sudah saatnya follow arah kill berdasarkan waktu atau price movement.
+        Returns dict dengan key 'follow' (bool), 'bias' (optional), 'reason' (str)
+        """
+        if symbol not in self.kill_events:
+            return {"follow": False, "reason": "NO_KILL_EVENT"}
+        
+        event = self.kill_events[symbol]
+        age = time.time() - event["time"]
+        
+        # Timeout: 90 detik tanpa konfirmasi → reset
+        if age > 90:
+            del self.kill_events[symbol]
+            return {"follow": False, "reason": "TIMEOUT"}
+        
+        # Price sudah bergerak searah kill: konfirmasi
+        price_change = (current_price - event["entry_price"]) / event["entry_price"] * 100
+        
+        if event["direction"] == "LONG" and price_change > 1.5:
+            del self.kill_events[symbol]
+            return {"follow": True, "bias": "LONG", "reason": f"Post-kill LONG confirmed ({price_change:.1f}%)"}
+        if event["direction"] == "SHORT" and price_change < -1.5:
+            del self.kill_events[symbol]
+            return {"follow": True, "bias": "SHORT", "reason": f"Post-kill SHORT confirmed ({price_change:.1f}%)"}
+        
+        return {"follow": False, "reason": f"Waiting confirmation (age={age:.0f}s, Δ={price_change:.1f}%)"}
 
 
 # ================= HAWKES LIQUIDATION PREDICTOR =================
@@ -155,14 +217,14 @@ class HawkesLiquidationPredictor:
         self.mu_S = 0.02
 
         # Self-excitation
-        self.alpha_LL = 0.6
-        self.alpha_SS = 0.6
+        self.alpha_LL = 0.75
+        self.alpha_SS = 0.75
 
         # Cross-excitation
         self.alpha_LS = 0.3
         self.alpha_SL = 0.3
 
-        self.beta = 10.0          # decay rate (1/detik)
+        self.beta = 1.25          # decay rate (1/detik) - diturunkan dari 10.0 agar branching ratio realistis
         self.t_last = time.time()
 
         # Recursive R (sub‑milidetik update)
@@ -220,7 +282,7 @@ def is_post_squeeze_exhausted(result: dict) -> bool:
     """
     Cek apakah short squeeze sudah exhausted (selesai) dan akan reversal.
     Digunakan untuk membatalkan sinyal LONG yang terlambat.
-    (Legacy function - gunakan PostSqueezeExhaustionDetector.detect() untuk logic baru)
+    (Legacy function - gunakan PostSqueezeExhaustionDetector.detect() untuk logic baru yang lebih sensitif)
     """
     change_5m = abs(result.get("change_5m", 0))
     volume_ratio = result.get("volume_ratio", 1.0)
@@ -237,9 +299,9 @@ def is_post_squeeze_exhausted(result: dict) -> bool:
     gamma_dead = not gamma_executing               # tidak ada follow institusi
     ofi_bearish = ofi_bias == "SHORT"              # order flow sudah berbalik
 
-    # Hitung skor exhaustion (min 4 dari 6)
+    # Hitung skor exhaustion (min 4 dari 6) - RELAXED dari 4 ke 3 untuk sensitivitas lebih tinggi
     exhaustion_score = sum([moved_far, low_vol, obv_weak, flow_weak, gamma_dead, ofi_bearish])
-    return exhaustion_score >= 4
+    return exhaustion_score >= 3  # Diturunkan dari 4 ke 3
 
 
 # ================= MARKET PHASE DETECTOR =================
@@ -11340,6 +11402,95 @@ def safe_div(a, b, default=1.0):
         return a / b
     except:
         return default
+
+
+# ================= HAWKES SQUEEZE VALIDITY GATE =================
+
+def hawkes_squeeze_validity_gate(result: dict, hawkes_predictor) -> tuple:
+    """
+    Gate paling awal sebelum PostSqueeze (priority -31500).
+    Cek apakah squeeze signal masih valid atau sudah exhausted/terlambat.
+    
+    Returns: (result_dict, gate_triggered_bool)
+    """
+    bias = result.get("bias")
+    change_5m = abs(result.get("change_5m", 0))
+    volume_ratio = result.get("volume_ratio", 1.0)
+    gamma_executing = result.get("greeks_gamma_executing", False)
+    agg = result.get("agg", 0.5)
+    obv_trend = result.get("obv_trend", "NEUTRAL")
+    
+    # Hitung squeeze validity score (max 10)
+    score = 0
+    if change_5m < 5.0:      score += 2   # belum terlalu jauh
+    if volume_ratio > 1.2:   score += 2   # volume konfirmasi
+    if gamma_executing:      score += 3   # institusi ikut
+    if agg > 0.6:            score += 2   # aggressor kuat
+    if "POSITIVE" in obv_trend: score += 1  # OBV konfirmasi
+    
+    t_now = time.time()
+    long_dist = result.get("long_liq", 99) / 100.0
+    short_dist = result.get("short_liq", 99) / 100.0
+    prediction = hawkes_predictor.predict_who_dies_first(t_now, long_dist, short_dist)
+    
+    # Jika LONG signal tapi sudah terlambat atau Hawkes contradict
+    if bias == "LONG":
+        already_too_late = change_5m > 7.0 and score < 5
+        hawkes_contradict = (
+            prediction["who_dies_first"] == "LONG" and 
+            prediction["confidence"] > 0.10  # threshold lebih sensitif
+        )
+        
+        if already_too_late or hawkes_contradict:
+            reason_parts = []
+            if already_too_late:
+                reason_parts.append(f"move={change_5m:.1f}% sudah terlalu jauh, score={score}/10")
+            if hawkes_contradict:
+                reason_parts.append(
+                    f"Hawkes: LONG dies first (p={prediction['prob_long_dies']:.2f}, "
+                    f"λ_L={prediction['lambda_long']:.4f})"
+                )
+            
+            result["bias"] = "SHORT"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = -31500
+            result["entry_allowed"] = True
+            result["reason"] = f"[HAWKES SQUEEZE INVALID] {' | '.join(reason_parts)} → FADE LONG, force SHORT"
+            result["hawkes_squeeze_score"] = score
+            result["_squeeze_validity_gate_triggered"] = True
+            return result, True  # True = gate triggered
+    
+    # Symmetric untuk SHORT
+    if bias == "SHORT":
+        already_too_late = change_5m > 7.0 and score < 5
+        hawkes_contradict = (
+            prediction["who_dies_first"] == "SHORT" and 
+            prediction["confidence"] > 0.10
+        )
+        
+        if already_too_late or hawkes_contradict:
+            reason_parts = []
+            if already_too_late:
+                reason_parts.append(f"move={change_5m:.1f}% sudah terlalu jauh, score={score}/10")
+            if hawkes_contradict:
+                reason_parts.append(
+                    f"Hawkes: SHORT dies first (p={prediction['prob_short_dies']:.2f}, "
+                    f"λ_S={prediction['lambda_short']:.4f})"
+                )
+            
+            result["bias"] = "LONG"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = -31500
+            result["entry_allowed"] = True
+            result["reason"] = f"[HAWKES SQUEEZE INVALID] {' | '.join(reason_parts)} → FADE SHORT, force LONG"
+            result["hawkes_squeeze_score"] = score
+            result["_squeeze_validity_gate_triggered"] = True
+            return result, True
+    
+    result["hawkes_squeeze_score"] = score
+    result["_squeeze_validity_gate_triggered"] = False
+    return result, False
+
 
 # ================= MACD DUEL LOGIC =================
 
@@ -24663,16 +24814,26 @@ class BinanceAnalyzer:
         rsi6_5m_val = rsi6_5m  # Sudah ada di atas, pastikan konsisten
         rsi14_val = rsi14  # Sudah ada di atas, pastikan konsisten
         
-        # ========== POST-SQUEEZE EXHAUSTION GATE (PALING AWAL - PRIORITY -31000) ==========
+        # ========== HAWKES SQUEEZE VALIDITY GATE (PALING AWAL - PRIORITY -31500) ==========
+        # Cek SEBELUM PostSqueeze, SEBELUM unblock
+        result, squeeze_invalid = hawkes_squeeze_validity_gate(result, self.hawkes_predictor)
+        if squeeze_invalid:
+            return result
+        # ========== END HAWKES SQUEEZE VALIDITY GATE ==========
+        
+        # ========== POST-SQUEEZE EXHAUSTION GATE (PRIORITY -31000) ==========
         # Batalkan sinyal LONG jika squeeze sudah selesai dan akan reversal
         exhaustion = PostSqueezeExhaustionDetector.detect(result)
         if exhaustion["override"]:
+            result["_exhaustion_gate_triggered"] = True
             result["bias"] = exhaustion["new_bias"]
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = -31000
             result["reason"] = f"[POST SQUEEZE EXHAUSTION] {exhaustion['reason']} | " + result.get("reason", "")
             result["entry_allowed"] = True
             return result
+        elif exhaustion.get("warning"):
+            result["_exhaustion_warning"] = True
         # ========== END POST-SQUEEZE GATE ==========
         
         # ========== LANGKAH 7 : PREP/BAIT PHASE HARD BLOCK ===========
@@ -30566,15 +30727,22 @@ class BinanceAnalyzer:
         # ========== PERSISTENCE FILTER (GABUNGAN DOSEN + POSITION HOLDING) ==========
         result = self._apply_persistence_filter(result)
         
-        # ========== PAKSA UNBLOCK SEMUA BLOKIRAN SEBELUM HAWKES ==========
-        # Ini akan mengembalikan bias ke original_bias jika awalnya LONG/SHORT
-        # Tidak peduli berapa banyak blok di tengah, semua akan ditembus
+        # ========== CONDITIONAL UNBLOCK (BUKAN PAKSA) ==========
+        # Hanya restore original_bias jika tidak ada gate yang triggered
+        _hawkes_blocked = result.get("_hawkes_gate_triggered", False)
+        _exhaustion_blocked = result.get("_exhaustion_gate_triggered", False)
+        _squeeze_invalid = result.get("_squeeze_validity_gate_triggered", False)
+        
         if original_bias in ("LONG", "SHORT"):
-            result["bias"] = original_bias
-            result["confidence"] = "ABSOLUTE"
-            result["entry_allowed"] = True
-            result["priority_level"] = -1  # reset priority
-            result["reason"] = "[UNBLOCKED] " + result.get("reason", "")
+            if not _hawkes_blocked and not _exhaustion_blocked and not _squeeze_invalid:
+                result["bias"] = original_bias
+                result["confidence"] = "ABSOLUTE"
+                result["entry_allowed"] = True
+                result["priority_level"] = -1  # reset priority
+                result["reason"] = "[CONDITIONAL UNLOCK] No critical override → restore original bias | " + result.get("reason", "")
+            else:
+                # Biarkan override tetap berlaku
+                result["reason"] = "[LOCKED BY GATE] Override aktif, original bias diabaikan | " + result.get("reason", "")
         
         # ========== HAWKES PROCESS GATE (SATU-SATUNYA BLOCK) ==========
         hawkes_intensity = result.get("hawkes_intensity", 0)
@@ -30612,15 +30780,15 @@ class BinanceAnalyzer:
         result["hawkes_lambda_long"] = prediction["lambda_long"]
         result["hawkes_lambda_short"] = prediction["lambda_short"]
 
-        # ── CASE 2: Hawkes CONTRADICT signal ──
-        if (result["bias"] == "LONG" and prediction["who_dies_first"] == "LONG" and prediction["confidence"] > 0.15):
+        # ── CASE 2: Hawkes CONTRADICT signal (threshold diturunkan ke 0.10 untuk sensitivitas lebih tinggi) ──
+        if (result["bias"] == "LONG" and prediction["who_dies_first"] == "LONG" and prediction["confidence"] > 0.10):
             result["bias"] = "SHORT"
             result["confidence"] = "ABSOLUTE"
             result["reason"] = f"[HAWKES OVERRIDE] LONG dies first despite squeeze signal → force SHORT. " + result.get("reason", "")
             result["entry_allowed"] = True
             return result
 
-        if (result["bias"] == "SHORT" and prediction["who_dies_first"] == "SHORT" and prediction["confidence"] > 0.15):
+        if (result["bias"] == "SHORT" and prediction["who_dies_first"] == "SHORT" and prediction["confidence"] > 0.10):
             result["bias"] = "LONG"
             result["confidence"] = "ABSOLUTE"
             result["reason"] = f"[HAWKES OVERRIDE] SHORT dies first despite dump signal → force LONG. " + result.get("reason", "")
@@ -30738,11 +30906,11 @@ class BinanceAnalyzer:
             # Deteksi event likuidasi dari perubahan long_liq dan short_liq
             if hasattr(self, 'last_long_liq') and hasattr(self, 'last_short_liq'):
                 if self.last_long_liq is not None and self.last_short_liq is not None:
-                    # Long liq menipis = beberapa long terlikuidasi
-                    if liq["long_dist"] < self.last_long_liq - 0.05:
+                    # Long liq menipis = beberapa long terlikuidasi (threshold 0.01% untuk sensitivitas lebih tinggi)
+                    if liq["long_dist"] < self.last_long_liq - 0.01:
                         self.hawkes_predictor.update_recursive(time.time(), 'LONG_LIQ')
-                    # Short liq menipis = beberapa short terlikuidasi
-                    if liq["short_dist"] < self.last_short_liq - 0.05:
+                    # Short liq menipis = beberapa short terlikuidasi (threshold 0.01% untuk sensitivitas lebih tinggi)
+                    if liq["short_dist"] < self.last_short_liq - 0.01:
                         self.hawkes_predictor.update_recursive(time.time(), 'SHORT_LIQ')
 
             self.last_long_liq = liq["long_dist"]
