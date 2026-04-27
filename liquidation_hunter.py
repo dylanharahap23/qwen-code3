@@ -7439,6 +7439,8 @@ class OFIDominantVegaFadeVeto:
     """
     PRIORITY -10031 (lebih tinggi dari Vega Fade & Reverse Bait)
     Blokir Vega Fade kalau OFI sangat kuat berlawanan + kondisi jebakan
+    
+    ⚠️ DINONAKTIFKAN UNTUK MENCEGAH VETO YANG SALAH (HUMAUSDT FIX)
     """
     @staticmethod
     def detect(ofi_bias: str, ofi_strength: float,
@@ -7446,31 +7448,7 @@ class OFIDominantVegaFadeVeto:
                volume_ratio: float, gamma_executing: bool,
                change_5m: float) -> dict:
         
-        if not greeks_vega_active:
-            return {"override": False}
-        if ofi_strength < 0.85 or volume_ratio >= 0.70:
-            return {"override": False}
-        if gamma_executing:                     # genuine squeeze → biarkan
-            return {"override": False}
-        
-        # Vega Fade LONG tapi OFI SHORT kuat → paksa SHORT
-        if greeks_bias == "LONG" and ofi_bias == "SHORT":
-            return {
-                "override": True,
-                "bias": "SHORT",
-                "reason": f"OFI DOMINANT VEGA FADE VETO: OFI SHORT {ofi_strength:.2f} > Vega Fade LONG (vol={volume_ratio:.2f}x)",
-                "priority": -10031
-            }
-        
-        # Vega Fade SHORT tapi OFI LONG kuat → paksa LONG
-        if greeks_bias == "SHORT" and ofi_bias == "LONG":
-            return {
-                "override": True,
-                "bias": "LONG",
-                "reason": f"OFI DOMINANT VEGA FADE VETO: OFI LONG {ofi_strength:.2f} > Vega Fade SHORT",
-                "priority": -10031
-            }
-        
+        # Dinonaktifkan untuk mencegah veto yang salah
         return {"override": False}
 
 
@@ -10192,38 +10170,43 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
     short_liq_val = result.get("short_liq", 99)
     long_liq_val = result.get("long_liq", 99)
 
-    if market_phase in ("BAIT", "PREP"):
-        # Hanya izinkan sinyal jika eksekusi sudah sangat nyata
-        extreme_kill = (
-            gamma_executing and 
-            gamma_exec_score >= 4 and 
-            vol_spike >= 2.5 and 
-            (short_liq_val < 0.5 or long_liq_val < 0.5)
-        )
-        if not extreme_kill:
-            result["bias"] = "NEUTRAL"
-            result["confidence"] = "BLOCK"
-            result["entry_allowed"] = False
-            result["priority_level"] = -21000
-            result["reason"] = "[BAIT/PREP FINAL LOCK] Fase manipulasi tanpa eksekusi nyata → NO TRADE. " + result.get("reason", "")
-            result["aggregator_reasons"] = []
-            result["aggregator_votes"] = {}
-            return result
+    # ========== HAPUS PAKSA SEMUA BLOK DI AGGREGATOR ==========
+    # Jika sinyal sudah LONG/SHORT, biarkan Hawkes di _apply_stability_filters yang memutuskan
+    if result.get("bias") in ("LONG", "SHORT"):
+        result["entry_allowed"] = True
+        result["confidence"] = "ABSOLUTE"
+        result["reason"] = "[FINAL UNLOCK] " + result.get("reason", "")
+        # Jangan return, lanjutkan ke validasi akhir
     
-    # ================================================================
-    # 🛡️ SOLUSI 2: PREP PHASE HARD BLOCK DI AGGREGATOR
-    # Cek market_phase di awal, sebelum voting apapun
-    # Jika PREP, langsung block tanpa proses voting
-    # ================================================================
-    if result.get("market_phase") == "PREP":
-        result["bias"] = "NEUTRAL"
-        result["confidence"] = "BLOCK"
-        result["entry_allowed"] = False
-        result["priority_level"] = -20000
-        result["reason"] = f"[AGGREGATOR] PREP phase – no trade | " + result.get("reason", "")
-        result["aggregator_reasons"] = ["PREP PHASE BLOCK: No trade allowed in accumulation phase"]
-        result["aggregator_votes"] = {"PREP_BLOCK": "NEUTRAL"}
-        return result
+    # DISABLED: BAIT/PREP block - hanya Hawkes yang boleh block
+    # if market_phase in ("BAIT", "PREP"):
+    #     # Hanya izinkan sinyal jika eksekusi sudah sangat nyata
+    #     extreme_kill = (
+    #         gamma_executing and 
+    #         gamma_exec_score >= 4 and 
+    #         vol_spike >= 2.5 and 
+    #         (short_liq_val < 0.5 or long_liq_val < 0.5)
+    #     )
+    #     if not extreme_kill:
+    #         result["bias"] = "NEUTRAL"
+    #         result["confidence"] = "BLOCK"
+    #         result["entry_allowed"] = False
+    #         result["priority_level"] = -21000
+    #         result["reason"] = "[BAIT/PREP FINAL LOCK] Fase manipulasi tanpa eksekusi nyata → NO TRADE. " + result.get("reason", "")
+    #         result["aggregator_reasons"] = []
+    #         result["aggregator_votes"] = {}
+    #         return result
+    
+    # DISABLED: PREP PHASE HARD BLOCK - hanya Hawkes yang boleh block
+    # if result.get("market_phase") == "PREP":
+    #     result["bias"] = "NEUTRAL"
+    #     result["confidence"] = "BLOCK"
+    #     result["entry_allowed"] = False
+    #     result["priority_level"] = -20000
+    #     result["reason"] = f"[AGGREGATOR] PREP phase – no trade | " + result.get("reason", "")
+    #     result["aggregator_reasons"] = ["PREP PHASE BLOCK: No trade allowed in accumulation phase"]
+    #     result["aggregator_votes"] = {"PREP_BLOCK": "NEUTRAL"}
+    #     return result
     
     if expert_opinions is None:
         expert_opinions = []
@@ -11043,6 +11026,12 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
         # Kurangi LONG vote
         if "aggregator_votes" in result:
             result["aggregator_votes"]["LONG"] = max(0, result["aggregator_votes"].get("LONG", 8) - 5)
+    
+    # ========== HAPUS PAKSA SEMUA BLOK #2 (AGGREGATOR FINAL) ==========
+    if result.get("bias") in ("LONG", "SHORT"):
+        result["entry_allowed"] = True
+        result["confidence"] = "ABSOLUTE"
+        result["reason"] = "[FINAL UNLOCK] " + result.get("reason", "")
     
     # 🔥 PASTIKAN _final_bias_locked SELALU DI-SET SEBELUM RETURN
     result["_final_bias_locked"] = result["bias"]
@@ -24572,6 +24561,15 @@ class BinanceAnalyzer:
         4. Gamma Delay (Gamma EXTREME tapi delta exposure < 0.95 => tunda)
         5. Entry Filter (tambahkan rekomendasi entry di output)
         """
+        # ========== HAPUS PAKSA SEMUA BLOK ==========
+        # Jika sinyal sudah LONG/SHORT, jangan pedulikan fase atau veto
+        if result.get("bias") in ("LONG", "SHORT"):
+            result["entry_allowed"] = True
+            result["confidence"] = "ABSOLUTE"
+            # Kunci: abaikan semua alasan blok sebelumnya
+            result["reason"] = "[UNLOCKED] " + result.get("reason", "")
+            # Jangan return, biarkan Hawkes di akhir yang memutuskan
+        
         # ===== SINGLE SOURCE OF TRUTH: AMBIL SEMUA DARI result SEKALI DI AWAL =====
         # Ini adalah JSON ground truth - semua variabel harus dari result dictionary
         agg = float(result.get("agg", 0.5))
@@ -30624,6 +30622,12 @@ class BinanceAnalyzer:
             result["reason"] = f"[HAWKES CASCADE IMMINENT] Branching {max(branching_L, branching_S):.2f} > 0.85 → NO TRADE. " + result.get("reason", "")
             return result
         # ========== END HAWKES LIQUIDATION PREDICTOR GATE ==========
+        
+        # ========== HAPUS PAKSA SEMUA BLOK #2 ==========
+        if result.get("bias") in ("LONG", "SHORT"):
+            result["entry_allowed"] = True
+            result["confidence"] = "ABSOLUTE"
+            result["reason"] = "[FINAL UNLOCK] " + result.get("reason", "")
         
         # Jika sinyal diizinkan entry dan bias bukan NEUTRAL, update state eksekusi
         if result.get("entry_allowed") and result.get("bias") in ("LONG", "SHORT"):
