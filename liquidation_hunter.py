@@ -114,10 +114,40 @@ def validate_signal_consistency(result: dict) -> bool:
 
 
 # ================= POST-SQUEEZE EXHAUSTION DETECTOR =================
+class PostSqueezeExhaustionDetector:
+    """
+    Deteksi apakah squeeze sudah selesai dan harga akan reversal.
+    Digunakan untuk membalik sinyal LONG menjadi SHORT.
+    """
+    @staticmethod
+    def detect(data: dict) -> dict:
+        change_5m = abs(data.get("change_5m", 0))
+        volume_ratio = data.get("volume_ratio", 1.0)
+        obv_trend = data.get("obv_trend", "NEUTRAL")
+        agg = data.get("agg", 0.5)
+        gamma_executing = data.get("greeks_gamma_executing", False)
+        ofi_bias = data.get("ofi_bias", "NEUTRAL")
+
+        # Syarat exhaustion: sudah bergerak >7%, volume rendah, OBV tidak konfirmasi, aggressor lemah
+        if (change_5m > 7.0 and
+            volume_ratio < 0.7 and
+            obv_trend in ("NEUTRAL", "NEGATIVE_EXTREME") and
+            agg < 0.4 and
+            not gamma_executing and
+            ofi_bias == "SHORT"):
+            return {
+                "override": True,
+                "new_bias": "SHORT",
+                "reason": "POST_SQUEEZE_EXHAUSTION: move sudah terjadi, fuel habis, reversal imminent"
+            }
+        return {"override": False}
+
+
 def is_post_squeeze_exhausted(result: dict) -> bool:
     """
     Cek apakah short squeeze sudah exhausted (selesai) dan akan reversal.
     Digunakan untuk membatalkan sinyal LONG yang terlambat.
+    (Legacy function - gunakan PostSqueezeExhaustionDetector.detect() untuk logic baru)
     """
     change_5m = abs(result.get("change_5m", 0))
     volume_ratio = result.get("volume_ratio", 1.0)
@@ -24550,43 +24580,24 @@ class BinanceAnalyzer:
         rsi6_5m_val = rsi6_5m  # Sudah ada di atas, pastikan konsisten
         rsi14_val = rsi14  # Sudah ada di atas, pastikan konsisten
         
-        # ========== POST-SQUEEZE EXHAUSTION GATE ==========
+        # ========== POST-SQUEEZE EXHAUSTION GATE (PALING AWAL - PRIORITY -31000) ==========
         # Batalkan sinyal LONG jika squeeze sudah selesai dan akan reversal
-        current_bias = result.get("bias", "NEUTRAL")
-        phase = result.get("phase", "")
-        
-        if current_bias == "LONG" and "PROTECT_GENUINE_SHORT_SQUEEZE" in phase:
-            if is_post_squeeze_exhausted(result):
-                result["bias"] = "SHORT"
-                result["confidence"] = "ABSOLUTE"
-                result["priority_level"] = -31000
-                result["reason"] = (
-                    "[POST-SQUEEZE EXHAUSTION] Harga sudah naik >7% dengan volume rendah, "
-                    "OBV lemah, flow rendah, gamma mati, OFI sudah SHORT. "
-                    "Squeeze telah selesai, reversal dump imminent. Batalkan LONG, force SHORT. | "
-                    + result.get("reason", "")
-                )
-                result["entry_allowed"] = True
-                return result
+        exhaustion = PostSqueezeExhaustionDetector.detect(result)
+        if exhaustion["override"]:
+            result["bias"] = exhaustion["new_bias"]
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = -31000
+            result["reason"] = f"[POST SQUEEZE EXHAUSTION] {exhaustion['reason']} | " + result.get("reason", "")
+            result["entry_allowed"] = True
+            return result
         # ========== END POST-SQUEEZE GATE ==========
-        
-        # Hard rule tambahan: jangan LONG jika harga sudah naik >7% dan ofi sudah SHORT
-        if current_bias == "LONG":
-            change_5m_check = result.get("change_5m", 0)
-            volume_ratio_check = result.get("volume_ratio", 1.0)
-            ofi_bias_check = result.get("ofi_bias", "NEUTRAL")
-            if change_5m_check > 7.0 and volume_ratio_check < 0.8 and ofi_bias_check == "SHORT":
-                result["bias"] = "NEUTRAL"
-                result["confidence"] = "BLOCK"
-                result["entry_allowed"] = False
-                result["priority_level"] = -30900
-                result["reason"] = "[LATE SQUEEZE CHASE BLOCKED] Harga sudah naik >7%, volume rendah, OFI sudah SHORT. Jangan kejar. " + result.get("reason", "")
-                return result
         
         # ========== LANGKAH 7 : PREP/BAIT PHASE HARD BLOCK ===========
         # Prioritas -20000 (sangat tinggi), hanya dikalahkan oleh -10110 (Ultra-Low Vol Veto)
         # FIX 1: Perluas block untuk BAIT phase juga
-        if market_phase in ("PREP", "BAIT"):
+        # HAPUS: PREP/BAIT block dihapus sesuai instruksi dosen
+        # Hanya Hawkes Gate yang boleh block
+        # if market_phase in ("PREP", "BAIT"):
             # Hitung vol_spike
             vol_spike = latest_volume / volume_ma10 if volume_ma10 > 0 else 1.0
 
@@ -30471,6 +30482,20 @@ class BinanceAnalyzer:
 
         # ========== PERSISTENCE FILTER (GABUNGAN DOSEN + POSITION HOLDING) ==========
         result = self._apply_persistence_filter(result)
+        
+        # ========== HAWKES PROCESS GATE (SATU-SATUNYA BLOCK) ==========
+        hawkes_intensity = result.get("hawkes_intensity", 0)
+        hawkes_branching = result.get("hawkes_branching", 0)
+        hawkes_baseline = result.get("hawkes_baseline", 0.05)
+
+        if hawkes_branching > 0.85 or hawkes_intensity > 3 * hawkes_baseline:
+            result["bias"] = "NEUTRAL"
+            result["confidence"] = "BLOCK"
+            result["entry_allowed"] = False
+            result["priority_level"] = -5000
+            result["reason"] = f"[HAWKES GATE] Branching {hawkes_branching:.2f} / Intensity {hawkes_intensity:.3f} → pasar tidak stabil, NO TRADE. " + result.get("reason", "")
+            return result
+        # ========== END HAWKES GATE ==========
         
         # Jika sinyal diizinkan entry dan bias bukan NEUTRAL, update state eksekusi
         if result.get("entry_allowed") and result.get("bias") in ("LONG", "SHORT"):
