@@ -1153,7 +1153,7 @@ class HighUpEnergyFakePumpGuard:
     @staticmethod
     def detect(up_energy: float, down_energy: float, volume_ratio: float,
                change_5m: float, market_phase: str, short_liq: float,
-               long_liq: float) -> dict:
+               long_liq: float, funding_rate: float = 0.0) -> dict:
 
         if up_energy < 4.0 or down_energy > 0.01 or volume_ratio > 0.65:
             return {"override": False}
@@ -1161,17 +1161,30 @@ class HighUpEnergyFakePumpGuard:
             return {"override": False}
         if short_liq >= long_liq:
             return {"override": False}
-
-        return {
-            "override": True,
-            "bias": "SHORT",
-            "reason": (
-                f"HIGH UP-ENERGY FAKE PUMP: up_energy={up_energy:.2f}, "
-                f"vol={volume_ratio:.2f}x, short_liq lebih dekat -> "
-                f"HFT fake buy wall, FORCE SHORT"
-            ),
-            "priority": -30750
-        }
+        
+        # 🔥 BARU: Cek funding rate
+        if funding_rate < -0.002:   # funding negatif ekstrem (short crowded)
+            return {
+                "override": True,
+                "bias": "LONG",
+                "reason": (
+                    f"HIGH UP-ENERGY GENUINE SQUEEZE: up_energy={up_energy:.2f}, "
+                    f"funding={funding_rate:.4f} (<-0.002) → shorts trapped, "
+                    f"force LONG instead of SHORT"
+                ),
+                "priority": -30750   # priority sama
+            }
+        else:
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"HIGH UP-ENERGY FAKE PUMP: up_energy={up_energy:.2f}, "
+                    f"vol={volume_ratio:.2f}x, short_liq lebih dekat -> "
+                    f"HFT fake buy wall, FORCE SHORT"
+                ),
+                "priority": -30750
+            }
 
 
 class ProtectGenuineShortSqueezeGuard:
@@ -10377,10 +10390,15 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
     # -----------------------------------------------------------------
     # 0. EXCHANGE RISK HARD BLOCK (dengan threshold dinamis, Priority -30000)
     # -----------------------------------------------------------------
-    # 🔥 FIX: Jangan jalankan jika LIQ ABSOLUTE sudah lock
-    if result.get("_liq_absolute_lock"):
-        # Skip exchange hard block, biarkan LIQ ABSOLUTE menang
-        pass
+    # 🔥 FIX 1: JANGAN override jika Hawkes atau Squeeze gate sudah lock
+    hawkes_locked = result.get("_hawkes_gate_triggered", False)
+    squeeze_locked = result.get("_squeeze_validity_gate_triggered", False)
+    liq_absolute = result.get("_liq_absolute_lock", False)
+
+    if hawkes_locked or squeeze_locked or liq_absolute:
+        # Skip exchange hard block, hormati gate yang lebih tinggi
+        reasons.append("[EXCHANGE_BLOCK_SKIPPED] Higher priority gate already locked")
+        # JANGAN return, lanjut ke proses lain
     else:
         exchange_risk_score = result.get("exchange_risk_score", 0)
         exchange_safe = result.get("exchange_safe_direction", "NEUTRAL")
@@ -10565,7 +10583,28 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
     votes = {"LONG": 0.0, "SHORT": 0.0}
     context = result
     
-    # ========== FIX 2: BAIT VACUUM PENALTY (Saran Dosen) ==========
+    # ========== FIX 2: BAIT VACUUM PENALTY (dengan context awareness) ==========
+    def classify_vacuum_type(data: dict) -> str:
+        rsi5m = data.get("rsi6_5m", 50)
+        change_5m_abs = abs(data.get("change_5m", 0))
+        funding = data.get("funding_rate", 0)
+        regime = data.get("market_regime", "")
+        rsi6 = data.get("rsi6", 50)
+        volume_ratio_local = data.get("volume_ratio", 1.0)
+        
+        # Tipe B: Akumulasi genuine (DAMUSDT 15:42)
+        if rsi5m < 15 and change_5m_abs < 2.0 and regime == "ACCUMULATION":
+            # Funding trap: shorts bayar mahal -> sinyal kuat LONG
+            if funding > 0.0015:
+                return "GENUINE_ACCUMULATION_FUNDING_TRAP"
+            return "GENUINE_ACCUMULATION"
+        
+        # Tipe A: Fake pump (overbought + sudah naik)
+        if rsi6 > 65 and change_5m_abs > 3.0:
+            return "FAKE_PUMP"
+        
+        return "AMBIGUOUS"
+    
     market_phase_vote = result.get("market_phase", "UNKNOWN")
     volume_ratio_vote = result.get("volume_ratio", 1.0)
     down_energy_vote = result.get("down_energy", 0.0)
@@ -10573,12 +10612,42 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
     
     if market_phase_vote == "BAIT" and volume_ratio_vote < 0.5:
         if down_energy_vote < 0.01 and up_energy_vote > 0:
-            # Vacuum di BAIT phase dengan volume rendah = jebakan HFT
-            votes["LONG"] = 0.0
-            votes["SHORT"] += 5.0
-            reasons.append("BAIT_VACUUM_PENALTY: vacuum dalam low volume = fake")
-            # Tandai agar tidak ada vote tambahan dari vacuum nanti
-            result["_bait_vacuum_penalty_applied"] = True
+            # Klasifikasikan tipe vacuum
+            vacuum_type = classify_vacuum_type(result)
+            
+            if vacuum_type == "FAKE_PUMP":
+                votes["LONG"] = 0.0
+                votes["SHORT"] += 5.0
+                reasons.append("BAIT_VACUUM: FAKE_PUMP detected → SHORT")
+                result["_bait_vacuum_penalty_applied"] = True
+                
+            elif vacuum_type == "GENUINE_ACCUMULATION":
+                # Jangan beri penalty, batalkan SHORT
+                result["_bait_vacuum_cancelled"] = True
+                reasons.append("BAIT_VACUUM: GENUINE_ACCUMULATION detected → skip penalty")
+                # Tidak ada perubahan votes
+                
+            elif vacuum_type == "GENUINE_ACCUMULATION_FUNDING_TRAP":
+                # Paksa LONG (shorts akan di-squeeze)
+                votes["LONG"] += 8.0
+                votes["SHORT"] = 0.0
+                reasons.append("BAIT_VACUUM: FUNDING_TRAP for shorts → force LONG")
+                result["_bait_vacuum_funding_trap"] = True
+                
+            else:  # AMBIGUOUS
+                # Tidak cukup sinyal, block entry
+                result["entry_allowed"] = False
+                result["confidence"] = "BLOCK"
+                reasons.append("BAIT_VACUUM: AMBIGUOUS → NO TRADE")
+    
+    # ========== TAMBAHAN: ACCUMULATION regime = jangan BAIT SHORT ==========
+    if result.get("market_regime") == "ACCUMULATION" and market_phase_vote == "BAIT":
+        # Jika ada BAIT_VACUUM_PENALTY yang mencoba SHORT, batalkan
+        if result.get("_bait_vacuum_penalty_applied") and result.get("bias") == "SHORT":
+            result["bias"] = "NEUTRAL"
+            result["_bait_vacuum_penalty_applied"] = False
+            reasons.append("ACCUMULATION regime overrides BAIT_VACUUM → NO TRADE")
+            result["entry_allowed"] = False
     
     # ========== LECTURER FIX: WEIGHTED CONFLICT RESOLUTION FOR EXTREME RSI ==========
     # Weighted conflict resolution untuk kasus RSI ekstrem vs exchange risk
@@ -31205,7 +31274,8 @@ class BinanceAnalyzer:
                             change_5m=change_5m,
                             market_phase=provisional_market_phase,
                             short_liq=liq["short_dist"],
-                            long_liq=liq["long_dist"]
+                            long_liq=liq["long_dist"],
+                            funding_rate=funding_rate or 0.0
                         )
                         
                         # ===== KATUSUSDT FIX: Funding-Led Squeeze Shakeout Guard (Priority -30800) =====
