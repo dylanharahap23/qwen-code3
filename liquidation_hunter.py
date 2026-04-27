@@ -10225,974 +10225,239 @@ def _greeks_absolute_score(
 # ========== DECISION AGGREGATOR (Menggantikan Priority Chaos) ==========
 def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict:
     """
-    Menggantikan sistem priority-based override.
-    Mengumpulkan suara dari semua detector yang aktif dan memutuskan
-    berdasarkan bobot dan hirarki kepercayaan.
-    
-    Integrated with 7 Lecturer Rules for adversarial pattern protection.
+    KOMPANDAN ABSOLUT v2 (Hybrid Dosen + Detektor Existing)
+    ---------------------------------------------------------
+    Lapisan tertinggi (Physics → Greeks → Liq Absolute) hanya memutuskan
+    jika kondisi SUPER KETAT terpenuhi. Jika tidak, semua detektormu
+    tetap berperan sebagai penasihat lewat voting yang sudah disempurnakan.
     """
-    # ================================================================
-    # 🛡️ LANGKAH 2 – BAIT / PREP PHASE FINAL LOCK
-    # Sebelum semua voting, letakkan blok ini untuk memastikan sinyal
-    # tidak akan keluar dari fase BAIT/PREP kecuali ada konfirmasi eksekusi nyata
-    # ================================================================
-    market_phase = result.get("market_phase", "UNKNOWN")
-    gamma_executing = result.get("greeks_gamma_executing", False)
-    gamma_exec_score = result.get("greeks_gamma_exec_score", 0)
-    latest_volume = result.get("latest_volume", 0)
-    volume_ma10 = result.get("volume_ma10", 1)
-    vol_spike = latest_volume / max(volume_ma10, 1)
-    short_liq_val = result.get("short_liq", 99)
-    long_liq_val = result.get("long_liq", 99)
+    # ========== FUNGSI PEMBANTU (biar rapi) =================================
+    def _is_no_trade_zone(res: dict) -> bool:
+        """Blokir entry jika PREP/ACCUMULATION HIGH RISK tanpa konfirmasi gila."""
+        phase = res.get("market_phase", "UNKNOWN")
+        regime = res.get("market_regime", "UNKNOWN")
+        risk = res.get("regime_risk", "UNKNOWN")
+        # PREP phase = absolut NO TRADE kecuali ada gamma execute skor 4+ dan vol spike
+        if phase == "PREP":
+            exec_score = res.get("greeks_gamma_exec_score", 0)
+            vol_spike = (res.get("latest_volume", 0) / max(res.get("volume_ma10", 1), 1))
+            if not (res.get("greeks_gamma_executing") and exec_score >= 4 and vol_spike >= 2.5):
+                return True
+        # ACCUMULATION + HIGH RISK -> jangan entry
+        if regime == "ACCUMULATION" and risk == "HIGH_RISK":
+            # Kecuali ada sinyal kill yang sudah executing & short_liq < 0.5%
+            if not (res.get("greeks_gamma_executing") and res.get("short_liq", 99) < 0.5):
+                return True
+        return False
 
-    # ========== HAPUS PAKSA SEMUA BLOK DI AGGREGATOR ==========
-    # Jika sinyal sudah LONG/SHORT, biarkan Hawkes di _apply_stability_filters yang memutuskan
-    if result.get("bias") in ("LONG", "SHORT"):
-        result["entry_allowed"] = True
-        result["confidence"] = "ABSOLUTE"
-        result["reason"] = "[FINAL UNLOCK] " + result.get("reason", "")
-        # Jangan return, lanjutkan ke validasi akhir
-    
-    # DISABLED: BAIT/PREP block - hanya Hawkes yang boleh block
-    # if market_phase in ("BAIT", "PREP"):
-    #     # Hanya izinkan sinyal jika eksekusi sudah sangat nyata
-    #     extreme_kill = (
-    #         gamma_executing and 
-    #         gamma_exec_score >= 4 and 
-    #         vol_spike >= 2.5 and 
-    #         (short_liq_val < 0.5 or long_liq_val < 0.5)
-    #     )
-    #     if not extreme_kill:
-    #         result["bias"] = "NEUTRAL"
-    #         result["confidence"] = "BLOCK"
-    #         result["entry_allowed"] = False
-    #         result["priority_level"] = -21000
-    #         result["reason"] = "[BAIT/PREP FINAL LOCK] Fase manipulasi tanpa eksekusi nyata → NO TRADE. " + result.get("reason", "")
-    #         result["aggregator_reasons"] = []
-    #         result["aggregator_votes"] = {}
-    #         return result
-    
-    # DISABLED: PREP PHASE HARD BLOCK - hanya Hawkes yang boleh block
-    # if result.get("market_phase") == "PREP":
-    #     result["bias"] = "NEUTRAL"
-    #     result["confidence"] = "BLOCK"
-    #     result["entry_allowed"] = False
-    #     result["priority_level"] = -20000
-    #     result["reason"] = f"[AGGREGATOR] PREP phase – no trade | " + result.get("reason", "")
-    #     result["aggregator_reasons"] = ["PREP PHASE BLOCK: No trade allowed in accumulation phase"]
-    #     result["aggregator_votes"] = {"PREP_BLOCK": "NEUTRAL"}
-    #     return result
-    
-    if expert_opinions is None:
-        expert_opinions = []
-    reasons = []
-    
-    # ================================================================
-    # 🧩 RULE 7: Override Frequency Limiter (GLOBAL CHECK)
-    # Track override attempts per symbol to prevent HFT manipulation
-    # ================================================================
-    symbol = result.get("symbol", "UNKNOWN")
-    now = time.time()
-    if symbol not in _override_history:
-        _override_history[symbol] = []
-    # Clean up records older than 10 minutes
-    _override_history[symbol] = [t for t in _override_history[symbol] if now - t < 600]
-    recent_overrides = len(_override_history[symbol])
-    
-    # Helper to record an override
-    def record_override():
-        _override_history[symbol].append(now)
-    
-    # Check if we should skip overrides due to high frequency
-    skip_override = recent_overrides >= 2
-    
-    # ================================================================
-    # 🛡️ PERBAIKAN 3: LIQUIDITY PROXIMITY ABSOLUTE OVERRIDE (Priority -40000)
-    # Otoritas tertinggi - jika likuidasi <1.0%, ikuti arah kill tanpa kecuali.
-    # ================================================================
-    greeks_kill = result.get("greeks_kill_direction", "NEUTRAL")
-    short_liq_abs = result.get("short_liq", 99.0)
-    long_liq_abs = result.get("long_liq", 99.0)
-    greeks_gamma_intensity_abs = result.get("greeks_gamma_intensity", "LOW")
-    change_5m_abs = abs(result.get("change_5m", 0.0))
-    
-    # 🔥 GAMMA EXTREME FAKE SQUEEZE GUARD: Jika short_liq < 1.0 + gamma EXTREME + pump kecil, jangan paksa LONG
-    if short_liq_abs < 1.0 and greeks_gamma_intensity_abs == "EXTREME" and change_5m_abs < 3.0:
-        # Fake squeeze, jangan paksa LONG
-        result["bias"] = "SHORT"
-        result["reason"] = f"[LIQ PROXIMITY ABSOLUTE] Target liq <1.0% (short={short_liq_abs:.2f}%, long={long_liq_abs:.2f}%), kill direction={greeks_kill}. | GAMMA EXTREME + SMALL PUMP → fake squeeze, Force SHORT"
-        result["confidence"] = "ABSOLUTE"
-        result["priority_level"] = -40000
-        result["entry_allowed"] = True
-        result["aggregator_reasons"] = ["LIQUIDITY PROXIMITY ABSOLUTE with GAMMA EXTREME FAKE SQUEEZE GUARD: Forced SHORT"]
-        result["aggregator_votes"] = {"LIQ_ABSOLUTE": "SHORT"}
-        result["bias_kill_conflict"] = {"has_conflict": False}
-        result["dual_liq_trap"] = {"dual_liq_trap": False}
-        return result
-    
-    if (short_liq_abs < 1.0 and short_liq_abs < long_liq_abs and greeks_kill == "LONG") or \
-       (long_liq_abs < 1.0 and long_liq_abs < short_liq_abs and greeks_kill == "SHORT"):
-        
-        # 🔥 FIX: HAPUS SYARAT TAMBAHAN (gamma_exec or vol_spike)
-        # Langsung override, tidak perlu kondisi apapun lagi
-        result["bias"] = greeks_kill
-        result["confidence"] = "ABSOLUTE"
-        result["priority_level"] = -40000
-        result["entry_allowed"] = True
-        result["_liq_absolute_lock"] = True   # 🔥 FLAG UNTUK GATE LAIN
-        result["_final_bias_locked"] = greeks_kill
-        result["reason"] = (
-            f"[LIQ PROXIMITY ABSOLUTE] Target liq <1.0% (short={short_liq_abs:.2f}%, long={long_liq_abs:.2f}%), "
-            f"kill direction={greeks_kill}. NO GATE CAN OVERRIDE. | " + result.get("reason", "")
-        )
-        result["aggregator_reasons"] = ["LIQUIDITY PROXIMITY ABSOLUTE: Forced " + greeks_kill]
-        result["aggregator_votes"] = {"LIQ_ABSOLUTE": greeks_kill}
-        # Clear potential conflict fields
-        result["bias_kill_conflict"] = {"has_conflict": False}
-        result["dual_liq_trap"] = {"dual_liq_trap": False}
-        return result   # ⬅️ EARLY RETURN
-    
-    # ================================================================
-    # 🛡️ PERBAIKAN 1: PRE-KILL EXCEPTION (Overrides Exchange Gate, Priority -30500)
-    # Pengecualian sebelum Exchange Risk Hard Block untuk kondisi kill yang sangat kuat.
-    # ================================================================
-    pre_kill = result.get("greeks_pre_kill", {})
-    gamma_exec_score = result.get("greeks_gamma_exec_score", 0)
-    kill_speed = result.get("greeks_kill_speed", 0.0)
-    kill_direction = result.get("greeks_kill_direction", "NEUTRAL")
-    short_liq_pk = result.get("short_liq", 99.0)
-    long_liq_pk = result.get("long_liq", 99.0)
-    
-    if (pre_kill.get("override", False) and 
-        gamma_exec_score >= 5 and 
-        kill_speed > 2.0 and
-        kill_direction in ("LONG", "SHORT")):
-        
-        # Cek apakah target likuidasi di arah kill sangat dekat
-        target_liq_close = (kill_direction == "LONG" and short_liq_pk < 1.0) or \
-                           (kill_direction == "SHORT" and long_liq_pk < 1.0)
-        if target_liq_close:
-            result["bias"] = kill_direction
-            result["confidence"] = "ABSOLUTE"
-            result["priority_level"] = -30500  # Lebih tinggi dari Exchange Gate (-30000)
-            result["entry_allowed"] = True
-            result["reason"] = (
-                f"[PRE-KILL EXCEPTION] greeks_pre_kill active, gamma_exec={gamma_exec_score}/6, "
-                f"kill_speed={kill_speed:.1f}, target_liq <1.0%. Exchange gate bypassed."
-            )
-            result["aggregator_reasons"] = ["PRE-KILL EXCEPTION: Forced " + kill_direction]
-            result["aggregator_votes"] = {"PRE_KILL_EXCEPTION": kill_direction}
-            # Clear potential conflict fields
-            result["bias_kill_conflict"] = {"has_conflict": False}
-            result["dual_liq_trap"] = {"dual_liq_trap": False}
-            return result
-    
-    # -----------------------------------------------------------------
-    # 0. EXCHANGE RISK HARD BLOCK (dengan threshold dinamis, Priority -30000)
-    # -----------------------------------------------------------------
-    # 🔥 FIX 1: JANGAN override jika Hawkes atau Squeeze gate sudah lock
-    hawkes_locked = result.get("_hawkes_gate_triggered", False)
-    squeeze_locked = result.get("_squeeze_validity_gate_triggered", False)
-    liq_absolute = result.get("_liq_absolute_lock", False)
+    def _physics_lock_valid(res: dict) -> bool:
+        """Physics lock hanya valid jika arah yang dikunci DIDUKUNG oleh liquidity."""
+        bias = res.get("bias", "NEUTRAL")
+        if bias not in ("LONG", "SHORT"):
+            return False
+        short_liq = res.get("short_liq", 99)
+        long_liq = res.get("long_liq", 99)
+        # Arah harus lebih dekat ke target likuidasinya
+        if bias == "LONG" and short_liq < long_liq and short_liq < 3.0:
+            return True
+        if bias == "SHORT" and long_liq < short_liq and long_liq < 3.0:
+            return True
+        return False
 
-    # Initialize variables that may be used regardless of gate locks
-    exchange_risk_score = result.get("exchange_risk_score", 0)
-    exchange_safe = result.get("exchange_safe_direction", "NEUTRAL")
-    greeks_bias = result.get("greeks_bias", "NEUTRAL")
-    rsi6_val = result.get("rsi6", 50.0)
-    short_liq = result.get("short_liq", 99.0)
-    delta_exposure = result.get("greeks_delta_exposure", 0.0)
-    is_genuine_squeeze = False  # default value
-    effective_threshold = 6  # default threshold
+    def _greeks_execution_confirmed(res: dict) -> bool:
+        """Greeks execution dianggap confirmed jika speed > 2.0 dan who_dies jelas."""
+        if not res.get("greeks_gamma_executing"):
+            return False
+        kill_speed = abs(res.get("greeks_kill_speed", 0))
+        who_dies = res.get("greeks_who_dies_first", "")
+        return (kill_speed > 2.0 and who_dies not in ("BOTH_POSSIBLE", "UNCLEAR", ""))
 
-    if hawkes_locked or squeeze_locked or liq_absolute:
-        # Skip exchange hard block, hormati gate yang lebih tinggi
-        reasons.append("[EXCHANGE_BLOCK_SKIPPED] Higher priority gate already locked")
-        # JANGAN return, lanjut ke proses lain
-    else:
-        rsi14_val = result.get("rsi14", 50.0)
-        up_energy_val = result.get("up_energy", 0.0)
-        
-        # 🛡️ PERBAIKAN 2: Exchange Risk Score Dinamis (Anti-Manipulasi Threshold)
-        # Jika Greeks sangat kuat dan berlawanan dengan exchange_safe, naikkan threshold
-        if greeks_bias in ("LONG", "SHORT") and greeks_bias != exchange_safe:
-            if result.get("greeks_gamma_exec_score", 0) >= 4:
-                effective_threshold = 7  # perlu risiko lebih tinggi untuk override
-                # Atau bisa langsung downgrade ke soft suggestion (tidak hard block)
-        
-        # Kondisi pengecualian: jika ini adalah genuine short squeeze (RSI rendah + short_liq dekat + exchange_safe = LONG)
-        is_genuine_squeeze = (rsi6_val < 40 and short_liq < 3.0 and exchange_safe == "LONG")
-    
-        if short_liq < 0.5 and delta_exposure > 0.9:
-            exchange_risk_score = min(exchange_risk_score, 5)
-    
-    # 🧩 RULE 6: RSI5m Exhaustion Override check BEFORE Exchange Hard Block
-    rsi5m = result.get("rsi6_5m", 50.0)
-    change_5m = result.get("change_5m", 0.0)
-    rsi_exhaustion_active = False
-    if rsi5m < 15 and change_5m < -4.0:
-        rsi_exhaustion_active = True
-        # Extreme oversold, any forced SHORT should be downgraded
-        if exchange_safe == "SHORT":
-            # Don't hard override, let voting decide
-            exchange_safe = "NEUTRAL"  # Effectively skip the override
-        elif exchange_safe == "LONG":
-            # Can execute but downgrade confidence later
-            pass  # Will handle in confidence assignment
-    
-    # 🧩 RULE 2: OBV-Price Divergence Hard Veto (for Exchange Gate)
-    # Check if we should skip the hard block due to OBV divergence
-    obv_trend = result.get("obv_trend", "NEUTRAL")
-    volume_ratio = result.get("volume_ratio", 1.0)
-    obv_price_divergence_skip = False
-    if exchange_risk_score >= 6 and exchange_safe in ("LONG", "SHORT") and not is_genuine_squeeze:
-        # If OBV extremely negative AND price dropped >3% AND volume ratio <0.7
-        # Skip hard override and let voting decide
-        if obv_trend == "NEGATIVE_EXTREME" and change_5m < -3.0 and volume_ratio < 0.7:
-            obv_price_divergence_skip = True
-    
-    if (exchange_risk_score >= effective_threshold and 
-        exchange_safe in ("LONG", "SHORT") and 
-        not is_genuine_squeeze and
-        not obv_price_divergence_skip):
-        
-        # 🔥 LECTURER FIX 4: Long Liq Ultra Close Falling Knife V3 Exception
-        # Jika long_liq < 1.2% + harga turun + fake vacuum, turunkan exchange risk score drastis
-        if exchange_risk_score >= 6 and exchange_safe == "LONG":
-            long_liq_val = result.get("long_liq", 99.0)
-            change_5m_val = result.get("change_5m", 0.0)
-            down_energy_val = result.get("down_energy", 0.0)
-            volume_ratio_val = result.get("volume_ratio", 1.0)
-            
-            if (long_liq_val < 1.2 and change_5m_val < -0.5 and 
-                down_energy_val < 0.01 and volume_ratio_val < 0.60):
-                exchange_risk_score = 2
-                reasons.append(f"Exchange Risk OVERRIDDEN by Long Liq Falling Knife V3")
-        
-        # 🔥 LECTURER FIX 3: Perkuat Exchange Risk Exception untuk Long Liq Fake Vacuum
-        if exchange_risk_score >= 7 and exchange_safe == "LONG":
-            long_liq_val = result.get("long_liq", 99.0)
-            short_liq_val = result.get("short_liq", 99.0)
-            volume_ratio_val = result.get("volume_ratio", 1.0)
-            down_energy_val = result.get("down_energy", 0.0)
-            
-            if long_liq_val < short_liq_val and long_liq_val < 2.0 and volume_ratio_val < 0.65 and down_energy_val < 0.01:
-                exchange_risk_score = 4   # turunkan agar sinyal SHORT bisa menang
-        
-        if exchange_safe == "LONG":
-            long_liq_val = result.get("long_liq", 99.0)
-            change_5m_val = result.get("change_5m", 0.0)
-            down_energy_val = result.get("down_energy", 0.0)
-            volume_ratio_val = result.get("volume_ratio", 1.0)
-            if (long_liq_val < 1.2 and change_5m_val < -0.5 and
-                down_energy_val < 0.01 and volume_ratio_val < 0.60):
-                result["bias"] = "SHORT"
-                result["confidence"] = "ABSOLUTE"
-                result["priority_level"] = -30550
-                result["entry_allowed"] = True
-                result["reason"] = (
-                    f"[EXCHANGE RISK FALLING KNIFE EXCEPTION] long_liq={long_liq_val:.2f}% + "
-                    f"change_5m={change_5m_val:.2f}% + vol={volume_ratio_val:.2f}x + fake vacuum "
-                    f"-> falling knife to long_liq. Force SHORT."
-                )
-                result["aggregator_reasons"] = ["EXCHANGE FALLING KNIFE EXCEPTION: Forced SHORT"]
-                result["aggregator_votes"] = {"EXCHANGE_EXCEPTION": "SHORT"}
-                result["bias_kill_conflict"] = {"has_conflict": False}
-                result["dual_liq_trap"] = {"dual_liq_trap": False}
-                return result
+    def _liq_absolute_valid(res: dict) -> bool:
+        """Liquidity absolute hanya jalan jika OBV & Volume tidak bertentangan keras."""
+        short_liq = res.get("short_liq", 99)
+        long_liq = res.get("long_liq", 99)
+        kill_dir = res.get("greeks_kill_direction", "")
+        agg = res.get("agg", 0.5)
+        down_energy = res.get("down_energy", 0)
+        up_energy = res.get("up_energy", 0)
+        obv_trend = res.get("obv_trend", "NEUTRAL")
+        volume_ratio = res.get("volume_ratio", 1.0)
 
-        if exchange_safe == "SHORT":
-            ultra_micro_exchange_exception = UltraMicroShortLiqSqueezeOverride.detect(
-                short_liq=short_liq,
-                delta_exposure=delta_exposure,
-                up_energy=up_energy_val,
-                volume_ratio=volume_ratio,
-                greeks_kill_direction=result.get("greeks_kill_direction", "")
-            )
-            if ultra_micro_exchange_exception["override"]:
-                result["bias"] = "LONG"
-                result["confidence"] = "ABSOLUTE"
-                result["priority_level"] = -29900
-                result["entry_allowed"] = True
-                result["reason"] = (
-                    f"EXCHANGE RISK EXCEPTION: short_liq={short_liq:.2f}% ultra dekat + "
-                    f"delta_exposure={delta_exposure:.3f} (LONG crowded) + "
-                    f"up_energy={up_energy_val:.2f} -> possible micro squeeze. "
-                    f"Skip hard SHORT block. | {ultra_micro_exchange_exception['reason']}"
-                )
-                result["aggregator_reasons"] = ["EXCHANGE RISK EXCEPTION: Forced LONG"]
-                result["aggregator_votes"] = {"EXCHANGE_EXCEPTION": "LONG"}
-                result["bias_kill_conflict"] = {"has_conflict": False}
-                result["dual_liq_trap"] = {"dual_liq_trap": False}
-                return result
-        
-        # Apply Rule 6 RSI exhaustion downgrade if applicable
-        if rsi_exhaustion_active and exchange_safe == "LONG":
-            # Execute but will downgrade confidence
-            pass
-        
-        # Check Rule 7 frequency limiter
-        if skip_override:
-            # Frequency too high, skip this override and let aggregator decide
-            reasons.append(f"[OVERRIDE FREQ LIMITER] Skipping EXCHANGE HARD BLOCK due to {recent_overrides} recent overrides")
-        else:
-            record_override()
-            result["bias"] = exchange_safe
-            result["confidence"] = "ABSOLUTE" if not (rsi_exhaustion_active and exchange_safe == "LONG") else "HIGH"
-            result["priority_level"] = -30000
-            result["entry_allowed"] = True
-            result["reason"] = f"[EXCHANGE RISK HARD BLOCK] exchange_risk={exchange_risk_score}/10, safe_direction={exchange_safe}, RSI14={rsi14_val:.1f}. Override all other signals."
-            result["aggregator_reasons"] = [f"EXCHANGE HARD BLOCK: Forced {exchange_safe}"]
-            result["aggregator_votes"] = {"HARD_BLOCK": exchange_safe}
-            # Clear potential conflict fields
-            result["bias_kill_conflict"] = {"has_conflict": False}
-            result["dual_liq_trap"] = {"dual_liq_trap": False}
-            return result
+        # Jangan force jika OBV/Volume sangat berlawanan
+        if short_liq < 1.0 and short_liq < long_liq:
+            # LONG
+            if obv_trend == "NEGATIVE_EXTREME" and volume_ratio > 1.5:
+                return False
+            return (kill_dir == "LONG" or (agg > 0.8 and down_energy < 0.01))
+        if long_liq < 1.0 and long_liq < short_liq:
+            # SHORT
+            if obv_trend == "POSITIVE_EXTREME" and volume_ratio > 1.5:
+                return False
+            return (kill_dir == "SHORT" or (agg < 0.2 and up_energy < 0.01))
+        return False
 
-    # ========== GATE 9: EXTREME OVERBOUGHT + DRY DUMP (Force SHORT, Priority -25000) ==========
-    # Deteksi jebakan无量阴跌 (tanpa volume下跌) + RSI 5m极端超买
-    # Ini adalah pola HFT高位派发：RSI 5m > 90意味着中期动能已完全耗尽，无量下跌是流动性枯竭的征兆
-    rsi5m = result.get("rsi6_5m", 50.0)
-    market_phase = result.get("market_phase", "UNKNOWN")
-    volume_ratio = result.get("volume_ratio", 1.0)
-    change_5m = result.get("change_5m", 0.0)
-    long_liq = result.get("long_liq", 99.0)
-    
-    if (market_phase == "BAIT" and 
-        volume_ratio < 0.7 and 
-        rsi5m > 90 and 
-        change_5m < 0 and
-        long_liq < 10.0):   # 有合理的下跌目标
-        
-        result["bias"] = "SHORT"
-        result["confidence"] = "ABSOLUTE"
-        result["priority_level"] = -25000
-        result["entry_allowed"] = True
-        result["reason"] = (
-            f"[EXTREME OB DRY DUMP] BAIT phase, RSI5m={rsi5m:.1f} (>90), "
-            f"vol={volume_ratio:.2f}x, change={change_5m:.1f}%. "
-            f"Exhausted uptrend, forced SHORT."
-        )
-        result["aggregator_reasons"] = ["EXTREME OB DRY DUMP FORCE SHORT"]
-        result["aggregator_votes"] = {"HARD_OVERRIDE": "SHORT"}
-        # Clear potential conflict fields
-        result["bias_kill_conflict"] = {"has_conflict": False}
-        result["dual_liq_trap"] = {"dual_liq_trap": False}
-        return result
+    # ========== EKSEKUSI LAPISAN ============================================
 
-    # -----------------------------------------------------------------
-    # 1. INISIALISASI VOTING
-    # -----------------------------------------------------------------
-    votes = {"LONG": 0.0, "SHORT": 0.0}
-    context = result
-    
-    # ========== FIX 2: BAIT VACUUM PENALTY (dengan context awareness) ==========
-    def classify_vacuum_type(data: dict) -> str:
-        rsi5m = data.get("rsi6_5m", 50)
-        change_5m_abs = abs(data.get("change_5m", 0))
-        funding = data.get("funding_rate", 0)
-        regime = data.get("market_regime", "")
-        rsi6 = data.get("rsi6", 50)
-        volume_ratio_local = data.get("volume_ratio", 1.0)
-        
-        # Tipe B: Akumulasi genuine (DAMUSDT 15:42)
-        if rsi5m < 15 and change_5m_abs < 2.0 and regime == "ACCUMULATION":
-            # Funding trap: shorts bayar mahal -> sinyal kuat LONG
-            if funding > 0.0015:
-                return "GENUINE_ACCUMULATION_FUNDING_TRAP"
-            return "GENUINE_ACCUMULATION"
-        
-        # Tipe A: Fake pump (overbought + sudah naik)
-        if rsi6 > 65 and change_5m_abs > 3.0:
-            return "FAKE_PUMP"
-        
-        return "AMBIGUOUS"
-    
-    market_phase_vote = result.get("market_phase", "UNKNOWN")
-    volume_ratio_vote = result.get("volume_ratio", 1.0)
-    down_energy_vote = result.get("down_energy", 0.0)
-    up_energy_vote = result.get("up_energy", 0.0)
-    
-    if market_phase_vote == "BAIT" and volume_ratio_vote < 0.5:
-        if down_energy_vote < 0.01 and up_energy_vote > 0:
-            # Klasifikasikan tipe vacuum
-            vacuum_type = classify_vacuum_type(result)
-            
-            if vacuum_type == "FAKE_PUMP":
-                votes["LONG"] = 0.0
-                votes["SHORT"] += 5.0
-                reasons.append("BAIT_VACUUM: FAKE_PUMP detected → SHORT")
-                result["_bait_vacuum_penalty_applied"] = True
-                
-            elif vacuum_type == "GENUINE_ACCUMULATION":
-                # Jangan beri penalty, batalkan SHORT
-                result["_bait_vacuum_cancelled"] = True
-                reasons.append("BAIT_VACUUM: GENUINE_ACCUMULATION detected → skip penalty")
-                # Tidak ada perubahan votes
-                
-            elif vacuum_type == "GENUINE_ACCUMULATION_FUNDING_TRAP":
-                # Paksa LONG (shorts akan di-squeeze)
-                votes["LONG"] += 8.0
-                votes["SHORT"] = 0.0
-                reasons.append("BAIT_VACUUM: FUNDING_TRAP for shorts → force LONG")
-                result["_bait_vacuum_funding_trap"] = True
-                
-            else:  # AMBIGUOUS
-                # Tidak cukup sinyal, block entry
-                result["entry_allowed"] = False
-                result["confidence"] = "BLOCK"
-                reasons.append("BAIT_VACUUM: AMBIGUOUS → NO TRADE")
-    
-    # ========== TAMBAHAN: ACCUMULATION regime = jangan BAIT SHORT ==========
-    if result.get("market_regime") == "ACCUMULATION" and market_phase_vote == "BAIT":
-        # Jika ada BAIT_VACUUM_PENALTY yang mencoba SHORT, batalkan
-        if result.get("_bait_vacuum_penalty_applied") and result.get("bias") == "SHORT":
-            result["bias"] = "NEUTRAL"
-            result["_bait_vacuum_penalty_applied"] = False
-            reasons.append("ACCUMULATION regime overrides BAIT_VACUUM → NO TRADE")
-            result["entry_allowed"] = False
-    
-    # ========== LECTURER FIX: WEIGHTED CONFLICT RESOLUTION FOR EXTREME RSI ==========
-    # Weighted conflict resolution untuk kasus RSI ekstrem vs exchange risk
-    rsi6 = result.get("rsi6", 50)
-    exchange_score = result.get("exchange_risk_score", 0)
-    exchange_bias = result.get("exchange_safe_direction", "NEUTRAL")
-    long_liq = result.get("long_liq", 99)
-    short_liq = result.get("short_liq", 99)
-
-    # Bobot: RSI ekstrem > 90 atau < 10 memiliki bobot tinggi
-    rsi_extreme_score = 0
-    if rsi6 < 10:
-        rsi_extreme_score = 4  # sangat oversold
-        rsi_direction = "LONG"
-    elif rsi6 > 90:
-        rsi_extreme_score = 4  # sangat overbought
-        rsi_direction = "SHORT"
-    else:
-        rsi_direction = None
-
-    # Jika ada konflik antara exchange bias dan RSI ekstrem
-    if rsi_direction and exchange_bias != rsi_direction and exchange_score >= 6:
-        # Bobot liquidity proximity juga
-        liq_proximity_bias = "LONG" if short_liq < long_liq else "SHORT"
-        liq_proximity_score = 3 if min(short_liq, long_liq) < 1.5 else 1
-        
-        # Hitung weighted vote
-        long_votes = 0
-        short_votes = 0
-        if rsi_direction == "LONG":
-            long_votes += rsi_extreme_score
-        else:
-            short_votes += rsi_extreme_score
-        
-        if exchange_bias == "LONG":
-            long_votes += exchange_score // 2  # exchange risk score dibagi 2
-        else:
-            short_votes += exchange_score // 2
-        
-        if liq_proximity_bias == "LONG":
-            long_votes += liq_proximity_score
-        else:
-            short_votes += liq_proximity_score
-        
-        if long_votes > short_votes:
-            result["bias"] = "LONG"
-            result["confidence"] = "ABSOLUTE"
-            result["reason"] = f"[WEIGHTED CONFLICT] RSI={rsi6:.1f} ekstrem + liq proximity → override exchange bias | " + result.get("reason", "")
-        elif short_votes > long_votes:
-            result["bias"] = "SHORT"
-            result["confidence"] = "ABSOLUTE"
-            result["reason"] = f"[WEIGHTED CONFLICT] RSI={rsi6:.1f} ekstrem + liq proximity → override exchange bias | " + result.get("reason", "")
-
-    # ================================================================
-    # 🧩 RULE 5: Regime-Phase Conflict Block (Early Stage Check)
-    # Dangerous combination: LIQUIDATION_HUNT + BAIT requires 2 confirmations
-    # 🔥 DINONAKTIFKAN - PAKSA UNBLOCK AKAN MENGEMBALIKAN BIAS NANTI
-    # ================================================================
-    # DISABLED: Regime-Phase Conflict Block - akan di-unlock nanti oleh PAKSA UNBLOCK
-    # market_regime = result.get("market_regime", "UNKNOWN")
-    # market_phase = result.get("market_phase", "UNKNOWN")
-    # if market_regime == "LIQUIDATION_HUNT" and market_phase == "BAIT":
-    #     independent_absolute = 0
-    #     if result.get("exchange_risk_score", 0) >= 6:
-    #         independent_absolute += 1
-    #     if result.get("greeks_gamma_intensity") == "EXTREME":
-    #         independent_absolute += 1
-    #     if result.get("obv_magnitude") == "HIGH":
-    #         independent_absolute += 1
-    #     if independent_absolute < 2:
-    #         result["bias"] = "NEUTRAL"
-    #         result["confidence"] = "BLOCK"
-    #         result["entry_allowed"] = False
-    #         result["reason"] = "[REGIME-PHASE CONFLICT] LIQUIDATION_HUNT + BAIT without 2 confirmations → NO TRADE"
-    #         return result
-
-    # ================================================================
-    # 🧩 RULE 3: Liquidity Asymmetry Trap Detector
-    # Check before LIQUIDITY LAW voting
-    # ================================================================
-    short_liq_val = context.get("short_liq", 99.0)
-    long_liq_val = context.get("long_liq", 99.0)
-    if short_liq_val > 0 and long_liq_val > 0:
-        liq_ratio = long_liq_val / short_liq_val if short_liq_val > 0 else 999
-        if liq_ratio < 0.2 and result.get("bias", "NEUTRAL") == "LONG":
-            result["bias"] = "NEUTRAL"
-            result["confidence"] = "BLOCK"
-            result["entry_allowed"] = False
-            result["reason"] = f"[LIQ ASYMMETRY TRAP] long_liq={long_liq_val:.2f}% extremely close, short_liq={short_liq_val:.2f}% far → LONG blocked."
-            return result
-
-    # -----------------------------------------------------------------
-    # 2. TIER 1: HUKUM FISIKA PASAR (Bobot 10.0)
-    # -----------------------------------------------------------------
-    liq_bias = "LONG" if context.get("short_liq", 99) < context.get("long_liq", 99) else "SHORT"
-    liq_diff = abs(context.get("short_liq", 0) - context.get("long_liq", 0))
-    short_liq = context.get("short_liq", 99.0)
-    long_liq = context.get("long_liq", 99.0)
-    change_5m = context.get("change_5m", 0.0)
-    volume_ratio = context.get("volume_ratio", 1.0)
-    up_energy = context.get("up_energy", 0.0)
-    down_energy = context.get("down_energy", 0.0)
-    
-    # LIQUIDITY LAW dengan bobot dinamis
-    if short_liq < 1.5 and short_liq < long_liq:
-        liq_weight = 10.0
-        # Jika exchange risk HIGH dan merekomendasikan SHORT, turunkan bobot
-        # KECUALI jika ada squeeze momentum (short_liq < 1.0% + pump kuat)
-        if exchange_risk_score >= 6 and exchange_safe == "SHORT":
-            if short_liq < 1.0 and change_5m > 4.0:
-                # Jangan hard block jika ada squeeze momentum
-                exchange_risk_score = 5  # turunkan agar sinyal squeeze bisa menang
-                reasons.append(f"EXCHANGE RISK WEAKENED: short_liq={short_liq:.2f}% + change_5m={change_5m:.2f}% → squeeze momentum detected")
-            else:
-                liq_weight = 3.0
-                reasons.append(f"LIQUIDITY LAW: short_liq ultra close but EXCHANGE WARNING reduces weight to {liq_weight}")
-        else:
-            reasons.append("LIQUIDITY LAW: short_liq ultra close")
-        votes["LONG"] += liq_weight
-        
-    elif long_liq < 1.5 and long_liq < short_liq:
-        liq_weight = 10.0
-        if exchange_risk_score >= 6 and exchange_safe == "LONG":
-            # 🔥 LECTURER FIX: Jangan hard block LONG di kasus falling knife ke long_liq
-            if long_liq < 1.5 and change_5m < -1.0 and down_energy < 0.01 and volume_ratio < 0.55:
-                # Jangan hard block jika ada falling knife pattern ke long_liq
-                exchange_risk_score = 4
-                reasons.append("Exchange Risk overridden by Long Liq Falling Knife Trap")
-            else:
-                liq_weight = 3.0
-                reasons.append(f"LIQUIDITY LAW: long_liq ultra close but EXCHANGE WARNING reduces weight to {liq_weight}")
-        else:
-            reasons.append("LIQUIDITY LAW: long_liq ultra close")
-        votes["SHORT"] += liq_weight
-
-    # Zero Sellers / Buyers (Vacuum) - 🛡️ LANGKAH 1
-    if down_energy < 0.01 and up_energy > 0.5:
-        # Jangan memberi vote penuh jika OFI & Agg berkata sebaliknya
-        ofi_bias = context.get("ofi_bias", "NEUTRAL")
-        ofi_strength = context.get("ofi_strength", 0.0)
-        agg_val = context.get("agg", 0.5)
-        # ========== FIX 2: Cek apakah BAIT VACUUM PENALTY sudah diterapkan ==========
-        if result.get("_bait_vacuum_penalty_applied"):
-            # Sudah di-handle oleh BAIT VACUUM PENALTY, jangan tambah vote LONG lagi
-            pass
-        elif ofi_bias == "SHORT" and ofi_strength > 0.5 and agg_val < 0.4:
-            # Sinyal jual terlalu kuat, vacuum tidak reliable
-            votes["SHORT"] += 6.0
-            reasons.append("VACUUM OVERRULED BY STRONG SELL PRESSURE")
-        else:
-            votes["LONG"] += 8.0
-            reasons.append("VACUUM: No sellers + active buyers")
-    if up_energy < 0.01 and down_energy > 0.5:
-        # Mirror untuk SHORT - Jangan memberi vote penuh jika OFI & Agg berkata sebaliknya
-        ofi_bias = context.get("ofi_bias", "NEUTRAL")
-        ofi_strength = context.get("ofi_strength", 0.0)
-        agg_val = context.get("agg", 0.5)
-        if ofi_bias == "LONG" and ofi_strength > 0.5 and agg_val > 0.6:
-            # Sinyal beli terlalu kuat, vacuum tidak reliable
-            votes["LONG"] += 6.0
-            reasons.append("VACUUM OVERRULED BY STRONG BUY PRESSURE")
-        else:
-            votes["SHORT"] += 8.0
-            reasons.append("VACUUM: No buyers + active sellers")
-
-    # -----------------------------------------------------------------
-    # 3. TIER 2: JEJAK HFT (Bobot 8.0)
-    # -----------------------------------------------------------------
-    agg_val = context.get("agg", 0.5)
-    ofi_bias = context.get("ofi_bias", "NEUTRAL")
-    ofi_strength = context.get("ofi_strength", 0.0)
-    
-    # 🛡️ SOLUSI 3: Turunkan bobot HFT TRACE pada fase PREP
-    # Jika market_phase == "PREP", bagi bobot HFT dengan 4 (dari 8.0 jadi 2.0)
-    hft_weight = 8.0
-    if context.get("market_phase") == "PREP":
-        hft_weight = 2.0  # Turunkan drastis agar tidak override PREP block
-    
-    if agg_val > 0.85 and ofi_bias == "LONG" and ofi_strength > 0.7:
-        votes["LONG"] += hft_weight
-        reasons.append(f"HFT TRACE: Aggressive buying consensus (weight={hft_weight})")
-    if agg_val < 0.15 and ofi_bias == "SHORT" and ofi_strength > 0.7:
-        votes["SHORT"] += hft_weight
-        reasons.append(f"HFT TRACE: Aggressive selling consensus (weight={hft_weight})")
-    
-    # Debug print untuk memastikan suara masuk
-    print(f"[DEBUG VOTES] After Tier 2 (HFT): LONG={votes['LONG']}, SHORT={votes['SHORT']}, agg={agg_val:.2f}, ofi={ofi_bias}, strength={ofi_strength:.2f}")
-
-    # -----------------------------------------------------------------
-    # 4. TIER 3: SINYAL MATEMATIS EKSTREM (Bobot 7.0)
-    # -----------------------------------------------------------------
-    rsi_val = context.get("rsi6_5m", 50.0)
-    if rsi_val < 15 and change_5m < -2.0:
-        votes["LONG"] += 7.0
-        reasons.append("MATH: Extreme capitulation (RSI5m<15)")
-    elif rsi_val > 85 and change_5m > 2.0:
-        votes["SHORT"] += 7.0
-        reasons.append("MATH: Extreme blow-off (RSI5m>85)")
-
-    # -----------------------------------------------------------------
-    # 5. TRAP OVERRIDE DENGAN 6 GATE VALIDASI
-    # -----------------------------------------------------------------
-    market_phase = context.get("market_phase", "UNKNOWN")
-    greeks_override = context.get("greeks_override", False)
-    vega_score = context.get("greeks_vega_score", 0)
-    greeks_bias = context.get("greeks_bias", "NEUTRAL")
-    
-    bid_slope = context.get("bid_slope", 0.0)
-    ask_slope = context.get("ask_slope", 0.0)
-    
-    # ========== GATE: BAIT SELL DOMINANCE FORCE SHORT (Prioritas -25000) ==========
-    # Gate ini khusus menangkap skenario di mana Binance sendiri sudah memberi peringatan SHORT,
-    # pasar dalam fase jebakan, volume rendah, dan data real-time (agg, OFI, order book) 
-    # mengonfirmasi tekanan jual. Ini adalah pola distribusi diam-diam sebelum dump.
-    exchange_safe = context.get("exchange_safe_direction", "NEUTRAL")
-    short_liq_val = context.get("short_liq", 99.0)
-    
-    if (market_phase == "BAIT" and 
-        volume_ratio < 0.7 and 
-        exchange_safe == "SHORT" and
-        long_liq < short_liq_val and long_liq < 5.0):
-        
-        # Hitung skor sinyal jual
-        sell_score = 0
-        if agg_val < 0.3: sell_score += 1
-        if ofi_bias == "SHORT" and ofi_strength > 0.7: sell_score += 1
-        if ask_slope > bid_slope * 2.0: sell_score += 1
-        
-        if sell_score >= 2:
-            result["bias"] = "SHORT"
-            result["confidence"] = "ABSOLUTE"
-            result["priority_level"] = -25000
-            result["entry_allowed"] = True
-            result["reason"] = (
-                f"[BAIT SELL DOMINANCE] market_phase=BAIT, vol={volume_ratio:.2f}x, "
-                f"exchange_safe=SHORT, sell_score={sell_score}/3, long_liq={long_liq:.2f}%. "
-                f"Force SHORT, override all."
-            )
-            result["aggregator_reasons"] = ["BAIT SELL DOMINANCE FORCE SHORT"]
-            result["aggregator_votes"] = {"HARD_OVERRIDE": "SHORT"}
-            # Clear potential conflict fields
-            result["bias_kill_conflict"] = {"has_conflict": False}
-            result["dual_liq_trap"] = {"dual_liq_trap": False}
-            return result
-    
-    basic_trap_conditions = (
-        market_phase == "BAIT" and 
-        greeks_override and 
-        vega_score >= 4 and 
-        volume_ratio < 0.7 and
-        greeks_bias in ("LONG", "SHORT")
-    )
-    
-    if basic_trap_conditions:
-        # 🧩 RULE 4: Anti-Vega Manipulation Gate
-        # Additional requirement: must have confirmations from volume, aggregator, and OBV
-        aggregator_bias = "LONG" if votes["LONG"] > votes["SHORT"] else "SHORT"
-        obv_trend_check = context.get("obv_trend", "NEUTRAL")
-        
-        # Check if all confirmations are met
-        has_volume_confirmation = volume_ratio > 0.65
-        has_aggregator_alignment = aggregator_bias == greeks_bias
-        has_obv_confirmation = (
-            (greeks_bias == "LONG" and obv_trend_check == "POSITIVE_EXTREME") or
-            (greeks_bias == "SHORT" and obv_trend_check == "NEGATIVE_EXTREME")
-        )
-        
-        if not (has_volume_confirmation and has_aggregator_alignment and has_obv_confirmation):
-            reasons.append(
-                f"TRAP OVERRIDE BLOCKED (Anti-Vega Gate): high Vega but missing confirmations. "
-                f"volume_ok={has_volume_confirmation}, agg_align={has_aggregator_alignment}, obv_ok={has_obv_confirmation}"
-            )
-            basic_trap_conditions = False
-        
-        # GATE 1: Validasi Energi Pasar (dengan pengecualian Thin Ask Wall)
-        if up_energy > 2.0 and down_energy < 0.1:
-            # Pengecualian: Jika ask_slope sangat tipis dibanding bid_slope (rasio > 5x)
-            # dan Vega score >= 5, maka ini adalah jebakan "Fake Buy Pressure". Jangan blokir.
-            if bid_slope > 0 and ask_slope > 0:
-                bid_ask_ratio = bid_slope / ask_slope
-            else:
-                bid_ask_ratio = 0
-            
-            if bid_ask_ratio > 5.0 and vega_score >= 5:
-                reasons.append(f"TRAP OVERRIDE ENERGY GATE BYPASSED: Thin ask wall (bid/ask={bid_ask_ratio:.1f}x) + Vega={vega_score}/6 → buy pressure is fake.")
-                # Jangan set basic_trap_conditions = False, biarkan TRAP OVERRIDE lanjut
-            else:
-                reasons.append(f"TRAP OVERRIDE BLOCKED (Energy Gate): up_energy={up_energy:.2f} >> down_energy={down_energy:.2f}")
-                basic_trap_conditions = False
-            
-        # GATE 2: Validasi Exchange Safe Direction
-        if basic_trap_conditions and exchange_safe != "NEUTRAL" and exchange_safe != greeks_bias:
-            reasons.append(f"TRAP OVERRIDE BLOCKED (Exchange Gate): exchange_safe={exchange_safe} conflicts with greeks_bias={greeks_bias}")
-            basic_trap_conditions = False
-            
-        # GATE 3: Validasi Extreme Capitulation
-        if basic_trap_conditions and rsi6_val < 10:
-            reasons.append(f"TRAP OVERRIDE BLOCKED (RSI Gate): RSI6={rsi6_val:.1f} is extreme capitulation")
-            basic_trap_conditions = False
-            
-        # GATE 4: Validasi Akumulasi/Distribusi Kuat
-        strong_accumulation = (agg_val > 0.8 and ofi_bias == "LONG" and ofi_strength > 0.7 and bid_slope > ask_slope * 1.2)
-        strong_distribution = (agg_val < 0.2 and ofi_bias == "SHORT" and ofi_strength > 0.7 and ask_slope > bid_slope * 1.2)
-        if basic_trap_conditions and strong_accumulation and greeks_bias == "SHORT":
-            reasons.append("TRAP OVERRIDE BLOCKED (Accumulation Gate)")
-            basic_trap_conditions = False
-        if basic_trap_conditions and strong_distribution and greeks_bias == "LONG":
-            reasons.append("TRAP OVERRIDE BLOCKED (Distribution Gate)")
-            basic_trap_conditions = False
-            
-        # GATE 5: Validasi Ask/Bid Ratio Ekstrem
-        if basic_trap_conditions:
-            ask_bid_ratio = ask_slope / bid_slope if bid_slope > 0 else 999
-            bid_ask_ratio = bid_slope / ask_slope if ask_slope > 0 else 999
-            if greeks_bias == "LONG" and ask_bid_ratio > 5.0:
-                reasons.append(f"TRAP OVERRIDE BLOCKED (Ask Wall Gate): ask/bid ratio = {ask_bid_ratio:.1f}x > 5x")
-                basic_trap_conditions = False
-            if greeks_bias == "SHORT" and bid_ask_ratio > 5.0:
-                reasons.append(f"TRAP OVERRIDE BLOCKED (Bid Wall Gate): bid/ask ratio = {bid_ask_ratio:.1f}x > 5x")
-                basic_trap_conditions = False
-                
-        # GATE 6: BAIT Phase + Overbought Protection
-        if basic_trap_conditions:
-            if market_phase == "BAIT" and rsi14_val > 70 and greeks_bias == "LONG":
-                reasons.append(f"TRAP OVERRIDE BLOCKED (RSI Overbought Gate): RSI14={rsi14_val:.1f} > 70")
-                basic_trap_conditions = False
-
-        # GATE 7: Validasi Konsistensi OBV & OFI (Distribusi/Akumulasi Historis)
-        if basic_trap_conditions:
-            obv_trend = context.get("obv_trend", "NEUTRAL")
-            obv_value = context.get("obv_value", 0.0)
-            # Jika greeks_bias = LONG, tapi OBV negatif ekstrem dan OFI SHORT kuat → jangan LONG
-            if greeks_bias == "LONG":
-                if (obv_trend == "NEGATIVE_EXTREME" and obv_value < -50_000_000 and
-                    ofi_bias == "SHORT" and ofi_strength > 0.8):
-                    reasons.append(f"TRAP OVERRIDE BLOCKED (OBV/OFI Gate): OBV NEGATIVE_EXTREME ({obv_value:,.0f}) + OFI SHORT {ofi_strength:.2f}")
-                    basic_trap_conditions = False
-            # Jika greeks_bias = SHORT, tapi OBV positif ekstrem dan OFI LONG kuat → jangan SHORT
-            elif greeks_bias == "SHORT":
-                if (obv_trend == "POSITIVE_EXTREME" and obv_value > 50_000_000 and
-                    ofi_bias == "LONG" and ofi_strength > 0.8):
-                    reasons.append(f"TRAP OVERRIDE BLOCKED (OBV/OFI Gate): OBV POSITIVE_EXTREME ({obv_value:,.0f}) + OFI LONG {ofi_strength:.2f}")
-                    basic_trap_conditions = False
-
-        # GATE 8: OBV 极端积累否决（针对 SHORT 诱空陷阱）
-        # Jika OBV出现极端正积累（POSITIVE_EXTREME）且short_liq极近（<0.5%）时，
-        # 即便交易所发出SHORT警告，也应该视为真实挤压前的最后诱空，而不是真正的派发。
-        if basic_trap_conditions and greeks_bias == "SHORT":
-            obv_trend = context.get("obv_trend", "NEUTRAL")
-            obv_value = context.get("obv_value", 0.0)
-            short_liq = data.get("short_liq", 99.0)
-            if (obv_trend == "POSITIVE_EXTREME" and 
-                obv_value > 30_000_000 and 
-                short_liq < 0.5):
-                reasons.append(
-                    f"TRAP OVERRIDE BLOCKED (OBV Accumulation Gate): "
-                    f"OBV POSITIVE_EXTREME ({obv_value:,.0f}) + short_liq={short_liq:.2f}%"
-                )
-                basic_trap_conditions = False
-
-    # EKSEKUSI TRAP OVERRIDE JIKA MASIH LOLOS
-    if basic_trap_conditions:
-        previous_bias = "LONG" if votes["LONG"] > votes["SHORT"] else "SHORT" if votes["SHORT"] > votes["LONG"] else "NEUTRAL"
-        result["bias"] = greeks_bias
-        result["confidence"] = "ABSOLUTE"
-        result["priority_level"] = -20000
-        result["entry_allowed"] = True
-        
-        trap_reason = (
-            f"[TRAP OVERRIDE] BAIT phase + Vega active (score={vega_score}/6) + "
-            f"Greeks override + volume={volume_ratio:.2f}x → Pola jebakan HFT terdeteksi. "
-            f"Abaikan Aggregator (bias {previous_bias}), paksa ke {greeks_bias}."
-        )
-        result["reason"] = trap_reason + " | " + context.get("reason", "")
-        
-        result["aggregator_reasons"] = reasons + ["TRAP OVERRIDE ACTIVATED: " + trap_reason]
-        result["aggregator_votes"] = {"TRAP_OVERRIDE": {"forced_bias": greeks_bias, "previous_votes": votes.copy()}}
-        # Clear potential conflict fields
-        result["bias_kill_conflict"] = {"has_conflict": False}
-        result["dual_liq_trap"] = {"dual_liq_trap": False}
-        return result
-
-    # -----------------------------------------------------------------
-    # 6. DETECTOR FLAGS DARI analyze() (POST-KILL, PRE-SWEEP, GAMMA SPOOF, dll)
-    # -----------------------------------------------------------------
-    # Sekarang kita proses flag yang disimpan oleh detector di analyze()
-    # Ini menggantikan direct bias modification yang dilakukan sebelumnya
-    
-    # Priority ladder untuk detector flags:
-    # - Pre-Kill Sweep (-10500): liquidity sangat dekat, harus sweep dulu
-    # - Post-Kill Follow (-10400): gamma executing, ikuti kill direction
-    # - Gamma Spoof (-10300): gamma alignment terdeteksi
-    # - Reverse Bait (-10200): reverse squeeze bait detected
-    
-    # Cek Pre-Kill Sweep (priority -10500)
-    if result.get("_pre_kill_sweep_detected"):
-        sweep_bias = result.get("_pre_kill_sweep_bias")
-        sweep_reason = result.get("_pre_kill_sweep_reason", "")
-        entry_allowed = result.get("_pre_kill_sweep_entry_allowed", False)
-        
-        result["bias"] = sweep_bias
-        result["confidence"] = "ABSOLUTE"
-        result["priority_level"] = -10500
-        result["reason"] = f"[PRE-KILL SWEEP] {sweep_reason} | " + context.get("reason", "")
-        result["entry_allowed"] = entry_allowed
-        result["aggregator_reasons"] = reasons + [f"PRE-KILL SWEEP: {sweep_bias} because {sweep_reason}"]
-        # Clear potential conflict fields
-        result["bias_kill_conflict"] = {"has_conflict": False}
-        result["dual_liq_trap"] = {"dual_liq_trap": False}
-        return result
-    
-    # Cek Reverse Bait (priority -10200)
-    if result.get("_reverse_bait_detected"):
-        reverse_bias = result.get("_reverse_bait_bias", "SHORT")
-        reverse_reason = result.get("_reverse_bait_reason", "")
-        
-        result["bias"] = reverse_bias
-        result["confidence"] = "ABSOLUTE"
-        result["priority_level"] = -10200
-        result["reason"] = f"[REVERSE BAIT] {reverse_reason} | " + context.get("reason", "")
-        result["entry_allowed"] = True
-        result["aggregator_reasons"] = reasons + [f"REVERSE BAIT: {reverse_bias} because {reverse_reason}"]
-        # Clear potential conflict fields
-        result["bias_kill_conflict"] = {"has_conflict": False}
-        result["dual_liq_trap"] = {"dual_liq_trap": False}
-        return result
-    
-    # Cek Post-Kill Follow (priority -10400)
-    if result.get("_post_kill_follow"):
-        post_kill_bias = result.get("_post_kill_bias")
-        post_kill_reason = result.get("_post_kill_reason", "")
-        
-        result["bias"] = post_kill_bias
-        result["confidence"] = "ABSOLUTE"
-        result["priority_level"] = -10400
-        result["reason"] = f"[POST-KILL FOLLOW] {post_kill_reason} | " + context.get("reason", "")
-        result["entry_allowed"] = True
-        result["aggregator_reasons"] = reasons + [f"POST-KILL FOLLOW: {post_kill_bias} because {post_kill_reason}"]
-        # Clear potential conflict fields
-        result["bias_kill_conflict"] = {"has_conflict": False}
-        result["dual_liq_trap"] = {"dual_liq_trap": False}
-        return result
-    
-    # Cek Gamma Spoof (priority -10300)
-    if result.get("_gamma_spoof_detected"):
-        spoof_bias = result.get("_gamma_spoof_bias")
-        spoof_reason = result.get("_gamma_spoof_reason", "")
-        spoof_priority = result.get("_gamma_spoof_priority", -10300)
-        
-        result["bias"] = spoof_bias
-        result["confidence"] = "ABSOLUTE"
-        result["priority_level"] = spoof_priority
-        result["reason"] = f"[GAMMA SPOOF] {spoof_reason} | " + context.get("reason", "")
-        result["entry_allowed"] = True
-        result["aggregator_reasons"] = reasons + [f"GAMMA SPOOF: {spoof_bias} because {spoof_reason}"]
-        # Clear potential conflict fields
-        result["bias_kill_conflict"] = {"has_conflict": False}
-        result["dual_liq_trap"] = {"dual_liq_trap": False}
-        return result
-
-    # -----------------------------------------------------------------
-    # 7. KEPUTUSAN AKHIR (VOTING)
-    # -----------------------------------------------------------------
-    
-    # PERLEMAH VACUUM DI LOW VOLUME + EXTREME RSI / FALLING KNIFE
-    volume_ratio = result.get("volume_ratio", 1.0)
-    down_energy = result.get("down_energy", 0.0)
-    rsi6_5m = result.get("rsi6_5m", 50.0)
-    rsi6 = result.get("rsi6", 50.0)
-    long_liq_vote = result.get("long_liq", 99.0)
-    change_5m_vote = result.get("change_5m", 0.0)
-    fake_vacuum_extreme = volume_ratio < 0.70 and down_energy < 0.01 and rsi6_5m > 78
-    fake_vacuum_falling_knife = (
-        volume_ratio < 0.60 and down_energy < 0.01 and
-        long_liq_vote < 1.2 and change_5m_vote < -0.5
-    )
-    if fake_vacuum_extreme or fake_vacuum_falling_knife:
-        if "VACUUM: No sellers" in result.get("reason", ""):
-            original_long_votes = votes.get("LONG", 0)
-            weaken_amount = 7 if fake_vacuum_falling_knife else 6
-            votes["LONG"] = max(0, votes.get("LONG", 8) - weaken_amount)
-            result["_fake_vacuum_weakened"] = True
-            result["_original_long_votes"] = original_long_votes
-            fake_vacuum_reason = (
-                f"FAKE_VACUUM_EXTREME_RSI: vol={volume_ratio:.2f}x + "
-                f"RSI5m={rsi6_5m:.1f} â†’ weakened NoSeller vote"
-            )
-            reasons.append(fake_vacuum_reason)
-    
-    if votes["LONG"] > votes["SHORT"]:
-        result["bias"] = "LONG"
-        result["confidence"] = "ABSOLUTE" if votes["LONG"] >= 15 else "HIGH"
-        result["entry_allowed"] = True
-    elif votes["SHORT"] > votes["LONG"]:
-        result["bias"] = "SHORT"
-        result["confidence"] = "ABSOLUTE" if votes["SHORT"] >= 15 else "HIGH"
-        result["entry_allowed"] = True
-    else:
+    # --- LAPISAN 0: NO TRADE ZONE ------------------------------------------
+    if _is_no_trade_zone(result):
         result["bias"] = "NEUTRAL"
         result["confidence"] = "BLOCK"
         result["entry_allowed"] = False
-        reasons.append("DEADLOCK: Equal evidence for both sides.")
+        result["priority_level"] = -50000
+        result["reason"] = "[NO TRADE ZONE] PREP/ACCUMULATION HIGH RISK – no entry allowed. " + result.get("reason", "")
+        result["_final_bias_locked"] = "NEUTRAL"
+        return result
 
-    # ================================================================
-    # 🧩 RULE 1: Consensus Divergence Penalty (Post-Voting Check)
-    # If aggregator vote is extreme but result bias conflicts, downgrade confidence
-    # ================================================================
+    # --- LAPISAN 1: PHYSICS LOCK (Hawkes / Exhaustion) ---------------------
+    if (result.get("_hawkes_gate_triggered") or result.get("_exhaustion_gate_triggered")) and _physics_lock_valid(result):
+        result["entry_allowed"] = True
+        result["confidence"] = "ABSOLUTE"
+        result["priority_level"] = -99999
+        result["reason"] = "[PHYSICS ABSOLUTE] Hawkes/Exhaustion + liquidity confirmed → NO OVERRIDE. " + result.get("reason", "")
+        result["_final_bias_locked"] = result["bias"]
+        return result
+
+    # --- LAPISAN 2: GREEKS EXECUTION LOCK ----------------------------------
+    if _greeks_execution_confirmed(result):
+        kill_dir = result["greeks_kill_direction"]
+        short_liq = result.get("short_liq", 99)
+        long_liq = result.get("long_liq", 99)
+        if (kill_dir == "LONG" and short_liq < long_liq) or (kill_dir == "SHORT" and long_liq < short_liq):
+            result["bias"] = kill_dir
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = -99990
+            result["entry_allowed"] = True
+            result["reason"] = f"[GREEKS EXECUTION] gamma_executing + speed>2, kill={kill_dir} → LOCK. " + result.get("reason", "")
+            result["_final_bias_locked"] = kill_dir
+            return result
+
+    # --- LAPISAN 3: LIQUIDITY PROXIMITY ABSOLUTE ---------------------------
+    if _liq_absolute_valid(result):
+        short_liq = result.get("short_liq", 99)
+        long_liq = result.get("long_liq", 99)
+        if short_liq < 1.0 and short_liq < long_liq:
+            result["bias"] = "LONG"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = -99980
+            result["entry_allowed"] = True
+            result["reason"] = f"[LIQ ABSOLUTE] short_liq={short_liq:.2f}% < 1.0% → FORCE LONG. " + result.get("reason", "")
+            result["_final_bias_locked"] = "LONG"
+            return result
+        if long_liq < 1.0 and long_liq < short_liq:
+            result["bias"] = "SHORT"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = -99980
+            result["entry_allowed"] = True
+            result["reason"] = f"[LIQ ABSOLUTE] long_liq={long_liq:.2f}% < 1.0% → FORCE SHORT. " + result.get("reason", "")
+            result["_final_bias_locked"] = "SHORT"
+            return result
+
+    # ========================================================================
+    # JIKA TIDAK ADA KOMANDAN YANG MENGAMBIL ALIH, GUNAKAN SISTEM VOTING
+    # DETEKTORMU SEPERTI BIASA.
+    # ========================================================================
+    
+    # -- Voting dari sinyal yang sudah dikumpulkan -------------------------
+    votes = {"LONG": 0.0, "SHORT": 0.0}
+    reasons = []
+
+    # 1. LIQUIDITY LAW
+    short_liq = result.get("short_liq", 99)
+    long_liq = result.get("long_liq", 99)
+    if short_liq < long_liq and short_liq < 2.0:
+        votes["LONG"] += 10.0
+        reasons.append("LIQUIDITY LAW: short_liq ultra close")
+    elif long_liq < short_liq and long_liq < 2.0:
+        votes["SHORT"] += 10.0
+        reasons.append("LIQUIDITY LAW: long_liq ultra close")
+
+    # 2. VACUUM
+    down_energy = result.get("down_energy", 0)
+    up_energy = result.get("up_energy", 0)
+    if down_energy < 0.01 and up_energy > 0.5:
+        if result.get("agg", 0.5) > 0.6:   # ada konfirmasi
+            votes["LONG"] += 8.0
+            reasons.append("VACUUM: No sellers + active buyers")
+        else:
+            votes["SHORT"] += 6.0   # vacuum di kondisi bearish = jebakan
+            reasons.append("VACUUM OVERRULED BY STRONG SELL PRESSURE")
+    elif up_energy < 0.01 and down_energy > 0.5:
+        if result.get("agg", 0.5) < 0.4:
+            votes["SHORT"] += 8.0
+            reasons.append("VACUUM: No buyers + active sellers")
+        else:
+            votes["LONG"] += 6.0
+            reasons.append("VACUUM OVERRULED BY STRONG BUY PRESSURE")
+
+    # 3. HFT TRACE
+    agg = result.get("agg", 0.5)
+    ofi_bias = result.get("ofi_bias", "NEUTRAL")
+    ofi_strength = result.get("ofi_strength", 0.0)
+    if agg > 0.85 and ofi_bias == "LONG" and ofi_strength > 0.7:
+        votes["LONG"] += 8.0
+        reasons.append("HFT TRACE: Aggressive buying consensus")
+    elif agg < 0.15 and ofi_bias == "SHORT" and ofi_strength > 0.7:
+        votes["SHORT"] += 8.0
+        reasons.append("HFT TRACE: Aggressive selling consensus")
+
+    # 4. BAIT VACUUM CHECK (ambil dari detector existing)
+    if result.get("_bait_vacuum_penalty_applied"):
+        votes["SHORT"] += 5.0
+        reasons.append("BAIT_VACUUM_PENALTY: vacuum dalam low volume = fake")
+
+    # 5. Exchange Risk sebagai penasihat saja (bukan hard block)
+    exchange_safe = result.get("exchange_safe_direction", "NEUTRAL")
+    exchange_risk_score = result.get("exchange_risk_score", 0)
+    if exchange_risk_score >= 7 and exchange_safe in ("LONG", "SHORT"):
+        if exchange_safe == "LONG":
+            votes["LONG"] += 4.0
+            reasons.append(f"EXCHANGE ADVICE: risk={exchange_risk_score}, safe=LONG")
+        else:
+            votes["SHORT"] += 4.0
+            reasons.append(f"EXCHANGE ADVICE: risk={exchange_risk_score}, safe=SHORT")
+
+    # 6. Post-Kill / Pre-Sweep flags
+    if result.get("_post_kill_follow"):
+        pk_bias = result.get("_post_kill_bias")
+        if pk_bias == "LONG":
+            votes["LONG"] += 6.0
+        elif pk_bias == "SHORT":
+            votes["SHORT"] += 6.0
+        reasons.append("POST-KILL FOLLOW active")
+
+    if result.get("_pre_kill_sweep_detected"):
+        sweep_bias = result.get("_pre_kill_sweep_bias")
+        if sweep_bias == "LONG":
+            votes["LONG"] += 5.0
+        elif sweep_bias == "SHORT":
+            votes["SHORT"] += 5.0
+        reasons.append("PRE-KILL SWEEP active")
+
+    # -- Keputusan akhir ---------------------------------------------------
     total_votes = votes["LONG"] + votes["SHORT"]
     if total_votes > 0:
         long_pct = votes["LONG"] / total_votes
-        expected_bias = "LONG" if long_pct > 0.5 else "SHORT"
-        
-        # Check for extreme divergence (>85% or <15%)
-        if (long_pct > 0.85 or long_pct < 0.15) and result.get("bias", "NEUTRAL") != expected_bias:
-            # Downgrade confidence if ABSOLUTE
-            if result.get("confidence") == "ABSOLUTE":
-                result["confidence"] = "HIGH"
-            result["reason"] += f" | ⚠️ CONSENSUS DIVERGENCE: Override conflicts with strong aggregator vote (LONG={long_pct*100:.1f}%)."
+        if long_pct >= 0.65:
+            result["bias"] = "LONG"
+            result["confidence"] = "ABSOLUTE" if long_pct >= 0.8 else "HIGH"
+        elif long_pct <= 0.35:
+            result["bias"] = "SHORT"
+            result["confidence"] = "ABSOLUTE" if long_pct <= 0.2 else "HIGH"
+        else:
+            result["bias"] = "NEUTRAL"
+            result["confidence"] = "BLOCK"
+            reasons.append("DEADLOCK: Equal evidence for both sides.")
+    else:
+        result["bias"] = "NEUTRAL"
+        result["confidence"] = "BLOCK"
 
-    result["reason"] = "[AGGREGATOR] " + " | ".join(reasons) + " | Original: " + context.get("reason", "")
-    result["aggregator_reasons"] = reasons
+    result["entry_allowed"] = result["bias"] != "NEUTRAL"
+    result["reason"] = "[AGGREGATOR] " + " | ".join(reasons) + " | Original: " + result.get("reason", "")
     result["aggregator_votes"] = votes
-    
-    # ================= STEP 3: PERKUAT LOW VOLUME WARNING DI AGGREGATOR / REASON =================
-    # Tambahkan warning jika ada extreme divergence + ultra low vol
-    if volume_ratio < 0.30 and rsi6_5m < 30 and rsi6 > 65:
-        result["reason"] += f" | ⚠️ EXTREME DIVERGENCE + ULTRA LOW VOL → bear trap suspected"
-        # Kurangi LONG vote
-        if "aggregator_votes" in result:
-            result["aggregator_votes"]["LONG"] = max(0, result["aggregator_votes"].get("LONG", 8) - 5)
-    
-    # ========== HAPUS PAKSA SEMUA BLOK #2 (AGGREGATOR FINAL) ==========
-    if result.get("bias") in ("LONG", "SHORT"):
-        result["entry_allowed"] = True
-        result["confidence"] = "ABSOLUTE"
-        result["reason"] = "[FINAL UNLOCK] " + result.get("reason", "")
-    
-    # 🔥 PASTIKAN _final_bias_locked SELALU DI-SET SEBELUM RETURN
-    result["_final_bias_locked"] = result["bias"]
-    
-    return result
 
+    # Final lock
+    result["_final_bias_locked"] = result["bias"]
+    return result
 
 def greeks_final_screen(result: dict) -> dict:
     """
