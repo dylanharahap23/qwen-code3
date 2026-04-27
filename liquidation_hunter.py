@@ -10050,6 +10050,38 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
     Integrated with 7 Lecturer Rules for adversarial pattern protection.
     """
     # ================================================================
+    # 🛡️ LANGKAH 2 – BAIT / PREP PHASE FINAL LOCK
+    # Sebelum semua voting, letakkan blok ini untuk memastikan sinyal
+    # tidak akan keluar dari fase BAIT/PREP kecuali ada konfirmasi eksekusi nyata
+    # ================================================================
+    market_phase = result.get("market_phase", "UNKNOWN")
+    gamma_executing = result.get("greeks_gamma_executing", False)
+    gamma_exec_score = result.get("greeks_gamma_exec_score", 0)
+    latest_volume = result.get("latest_volume", 0)
+    volume_ma10 = result.get("volume_ma10", 1)
+    vol_spike = latest_volume / max(volume_ma10, 1)
+    short_liq_val = result.get("short_liq", 99)
+    long_liq_val = result.get("long_liq", 99)
+
+    if market_phase in ("BAIT", "PREP"):
+        # Hanya izinkan sinyal jika eksekusi sudah sangat nyata
+        extreme_kill = (
+            gamma_executing and 
+            gamma_exec_score >= 4 and 
+            vol_spike >= 2.5 and 
+            (short_liq_val < 0.5 or long_liq_val < 0.5)
+        )
+        if not extreme_kill:
+            result["bias"] = "NEUTRAL"
+            result["confidence"] = "BLOCK"
+            result["entry_allowed"] = False
+            result["priority_level"] = -21000
+            result["reason"] = "[BAIT/PREP FINAL LOCK] Fase manipulasi tanpa eksekusi nyata → NO TRADE. " + result.get("reason", "")
+            result["aggregator_reasons"] = []
+            result["aggregator_votes"] = {}
+            return result
+    
+    # ================================================================
     # 🛡️ SOLUSI 2: PREP PHASE HARD BLOCK DI AGGREGATOR
     # Cek market_phase di awal, sebelum voting apapun
     # Jika PREP, langsung block tanpa proses voting
@@ -10491,13 +10523,31 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
             reasons.append("LIQUIDITY LAW: long_liq ultra close")
         votes["SHORT"] += liq_weight
 
-    # Zero Sellers / Buyers (Vacuum)
+    # Zero Sellers / Buyers (Vacuum) - 🛡️ LANGKAH 1
     if down_energy < 0.01 and up_energy > 0.5:
-        votes["LONG"] += 8.0
-        reasons.append("VACUUM: No sellers + active buyers")
+        # Jangan memberi vote penuh jika OFI & Agg berkata sebaliknya
+        ofi_bias = context.get("ofi_bias", "NEUTRAL")
+        ofi_strength = context.get("ofi_strength", 0.0)
+        agg_val = context.get("agg", 0.5)
+        if ofi_bias == "SHORT" and ofi_strength > 0.5 and agg_val < 0.4:
+            # Sinyal jual terlalu kuat, vacuum tidak reliable
+            votes["SHORT"] += 6.0
+            reasons.append("VACUUM OVERRULED BY STRONG SELL PRESSURE")
+        else:
+            votes["LONG"] += 8.0
+            reasons.append("VACUUM: No sellers + active buyers")
     if up_energy < 0.01 and down_energy > 0.5:
-        votes["SHORT"] += 8.0
-        reasons.append("VACUUM: No buyers + active sellers")
+        # Mirror untuk SHORT - Jangan memberi vote penuh jika OFI & Agg berkata sebaliknya
+        ofi_bias = context.get("ofi_bias", "NEUTRAL")
+        ofi_strength = context.get("ofi_strength", 0.0)
+        agg_val = context.get("agg", 0.5)
+        if ofi_bias == "LONG" and ofi_strength > 0.5 and agg_val > 0.6:
+            # Sinyal beli terlalu kuat, vacuum tidak reliable
+            votes["LONG"] += 6.0
+            reasons.append("VACUUM OVERRULED BY STRONG BUY PRESSURE")
+        else:
+            votes["SHORT"] += 8.0
+            reasons.append("VACUUM: No buyers + active sellers")
 
     # -----------------------------------------------------------------
     # 3. TIER 2: JEJAK HFT (Bobot 8.0)
@@ -33354,6 +33404,13 @@ class BinanceAnalyzer:
             # Bekukan state dalam snapshot atomic sebelum return
             snapshot = self.freeze_state(result)
             snapshot = self.resolve_priority_chain(snapshot)
+            
+            # 🛡️ LANGKAH 3 – PAKSA DATA JSON DI SEMUA OUTPUT
+            # Pastikan display tidak menipu, perbarui semua field tampilan dengan data dari JSON asli
+            snapshot["agg_display"] = snapshot.get("agg", snapshot.get("agg_display", 0.5))
+            snapshot["ofi_bias_display"] = snapshot.get("ofi_bias", snapshot.get("ofi_bias_display", "NEUTRAL"))
+            snapshot["algo_type_display"] = snapshot.get("algo_type_bias", snapshot.get("algo_type_display", "NEUTRAL"))
+            snapshot["hft_6pct_display"] = snapshot.get("hft_6pct_bias", snapshot.get("hft_6pct_display", "NEUTRAL"))
             
             # Simpan snapshot untuk referensi
             self._last_snapshot = snapshot
