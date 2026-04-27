@@ -11457,7 +11457,7 @@ def hawkes_squeeze_validity_gate(result: dict, hawkes_predictor) -> tuple:
         already_too_late = change_5m > 7.0 and score < 5
         hawkes_contradict = (
             prediction["who_dies_first"] == "LONG" and 
-            prediction["confidence"] > 0.10  # threshold lebih sensitif
+            prediction["confidence"] > 0.25  # threshold lebih sensitif
         )
         
         if already_too_late or hawkes_contradict:
@@ -11485,7 +11485,7 @@ def hawkes_squeeze_validity_gate(result: dict, hawkes_predictor) -> tuple:
         already_too_late = change_5m > 7.0 and score < 5
         hawkes_contradict = (
             prediction["who_dies_first"] == "SHORT" and 
-            prediction["confidence"] > 0.10
+            prediction["confidence"] > 0.25
         )
         
         if already_too_late or hawkes_contradict:
@@ -24450,6 +24450,7 @@ class BinanceAnalyzer:
         import copy
         snapshot = copy.deepcopy(result)
         snapshot["_snapshot_timestamp"] = time.time()
+        print(f"[DEBUG] Snapshot created at {snapshot['_snapshot_timestamp']}")
         return snapshot
 
     def resolve_priority_chain(self, snapshot: dict) -> dict:
@@ -30802,8 +30803,8 @@ class BinanceAnalyzer:
         result["hawkes_lambda_long"] = prediction["lambda_long"]
         result["hawkes_lambda_short"] = prediction["lambda_short"]
 
-        # ── CASE 2: Hawkes CONTRADICT signal (threshold diturunkan ke 0.10 untuk sensitivitas lebih tinggi) ──
-        if (result["bias"] == "LONG" and prediction["who_dies_first"] == "LONG" and prediction["confidence"] > 0.10):
+        # ── CASE 2: Hawkes CONTRADICT signal (threshold diturunkan ke 0.25 untuk sensitivitas lebih tinggi) ──
+        if (result["bias"] == "LONG" and prediction["who_dies_first"] == "LONG" and prediction["confidence"] > 0.25):
             result["bias"] = "SHORT"
             result["_hawkes_gate_triggered"] = True   # 🔥 LANGKAH 2: TAMBAHKAN FLAG INI
             result["confidence"] = "ABSOLUTE"
@@ -30811,7 +30812,7 @@ class BinanceAnalyzer:
             result["entry_allowed"] = True
             return result
 
-        if (result["bias"] == "SHORT" and prediction["who_dies_first"] == "SHORT" and prediction["confidence"] > 0.10):
+        if (result["bias"] == "SHORT" and prediction["who_dies_first"] == "SHORT" and prediction["confidence"] > 0.25):
             result["bias"] = "LONG"
             result["_hawkes_gate_triggered"] = True   # 🔥 LANGKAH 2: TAMBAHKAN FLAG INI
             result["confidence"] = "ABSOLUTE"
@@ -34142,6 +34143,7 @@ class OutputFormatter:
         print(f"🔥 {result.get('symbol', 'UNKNOWN')} @ {result.get('timestamp', '')}")
         print(f"💰 Price: ${result.get('price', 0):.4f}")
         print(f"🆔 Analysis ID: {analysis_id}")  # NEW: Display analysis_id
+        print(f"🕒 Snapshot time: {result.get('_snapshot_timestamp', 'N/A')}")
         print("="*80)
 
         print(f"\n{'='*40}")
