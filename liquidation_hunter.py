@@ -10319,30 +10319,25 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
     
     if (short_liq_abs < 1.0 and short_liq_abs < long_liq_abs and greeks_kill == "LONG") or \
        (long_liq_abs < 1.0 and long_liq_abs < short_liq_abs and greeks_kill == "SHORT"):
-        # TAHAP 3.2: Syarat tambahan: gamma executing atau volume spike > 1.3x
-        gamma_exec = result.get("greeks_gamma_executing", False)
-        vol_spike = result.get("latest_volume", 0) / max(result.get("volume_ma10", 1), 1)
-        liq_ok = False
-        if (short_liq_abs < 1.0 and short_liq_abs < long_liq_abs and greeks_kill == "LONG"):
-            liq_ok = True
-        elif (long_liq_abs < 1.0 and long_liq_abs < short_liq_abs and greeks_kill == "SHORT"):
-            liq_ok = True
-
-        if liq_ok and (gamma_exec or vol_spike > 1.3):
-            result["bias"] = greeks_kill
-            result["confidence"] = "ABSOLUTE"
-            result["priority_level"] = -40000
-            result["entry_allowed"] = True
-            result["reason"] = f"[LIQ PROXIMITY ABSOLUTE] Target liq <1.0% (short={short_liq_abs:.2f}%, long={long_liq_abs:.2f}%), kill direction={greeks_kill}. Gamma exec={gamma_exec}, vol_spike={vol_spike:.2f}x. No gate can override."
-            result["aggregator_reasons"] = ["LIQUIDITY PROXIMITY ABSOLUTE: Forced " + greeks_kill]
-            result["aggregator_votes"] = {"LIQ_ABSOLUTE": greeks_kill}
-            # Clear potential conflict fields
-            result["bias_kill_conflict"] = {"has_conflict": False}
-            result["dual_liq_trap"] = {"dual_liq_trap": False}
-            return result
-        else:
-            # Jangan override, biarkan keputusan lain
-            pass
+        
+        # 🔥 FIX: HAPUS SYARAT TAMBAHAN (gamma_exec or vol_spike)
+        # Langsung override, tidak perlu kondisi apapun lagi
+        result["bias"] = greeks_kill
+        result["confidence"] = "ABSOLUTE"
+        result["priority_level"] = -40000
+        result["entry_allowed"] = True
+        result["_liq_absolute_lock"] = True   # 🔥 FLAG UNTUK GATE LAIN
+        result["_final_bias_locked"] = greeks_kill
+        result["reason"] = (
+            f"[LIQ PROXIMITY ABSOLUTE] Target liq <1.0% (short={short_liq_abs:.2f}%, long={long_liq_abs:.2f}%), "
+            f"kill direction={greeks_kill}. NO GATE CAN OVERRIDE. | " + result.get("reason", "")
+        )
+        result["aggregator_reasons"] = ["LIQUIDITY PROXIMITY ABSOLUTE: Forced " + greeks_kill]
+        result["aggregator_votes"] = {"LIQ_ABSOLUTE": greeks_kill}
+        # Clear potential conflict fields
+        result["bias_kill_conflict"] = {"has_conflict": False}
+        result["dual_liq_trap"] = {"dual_liq_trap": False}
+        return result   # ⬅️ EARLY RETURN
     
     # ================================================================
     # 🛡️ PERBAIKAN 1: PRE-KILL EXCEPTION (Overrides Exchange Gate, Priority -30500)
@@ -10382,28 +10377,33 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
     # -----------------------------------------------------------------
     # 0. EXCHANGE RISK HARD BLOCK (dengan threshold dinamis, Priority -30000)
     # -----------------------------------------------------------------
-    exchange_risk_score = result.get("exchange_risk_score", 0)
-    exchange_safe = result.get("exchange_safe_direction", "NEUTRAL")
-    greeks_bias = result.get("greeks_bias", "NEUTRAL")
-    rsi14_val = result.get("rsi14", 50.0)
-    rsi6_val = result.get("rsi6", 50.0)
-    short_liq = result.get("short_liq", 99.0)
-    delta_exposure = result.get("greeks_delta_exposure", 0.0)
-    up_energy_val = result.get("up_energy", 0.0)
+    # 🔥 FIX: Jangan jalankan jika LIQ ABSOLUTE sudah lock
+    if result.get("_liq_absolute_lock"):
+        # Skip exchange hard block, biarkan LIQ ABSOLUTE menang
+        pass
+    else:
+        exchange_risk_score = result.get("exchange_risk_score", 0)
+        exchange_safe = result.get("exchange_safe_direction", "NEUTRAL")
+        greeks_bias = result.get("greeks_bias", "NEUTRAL")
+        rsi14_val = result.get("rsi14", 50.0)
+        rsi6_val = result.get("rsi6", 50.0)
+        short_liq = result.get("short_liq", 99.0)
+        delta_exposure = result.get("greeks_delta_exposure", 0.0)
+        up_energy_val = result.get("up_energy", 0.0)
+        
+        # 🛡️ PERBAIKAN 2: Exchange Risk Score Dinamis (Anti-Manipulasi Threshold)
+        effective_threshold = 6  # default
+        # Jika Greeks sangat kuat dan berlawanan dengan exchange_safe, naikkan threshold
+        if greeks_bias in ("LONG", "SHORT") and greeks_bias != exchange_safe:
+            if result.get("greeks_gamma_exec_score", 0) >= 4:
+                effective_threshold = 7  # perlu risiko lebih tinggi untuk override
+                # Atau bisa langsung downgrade ke soft suggestion (tidak hard block)
+        
+        # Kondisi pengecualian: jika ini adalah genuine short squeeze (RSI rendah + short_liq dekat + exchange_safe = LONG)
+        is_genuine_squeeze = (rsi6_val < 40 and short_liq < 3.0 and exchange_safe == "LONG")
     
-    # 🛡️ PERBAIKAN 2: Exchange Risk Score Dinamis (Anti-Manipulasi Threshold)
-    effective_threshold = 6  # default
-    # Jika Greeks sangat kuat dan berlawanan dengan exchange_safe, naikkan threshold
-    if greeks_bias in ("LONG", "SHORT") and greeks_bias != exchange_safe:
-        if result.get("greeks_gamma_exec_score", 0) >= 4:
-            effective_threshold = 7  # perlu risiko lebih tinggi untuk override
-            # Atau bisa langsung downgrade ke soft suggestion (tidak hard block)
-    
-    # Kondisi pengecualian: jika ini adalah genuine short squeeze (RSI rendah + short_liq dekat + exchange_safe = LONG)
-    is_genuine_squeeze = (rsi6_val < 40 and short_liq < 3.0 and exchange_safe == "LONG")
-
-    if short_liq < 0.5 and delta_exposure > 0.9:
-        exchange_risk_score = min(exchange_risk_score, 5)
+        if short_liq < 0.5 and delta_exposure > 0.9:
+            exchange_risk_score = min(exchange_risk_score, 5)
     
     # 🧩 RULE 6: RSI5m Exhaustion Override check BEFORE Exchange Hard Block
     rsi5m = result.get("rsi6_5m", 50.0)
