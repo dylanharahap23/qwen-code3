@@ -143,6 +143,79 @@ class PostSqueezeExhaustionDetector:
         return {"override": False}
 
 
+# ================= HAWKES LIQUIDATION PREDICTOR =================
+class HawkesLiquidationPredictor:
+    """
+    Multivariate Hawkes Process untuk memprediksi siapa yang akan terlikuidasi duluan.
+    Menggunakan self-excitation dan cross-excitation antara LONG_LIQ dan SHORT_LIQ events.
+    """
+    def __init__(self):
+        # Baseline intensities (event/detik)
+        self.mu_L = 0.02
+        self.mu_S = 0.02
+
+        # Self-excitation
+        self.alpha_LL = 0.6
+        self.alpha_SS = 0.6
+
+        # Cross-excitation
+        self.alpha_LS = 0.3
+        self.alpha_SL = 0.3
+
+        self.beta = 10.0          # decay rate (1/detik)
+        self.t_last = time.time()
+
+        # Recursive R (sub‑milidetik update)
+        self.R_LL = 0.0
+        self.R_SS = 0.0
+        self.R_LS = 0.0
+        self.R_SL = 0.0
+
+    def update_recursive(self, t_new, event_type):
+        """Panggil setiap ada event liquidasi masuk (LONG_LIQ / SHORT_LIQ)."""
+        dt = t_new - self.t_last
+        decay = np.exp(-self.beta * dt)
+
+        self.R_LL = decay * (self.R_LL + (1 if event_type == 'LONG_LIQ'  else 0))
+        self.R_SS = decay * (self.R_SS + (1 if event_type == 'SHORT_LIQ' else 0))
+        self.R_LS = decay * (self.R_LS + (1 if event_type == 'LONG_LIQ'  else 0))
+        self.R_SL = decay * (self.R_SL + (1 if event_type == 'SHORT_LIQ' else 0))
+
+        self.t_last = t_new
+
+        lambda_long  = self.mu_L + self.alpha_LL * self.R_LL + self.alpha_SL * self.R_SS
+        lambda_short = self.mu_S + self.alpha_SS * self.R_SS + self.alpha_LS * self.R_LL
+
+        return lambda_long, lambda_short
+
+    def predict_who_dies_first(self, t_now, long_dist, short_dist):
+        """Prediksi siapa yang akan tersapu duluan."""
+        decay = np.exp(-self.beta * (t_now - self.t_last))
+        R_LL_now = self.R_LL * decay
+        R_SS_now = self.R_SS * decay
+        R_LS_now = self.R_LS * decay
+        R_SL_now = self.R_SL * decay
+
+        lambda_long  = self.mu_L + self.alpha_LL * R_LL_now + self.alpha_SL * R_SS_now
+        lambda_short = self.mu_S + self.alpha_SS * R_SS_now + self.alpha_LS * R_LL_now
+
+        score_long_dies  = lambda_long  / max(long_dist,  0.001)
+        score_short_dies = lambda_short / max(short_dist, 0.001)
+
+        total = score_long_dies + score_short_dies
+        prob_long_dies  = score_long_dies  / total
+        prob_short_dies = score_short_dies / total
+
+        return {
+            "prob_long_dies":  round(prob_long_dies, 3),
+            "prob_short_dies": round(prob_short_dies, 3),
+            "lambda_long":     round(lambda_long, 4),
+            "lambda_short":    round(lambda_short, 4),
+            "who_dies_first":  "LONG" if prob_long_dies > prob_short_dies else "SHORT",
+            "confidence":      round(abs(prob_long_dies - prob_short_dies), 3)
+        }
+
+
 def is_post_squeeze_exhausted(result: dict) -> bool:
     """
     Cek apakah short squeeze sudah exhausted (selesai) dan akan reversal.
@@ -24186,7 +24259,7 @@ class BinanceAnalyzer:
         # LECTURER FIX: Atomic snapshot state
         self._last_snapshot = None
         
-        # ========== HAWKES PROCESS PARAMETERS ==========
+        # ========== HAWKES PROCESS PARAMETERS (LEGACY) ==========
         self.hawkes_mu = 0.05          # baseline intensity (event/detik)
         self.hawkes_alpha = 0.3        # jump size
         self.hawkes_beta = 0.5         # decay rate (1/detik)
@@ -24197,6 +24270,13 @@ class BinanceAnalyzer:
         
         # Tambahkan storage untuk trade timestamps
         self.hawkes_trade_times = []   # list of timestamps
+        
+        # ========== HAWKES LIQUIDATION PREDICTOR (MULTIVARIATE) ==========
+        self.hawkes_predictor = HawkesLiquidationPredictor()
+        
+        # Storage untuk tracking liquidasi event
+        self.last_long_liq = None
+        self.last_short_liq = None
 
     def __del__(self):
         if hasattr(self, 'ws') and self.ws is not None:
@@ -30495,7 +30575,55 @@ class BinanceAnalyzer:
             result["priority_level"] = -5000
             result["reason"] = f"[HAWKES GATE] Branching {hawkes_branching:.2f} / Intensity {hawkes_intensity:.3f} → pasar tidak stabil, NO TRADE. " + result.get("reason", "")
             return result
-        # ========== END HAWKES GATE ==========
+        # ========== END HAWKES GATE ==========\n        
+        # ========== HAWKES LIQUIDATION PREDICTOR GATE (MULTIVARIATE) ==========
+        hawkes_data = {
+            "timestamp_ms": time.time() * 1000,
+            "long_liq": result.get("long_liq", 99),
+            "short_liq": result.get("short_liq", 99),
+            "change_5m": result.get("change_5m", 0),
+            "volume_ratio": result.get("volume_ratio", 1.0),
+            "agg": result.get("agg", 0.5),
+            "ofi_bias": result.get("ofi_bias", "NEUTRAL")
+        }
+
+        t_now = hawkes_data["timestamp_ms"] / 1000.0
+        long_dist = hawkes_data["long_liq"] / 100.0
+        short_dist = hawkes_data["short_liq"] / 100.0
+
+        prediction = self.hawkes_predictor.predict_who_dies_first(t_now, long_dist, short_dist)
+
+        # Simpan hasil Hawkes ke result
+        result["hawkes_who_dies"] = prediction["who_dies_first"]
+        result["hawkes_confidence"] = prediction["confidence"]
+        result["hawkes_lambda_long"] = prediction["lambda_long"]
+        result["hawkes_lambda_short"] = prediction["lambda_short"]
+
+        # ── CASE 2: Hawkes CONTRADICT signal ──
+        if (result["bias"] == "LONG" and prediction["who_dies_first"] == "LONG" and prediction["confidence"] > 0.15):
+            result["bias"] = "SHORT"
+            result["confidence"] = "ABSOLUTE"
+            result["reason"] = f"[HAWKES OVERRIDE] LONG dies first despite squeeze signal → force SHORT. " + result.get("reason", "")
+            result["entry_allowed"] = True
+            return result
+
+        if (result["bias"] == "SHORT" and prediction["who_dies_first"] == "SHORT" and prediction["confidence"] > 0.15):
+            result["bias"] = "LONG"
+            result["confidence"] = "ABSOLUTE"
+            result["reason"] = f"[HAWKES OVERRIDE] SHORT dies first despite dump signal → force LONG. " + result.get("reason", "")
+            result["entry_allowed"] = True
+            return result
+
+        # ── CASE 3: Cascade imminent ──
+        branching_L = self.hawkes_predictor.alpha_LL / self.hawkes_predictor.beta
+        branching_S = self.hawkes_predictor.alpha_SS / self.hawkes_predictor.beta
+        if branching_L > 0.85 or branching_S > 0.85:
+            result["bias"] = "NEUTRAL"
+            result["confidence"] = "BLOCK"
+            result["entry_allowed"] = False
+            result["reason"] = f"[HAWKES CASCADE IMMINENT] Branching {max(branching_L, branching_S):.2f} > 0.85 → NO TRADE. " + result.get("reason", "")
+            return result
+        # ========== END HAWKES LIQUIDATION PREDICTOR GATE ==========
         
         # Jika sinyal diizinkan entry dan bias bukan NEUTRAL, update state eksekusi
         if result.get("entry_allowed") and result.get("bias") in ("LONG", "SHORT"):
@@ -30586,6 +30714,22 @@ class BinanceAnalyzer:
                 else "LOW"
             )
             liq = IndicatorCalculator.get_liquidation_zones(highs_1m, lows_1m, price)
+            
+            # ========== HAWKES LIQUIDATION EVENT DETECTION ==========
+            # Deteksi event likuidasi dari perubahan long_liq dan short_liq
+            if hasattr(self, 'last_long_liq') and hasattr(self, 'last_short_liq'):
+                if self.last_long_liq is not None and self.last_short_liq is not None:
+                    # Long liq menipis = beberapa long terlikuidasi
+                    if liq["long_dist"] < self.last_long_liq - 0.05:
+                        self.hawkes_predictor.update_recursive(time.time(), 'LONG_LIQ')
+                    # Short liq menipis = beberapa short terlikuidasi
+                    if liq["short_dist"] < self.last_short_liq - 0.05:
+                        self.hawkes_predictor.update_recursive(time.time(), 'SHORT_LIQ')
+
+            self.last_long_liq = liq["long_dist"]
+            self.last_short_liq = liq["short_dist"]
+            # ========== END HAWKES LIQUIDATION EVENT DETECTION ==========
+            
             ma25 = IndicatorCalculator.calculate_ma(closes_1m, 25)
             ma99 = IndicatorCalculator.calculate_ma(closes_1m, 99)
 
