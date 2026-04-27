@@ -10558,23 +10558,25 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
     # ================================================================
     # 🧩 RULE 5: Regime-Phase Conflict Block (Early Stage Check)
     # Dangerous combination: LIQUIDATION_HUNT + BAIT requires 2 confirmations
+    # 🔥 DINONAKTIFKAN - PAKSA UNBLOCK AKAN MENGEMBALIKAN BIAS NANTI
     # ================================================================
-    market_regime = result.get("market_regime", "UNKNOWN")
-    market_phase = result.get("market_phase", "UNKNOWN")
-    if market_regime == "LIQUIDATION_HUNT" and market_phase == "BAIT":
-        independent_absolute = 0
-        if result.get("exchange_risk_score", 0) >= 6:
-            independent_absolute += 1
-        if result.get("greeks_gamma_intensity") == "EXTREME":
-            independent_absolute += 1
-        if result.get("obv_magnitude") == "HIGH":
-            independent_absolute += 1
-        if independent_absolute < 2:
-            result["bias"] = "NEUTRAL"
-            result["confidence"] = "BLOCK"
-            result["entry_allowed"] = False
-            result["reason"] = "[REGIME-PHASE CONFLICT] LIQUIDATION_HUNT + BAIT without 2 confirmations → NO TRADE"
-            return result
+    # DISABLED: Regime-Phase Conflict Block - akan di-unlock nanti oleh PAKSA UNBLOCK
+    # market_regime = result.get("market_regime", "UNKNOWN")
+    # market_phase = result.get("market_phase", "UNKNOWN")
+    # if market_regime == "LIQUIDATION_HUNT" and market_phase == "BAIT":
+    #     independent_absolute = 0
+    #     if result.get("exchange_risk_score", 0) >= 6:
+    #         independent_absolute += 1
+    #     if result.get("greeks_gamma_intensity") == "EXTREME":
+    #         independent_absolute += 1
+    #     if result.get("obv_magnitude") == "HIGH":
+    #         independent_absolute += 1
+    #     if independent_absolute < 2:
+    #         result["bias"] = "NEUTRAL"
+    #         result["confidence"] = "BLOCK"
+    #         result["entry_allowed"] = False
+    #         result["reason"] = "[REGIME-PHASE CONFLICT] LIQUIDATION_HUNT + BAIT without 2 confirmations → NO TRADE"
+    #         return result
 
     # ================================================================
     # 🧩 RULE 3: Liquidity Asymmetry Trap Detector
@@ -24570,6 +24572,9 @@ class BinanceAnalyzer:
             result["reason"] = "[UNLOCKED] " + result.get("reason", "")
             # Jangan return, biarkan Hawkes di akhir yang memutuskan
         
+        # ========== SIMPAN BIAS ASLI SEBELUM SEMUA FILTER ==========
+        original_bias = result.get("bias", "NEUTRAL")
+        
         # ===== SINGLE SOURCE OF TRUTH: AMBIL SEMUA DARI result SEKALI DI AWAL =====
         # Ini adalah JSON ground truth - semua variabel harus dari result dictionary
         agg = float(result.get("agg", 0.5))
@@ -30560,6 +30565,16 @@ class BinanceAnalyzer:
 
         # ========== PERSISTENCE FILTER (GABUNGAN DOSEN + POSITION HOLDING) ==========
         result = self._apply_persistence_filter(result)
+        
+        # ========== PAKSA UNBLOCK SEMUA BLOKIRAN SEBELUM HAWKES ==========
+        # Ini akan mengembalikan bias ke original_bias jika awalnya LONG/SHORT
+        # Tidak peduli berapa banyak blok di tengah, semua akan ditembus
+        if original_bias in ("LONG", "SHORT"):
+            result["bias"] = original_bias
+            result["confidence"] = "ABSOLUTE"
+            result["entry_allowed"] = True
+            result["priority_level"] = -1  # reset priority
+            result["reason"] = "[UNBLOCKED] " + result.get("reason", "")
         
         # ========== HAWKES PROCESS GATE (SATU-SATUNYA BLOCK) ==========
         hawkes_intensity = result.get("hawkes_intensity", 0)
