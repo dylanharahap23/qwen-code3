@@ -11451,6 +11451,7 @@ def hawkes_squeeze_validity_gate(result: dict, hawkes_predictor) -> tuple:
                     f"λ_L={prediction['lambda_long']:.4f})"
                 )
             
+            result["_hawkes_gate_triggered"] = True   # 🔥 LANGKAH 2: TAMBAHKAN FLAG INI
             result["bias"] = "SHORT"
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = -31500
@@ -11479,6 +11480,7 @@ def hawkes_squeeze_validity_gate(result: dict, hawkes_predictor) -> tuple:
                 )
             
             result["bias"] = "LONG"
+            result["_hawkes_gate_triggered"] = True   # 🔥 LANGKAH 2: TAMBAHKAN FLAG INI
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = -31500
             result["entry_allowed"] = True
@@ -24826,6 +24828,7 @@ class BinanceAnalyzer:
         exhaustion = PostSqueezeExhaustionDetector.detect(result)
         if exhaustion["override"]:
             result["_exhaustion_gate_triggered"] = True
+            result["_hawkes_gate_triggered"] = True   # 🔥 LANGKAH 2: TAMBAHKAN FLAG INI
             result["bias"] = exhaustion["new_bias"]
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = -31000
@@ -30783,6 +30786,7 @@ class BinanceAnalyzer:
         # ── CASE 2: Hawkes CONTRADICT signal (threshold diturunkan ke 0.10 untuk sensitivitas lebih tinggi) ──
         if (result["bias"] == "LONG" and prediction["who_dies_first"] == "LONG" and prediction["confidence"] > 0.10):
             result["bias"] = "SHORT"
+            result["_hawkes_gate_triggered"] = True   # 🔥 LANGKAH 2: TAMBAHKAN FLAG INI
             result["confidence"] = "ABSOLUTE"
             result["reason"] = f"[HAWKES OVERRIDE] LONG dies first despite squeeze signal → force SHORT. " + result.get("reason", "")
             result["entry_allowed"] = True
@@ -30790,6 +30794,7 @@ class BinanceAnalyzer:
 
         if (result["bias"] == "SHORT" and prediction["who_dies_first"] == "SHORT" and prediction["confidence"] > 0.10):
             result["bias"] = "LONG"
+            result["_hawkes_gate_triggered"] = True   # 🔥 LANGKAH 2: TAMBAHKAN FLAG INI
             result["confidence"] = "ABSOLUTE"
             result["reason"] = f"[HAWKES OVERRIDE] SHORT dies first despite dump signal → force LONG. " + result.get("reason", "")
             result["entry_allowed"] = True
@@ -30806,18 +30811,42 @@ class BinanceAnalyzer:
             return result
         # ========== END HAWKES LIQUIDATION PREDICTOR GATE ==========
         
-        # ========== HAPUS PAKSA SEMUA BLOK #2 ==========
+        # ================================================================
+        # 🔥 HAWKES GATE — PALING UTAMA, TIDAK BISA DI-OVERRIDE
+        # ================================================================
+        if result.get("_hawkes_gate_triggered"):
+            # Hawkes sudah memutuskan — kunci mati, tidak ada yang boleh ubah
+            result["_final_bias_locked"] = result["bias"]
+            result["_lock_reason"] = "HAWKES_ABSOLUTE_LOCK"
+            result["entry_allowed"] = True
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = -99999
+            return result   # ⬅️ LANGSUNG KELUAR, bypass semua di bawahnya
+
+        # ================================================================
+        # RESET FINAL – SEMUA SINYAL LONG/SHORT WAJIB ABSOLUTE
+        # ================================================================
         if result.get("bias") in ("LONG", "SHORT"):
             result["entry_allowed"] = True
             result["confidence"] = "ABSOLUTE"
-            result["reason"] = "[FINAL UNLOCK] " + result.get("reason", "")
-        
-        # Jika sinyal diizinkan entry dan bias bukan NEUTRAL, update state eksekusi
-        if result.get("entry_allowed") and result.get("bias") in ("LONG", "SHORT"):
-            self.last_executed_bias = result["bias"]
-            self.last_executed_time = time.time()
-        
+            result["priority_level"] = -99998
+            result["reason"] = "[ABSOLUTE] " + result.get("reason", "").replace("BLOCKED", "ACTIVE").replace("NO TRADE", "ENTRY")
+
+        # ================================================================
+        # HAWKES INTENSITY CHECK (hanya untuk sinyal yang belum di-trigger Hawkes)
+        # ================================================================
+        hawkes_branching = result.get("hawkes_branching", 0)
+        hawkes_intensity = result.get("hawkes_intensity", 0)
+        hawkes_baseline = result.get("hawkes_baseline", 0.05)
+
+        if hawkes_branching > 0.85 or hawkes_intensity > 3 * hawkes_baseline:
+            result["bias"] = "NEUTRAL"
+            result["confidence"] = "BLOCK"
+            result["entry_allowed"] = False
+            result["reason"] = f"[HAWKES STOP] Branching {hawkes_branching:.2f}, Intensity {hawkes_intensity:.3f} > threshold. NO TRADE."
+
         return result
+
 
     def analyze(self) -> Optional[Dict]:
         try:
