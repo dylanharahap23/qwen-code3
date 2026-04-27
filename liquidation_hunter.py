@@ -10433,6 +10433,45 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
             votes["SHORT"] += 5.0
         reasons.append("PRE-KILL SWEEP active")
 
+    # ========== TAMBAHAN DARURAT DARI DOSEN ==========
+    # 7. RSI MULTI-TF CONSISTENCY
+    rsi6 = result.get("rsi6", 50)
+    rsi6_5m = result.get("rsi6_5m", 50)
+
+    # RSI1m overbought tapi RSI5m masih rendah = pump berlanjut
+    if rsi6 > 80 and rsi6_5m < 45:
+        votes["LONG"] += 5.0
+        reasons.append(f"RSI_MULTITF: 1m overbought ({rsi6:.0f}) tapi 5m masih rendah ({rsi6_5m:.0f}) → pump berlanjut")
+
+    # RSI1m oversold tapi RSI5m masih tinggi = dump berlanjut
+    if rsi6 < 20 and rsi6_5m > 55:
+        votes["SHORT"] += 5.0
+        reasons.append(f"RSI_MULTITF: 1m oversold ({rsi6:.0f}) tapi 5m masih tinggi ({rsi6_5m:.0f}) → dump berlanjut")
+
+    # 8. FUNDING RATE CONTEXT
+    funding = result.get("funding_rate", 0)
+    if funding is None:
+        funding = 0.0
+    obv = result.get("obv_trend", "NEUTRAL")
+
+    # Double trap: funding negatif tapi long liq sangat dekat + OBV distribusi
+    if funding < -0.005 and long_liq < 0.5 and "NEGATIVE" in obv:
+        votes["SHORT"] += 7.0  # dump dulu sebelum squeeze
+        reasons.append(f"DOUBLE_TRAP: funding={funding:.4f} tapi long_liq={long_liq:.2f}% → dump first")
+
+    # Funding positif tinggi + ACCUMULATION = longs akan di-dump
+    elif funding > 0.002 and result.get("market_regime") == "ACCUMULATION":
+        votes["SHORT"] += 5.0
+        reasons.append(f"CROWDED_LONGS: funding={funding:.4f} + ACCUMULATION → dump incoming")
+
+    # 9. REGIME SKIP
+    if result.get("regime_risk") == "SKIP":
+        # Tambah bobot netral untuk paksa DEADLOCK jika tidak ada sinyal kuat
+        votes["LONG"] = votes["LONG"] * 0.5   # debuff semua votes
+        votes["SHORT"] = votes["SHORT"] * 0.5
+        reasons.append("REGIME_SKIP: semua bobot di-debuff 50%")
+    # ========== AKHIR TAMBAHAN DOSEN ==========
+
     # -- Keputusan akhir ---------------------------------------------------
     total_votes = votes["LONG"] + votes["SHORT"]
     if total_votes > 0:
