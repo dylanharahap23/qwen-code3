@@ -10403,6 +10403,7 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
     short_liq = result.get("short_liq", 99.0)
     delta_exposure = result.get("greeks_delta_exposure", 0.0)
     is_genuine_squeeze = False
+    effective_threshold = 6  # default threshold
 
     if hawkes_locked or squeeze_locked or liq_absolute:
         # Skip exchange hard block, hormati gate yang lebih tinggi
@@ -10413,7 +10414,6 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
         up_energy_val = result.get("up_energy", 0.0)
         
         # 🛡️ PERBAIKAN 2: Exchange Risk Score Dinamis (Anti-Manipulasi Threshold)
-        effective_threshold = 6  # default
         # Jika Greeks sangat kuat dan berlawanan dengan exchange_safe, naikkan threshold
         if greeks_bias in ("LONG", "SHORT") and greeks_bias != exchange_safe:
             if result.get("greeks_gamma_exec_score", 0) >= 4:
