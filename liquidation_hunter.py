@@ -10402,7 +10402,7 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
     rsi6_val = result.get("rsi6", 50.0)
     short_liq = result.get("short_liq", 99.0)
     delta_exposure = result.get("greeks_delta_exposure", 0.0)
-    is_genuine_squeeze = False
+    is_genuine_squeeze = False  # default value
     effective_threshold = 6  # default threshold
 
     if hawkes_locked or squeeze_locked or liq_absolute:
