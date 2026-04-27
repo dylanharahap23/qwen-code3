@@ -23,13 +23,19 @@ node_modules/
 # Build artifacts
 dist/
 build/
+target/
 *.egg-info/
 
 # Editors
 .vscode/
 .idea/
 
-# System files
+# Coverage reports
+.coverage
+htmlcov/
+coverage/
+
+# OS specific
 .DS_Store
 Thumbs.db
 ```
