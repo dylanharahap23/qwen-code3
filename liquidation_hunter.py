@@ -23837,6 +23837,21 @@ class BinanceAnalyzer:
         # Priority ladder (semakin negatif semakin tinggi prioritas)
         candidates = []
         
+        # ========== PAGAR EXCHANGE HARD BLOCK ==========
+        # Physics / Greeks / Hawkes sudah final → Exchange tidak boleh ikut campur
+        if snapshot.get("priority_level", 0) <= -99000:
+            # Komandan tertinggi sudah memutuskan, abaikan semua override di bawahnya
+            return snapshot
+
+        if snapshot.get("_hawkes_gate_triggered") or snapshot.get("_squeeze_validity_gate_triggered"):
+            # Hawkes/Squeeze validity adalah kebenaran pasar, Exchange hanya opini
+            return snapshot
+
+        if snapshot.get("_liq_absolute_lock"):
+            # Liquidity absolute lock di -40000 sudah terpasang → tidak bisa digoyang
+            return snapshot
+        # =================================================
+
         # 1. Exchange Hard Block (priority -30000)
         exchange_bias = snapshot.get("exchange_safe_direction")
         exchange_score = snapshot.get("exchange_risk_score", 0)
