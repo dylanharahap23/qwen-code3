@@ -15,16 +15,21 @@ venv/
 # Logs
 *.log
 
+# Temporary files
+*.tmp
+*.swp
+*.swo
+
 # Coverage
 .coverage
 coverage/
 htmlcov/
 
-# Testing
-.pytest_cache/
-.mypy_cache/
+# IDE
+.vscode/
+.idea/
 
-# Distribution / packaging
+# Build and distribution
 dist/
 build/
 *.egg-info/
