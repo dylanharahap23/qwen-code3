@@ -6750,6 +6750,42 @@ class AdversarialRotationDetector:
         return {"risk": "LOW", "consecutive": same_dir, "discount": 0}
 
 
+class AdversarialAdaptationDetector:
+    """
+    Deteksi jika coin yang sama menghasilkan sinyal berlawanan dalam waktu singkat.
+    Jika terdeteksi: tingkatkan threshold confidence 2x.
+    """
+    def __init__(self):
+        self.signal_history = {}  # {symbol: [record]}
+
+    def record_signal(self, symbol: str, bias: str):
+        if symbol not in self.signal_history:
+            self.signal_history[symbol] = []
+        self.signal_history[symbol].append({
+            "time": time.time(),
+            "bias": bias
+        })
+        # Hanya simpan 60 menit terakhir
+        cutoff = time.time() - 3600
+        self.signal_history[symbol] = [
+            x for x in self.signal_history[symbol]
+            if x["time"] > cutoff
+        ]
+
+    def is_mirror_trap_likely(self, symbol: str, current_bias: str) -> bool:
+        history = self.signal_history.get(symbol, [])
+        if len(history) < 2:
+            return False
+        last_signal = history[-1]
+        time_gap = time.time() - last_signal["time"]
+        # Kalah dua kali dalam 60 menit dengan bias berlawanan
+        return (time_gap < 3600 and last_signal["bias"] != current_bias)
+
+    def get_confidence_penalty(self, symbol: str) -> float:
+        """Return multiplier untuk confidence threshold (1.0 = normal, 2.0 = butuh 2x lebih yakin)"""
+        return 2.0 if self.is_mirror_trap_likely(symbol, "") else 1.0
+
+
 class ReverseSqueezeBaitDetector:
     """
     🔥 PRIORITY -27300:
@@ -23946,6 +23982,9 @@ class BinanceAnalyzer:
         
         # ========== HAWKES LIQUIDATION PREDICTOR (MULTIVARIATE) ==========
         self.hawkes_predictor = HawkesLiquidationPredictor()
+        
+        # ========== ADVERSARIAL ADAPTATION DETECTOR ==========
+        self.adversarial_detector = AdversarialAdaptationDetector()
         
         # Storage untuk tracking liquidasi event
         self.last_long_liq = None
