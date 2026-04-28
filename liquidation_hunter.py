@@ -11199,6 +11199,166 @@ def apply_protect_genuine_squeeze(result: dict) -> tuple:
         return result, True
 
 
+# ================= SLOW BLEEDING KILL GUARDS =================
+
+def apply_liq_absolute_with_rsi_guard(result: dict) -> tuple:
+    """
+    LIQ ABSOLUTE (short_liq < 1.0% atau long_liq < 1.0%) hanya valid jika RSI tidak berlawanan.
+    Jika short_liq sangat dekat TAPI RSI6 > 70 dan RSI5m > 65 serta kill_dir = SHORT:
+        → Ini adalah OVERBOUGHT LIQ BAIT (pump sudah selesai, short_liq adalah umpan)
+        → Force SHORT, priority -42000 (lebih tinggi dari LIQ ABSOLUTE -40000)
+    Mirror untuk long_liq < 1.0% dengan RSI oversold.
+    """
+    short_liq = result.get("short_liq", 99)
+    long_liq = result.get("long_liq", 99)
+    rsi6 = result.get("rsi6", 50)
+    rsi6_5m = result.get("rsi6_5m", 50)
+    kill_dir = result.get("greeks_kill_direction", "")
+    
+    # Case: short_liq sangat dekat -> sistem akan paksa LONG
+    if short_liq < 1.0 and short_liq < long_liq:
+        # Tapi RSI keduanya overbought dan kill_dir = SHORT -> ini bait
+        if rsi6 > 70 and rsi6_5m > 65 and kill_dir == "SHORT":
+            result["bias"] = "SHORT"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = -42000
+            result["entry_allowed"] = True
+            result["_overbought_liq_bait"] = True
+            result["reason"] = (
+                f"[OVERBOUGHT_LIQ_BAIT] short_liq={short_liq:.2f}% <1% TAPI "
+                f"RSI6={rsi6:.0f} RSI5m={rsi6_5m:.0f} overbought, kill_dir={kill_dir} "
+                f"→ pump selesai, short_liq adalah UMPAN → FORCE SHORT"
+            )
+            return result, True
+    
+    # Case: long_liq sangat dekat -> sistem akan paksa SHORT
+    if long_liq < 1.0 and long_liq < short_liq:
+        # Tapi RSI keduanya oversold dan kill_dir = LONG -> ini bait
+        if rsi6 < 30 and rsi6_5m < 25 and kill_dir == "LONG":
+            result["bias"] = "LONG"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = -42000
+            result["entry_allowed"] = True
+            result["_oversold_liq_bait"] = True
+            result["reason"] = (
+                f"[OVERSOLD_LIQ_BAIT] long_liq={long_liq:.2f}% <1% TAPI "
+                f"RSI6={rsi6:.0f} RSI5m={rsi6_5m:.0f} oversold, kill_dir={kill_dir} "
+                f"→ dump selesai, long_liq adalah UMPAN → FORCE LONG"
+            )
+            return result, True
+    
+    return result, False
+
+
+def apply_pre_kill_sweep_with_rsi_guard(result: dict) -> tuple:
+    """
+    PRE_KILL_SWEEP dibatalkan jika RSI berlawanan (overbought saat mau LONG, oversold saat mau SHORT).
+    """
+    if not result.get("_pre_kill_sweep_detected"):
+        return result, False
+    
+    sweep_bias = result.get("_pre_kill_sweep_bias", "")
+    rsi6 = result.get("rsi6", 50)
+    rsi6_5m = result.get("rsi6_5m", 50)
+    kill_dir = result.get("greeks_kill_direction", "")
+    
+    # Sweep mau LONG tapi RSI overbought dan kill_dir = SHORT -> bait
+    if sweep_bias == "LONG" and rsi6 > 70 and rsi6_5m > 65 and kill_dir == "SHORT":
+        result["_pre_kill_sweep_detected"] = False
+        result["_pre_kill_sweep_cancelled_by_rsi"] = True
+        result["bias"] = "SHORT"
+        result["confidence"] = "ABSOLUTE"
+        result["priority_level"] = -42000
+        result["reason"] = (
+            f"[PRE_KILL_SWEEP_RSI_CANCEL] Sweep LONG dibatalkan: RSI6={rsi6:.0f} RSI5m={rsi6_5m:.0f} overbought, kill_dir={kill_dir} → SHORT"
+        )
+        return result, True
+    
+    # Sweep mau SHORT tapi RSI oversold dan kill_dir = LONG -> bait
+    if sweep_bias == "SHORT" and rsi6 < 30 and rsi6_5m < 25 and kill_dir == "LONG":
+        result["_pre_kill_sweep_detected"] = False
+        result["_pre_kill_sweep_cancelled_by_rsi"] = True
+        result["bias"] = "LONG"
+        result["confidence"] = "ABSOLUTE"
+        result["priority_level"] = -42000
+        result["reason"] = (
+            f"[PRE_KILL_SWEEP_RSI_CANCEL] Sweep SHORT dibatalkan: RSI6={rsi6:.0f} RSI5m={rsi6_5m:.0f} oversold, kill_dir={kill_dir} → LONG"
+        )
+        return result, True
+    
+    return result, False
+
+
+def estimate_kill_horizon(result: dict) -> str:
+    """
+    Estimasi kecepatan kill berdasarkan:
+    - jarak liq terdekat
+    - kill_speed (dari Greeks)
+    - gamma_executing
+    - volume_ratio
+    - change_5m (momentum)
+    Returns "FAST", "MEDIUM", atau "SLOW".
+    """
+    short_liq = result.get("short_liq", 99)
+    long_liq = result.get("long_liq", 99)
+    nearest_liq = min(short_liq, long_liq)
+    
+    kill_speed = abs(result.get("greeks_kill_speed", 0))
+    gamma_executing = result.get("greeks_gamma_executing", False)
+    volume_ratio = result.get("volume_ratio", 1.0)
+    change_5m = abs(result.get("change_5m", 0))
+    
+    velocity = 0
+    if nearest_liq < 1.0:
+        velocity += 4
+    elif nearest_liq < 2.0:
+        velocity += 2
+    if kill_speed > 2.0:
+        velocity += 2
+    if gamma_executing:
+        velocity += 2
+    if volume_ratio > 1.0:
+        velocity += 1
+    if change_5m > 3.0:
+        velocity += 1
+    
+    if velocity >= 7:
+        return "FAST"
+    elif velocity >= 4:
+        return "MEDIUM"
+    else:
+        return "SLOW"
+
+
+def apply_slow_kill_filter(result: dict) -> dict:
+    """
+    Jika kill diperkirakan SLOW, kurangi position size drastis.
+    Jika phase BAIT + SLOW, maka NO TRADE.
+    """
+    horizon = estimate_kill_horizon(result)
+    result["kill_horizon"] = horizon
+    
+    if horizon == "SLOW":
+        # Kurangi size 70% (multiplier = 0.3)
+        result["position_multiplier"] = result.get("position_multiplier", 1.0) * 0.3
+        result["reason"] += f" | [SLOW_KILL] Estimasi kill > 2 jam → size 30%"
+        
+        # Jika phase BAIT atau MANIPULATION, lebih baik NO TRADE
+        phase = result.get("market_phase", "")
+        regime = result.get("market_regime", "")
+        if phase == "BAIT" or regime == "MANIPULATION":
+            result["entry_allowed"] = False
+            result["reason"] += " | [SLOW_BAIT_BLOCK] BAIT/MANIPULATION + slow kill → NO TRADE"
+    elif horizon == "MEDIUM":
+        # Kurangi sedikit (30%)
+        result["position_multiplier"] = result.get("position_multiplier", 1.0) * 0.7
+        result["reason"] += f" | [MEDIUM_KILL] Estimasi kill 30m-2j → size 70%"
+    else:  # FAST
+        result["reason"] += f" | [FAST_KILL] Estimasi kill <30m → size 100%"
+    
+    return result
+
+
 def hawkes_squeeze_validity_gate(result: dict, hawkes_predictor) -> tuple:
     """
     Gate paling awal sebelum PostSqueeze (priority -31500).
