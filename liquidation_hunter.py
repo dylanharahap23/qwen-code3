@@ -10361,6 +10361,51 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
     votes = {"LONG": 0.0, "SHORT": 0.0}
     reasons = []
 
+    # ========== 0. FUNDING RATE OVERRIDE (bobot tertinggi) ==========
+    funding = result.get("funding_rate", 0)
+    if funding is None:
+        funding = 0.0
+    
+    if funding > 0.005:
+        # LONGS sangat crowded, bayar mahal → dump imminent
+        votes["SHORT"] += 15.0
+        reasons.append(
+            f"FUNDING_CROWDED_LONG: funding=+{funding:.4f} "
+            f"(+{funding*100:.2f}%/8h) → LONGS terperangkap, dump imminent"
+        )
+        # Debuff semua LONG votes yang sudah masuk (kali ini belum ada, tapi jaga-jaga)
+        votes["LONG"] = votes["LONG"] * 0.3
+    
+    elif funding < -0.005:
+        # SHORTS sangat crowded → squeeze incoming
+        votes["LONG"] += 15.0
+        reasons.append(
+            f"FUNDING_CROWDED_SHORT: funding={funding:.4f} "
+            f"({funding*100:.2f}%/8h) → SHORTS terperangkap, squeeze imminent"
+        )
+        votes["SHORT"] = votes["SHORT"] * 0.3
+    
+    # ========== 0.5. GREEKS CONFIRMATION (bobot tinggi) ==========
+    greeks_who = result.get("greeks_who_dies_first", "")
+    greeks_kill = result.get("greeks_kill_direction", "")
+    greeks_crowded = result.get("greeks_delta_crowded", "")
+    
+    # Greeks tegas siapa yang mati
+    if greeks_who == "LONG_TRADERS":
+        votes["SHORT"] += 8.0
+        reasons.append("GREEKS_CONFIRMED: LONG_TRADERS dies first → SHORT")
+    elif greeks_who == "SHORT_TRADERS":
+        votes["LONG"] += 8.0
+        reasons.append("GREEKS_CONFIRMED: SHORT_TRADERS dies first → LONG")
+    
+    # Greeks kill direction konfirmasi
+    if greeks_kill == "SHORT" and greeks_crowded == "LONG":
+        votes["SHORT"] += 5.0
+        reasons.append("GREEKS_KILL_CONFIRMED: kill=SHORT, crowded=LONG → SHORT")
+    elif greeks_kill == "LONG" and greeks_crowded == "SHORT":
+        votes["LONG"] += 5.0
+        reasons.append("GREEKS_KILL_CONFIRMED: kill=LONG, crowded=SHORT → LONG")
+
     # 1. LIQUIDITY LAW
     short_liq = result.get("short_liq", 99)
     long_liq = result.get("long_liq", 99)
