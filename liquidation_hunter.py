@@ -278,6 +278,45 @@ class HawkesLiquidationPredictor:
         }
 
 
+def is_post_squeeze_exhausted_v2(data: dict) -> tuple:
+    """
+    v2: Tambahkan validasi bahwa memang ada squeeze yang terjadi
+    sebelum declare exhaustion.
+    Returns: (is_exhausted: bool, score: int, reason: str)
+    """
+    change_5m = abs(data.get("change_5m", 0))
+    funding = data.get("funding_rate", 0) or 0.0
+    up_energy = data.get("up_energy", 0)
+    greeks_who_dies = data.get("greeks_who_dies_first", "")
+    volume_ratio = data.get("volume_ratio", 1.0)
+    obv = data.get("obv_trend", "NEUTRAL")
+    gamma_executing = data.get("greeks_gamma_executing", False)
+    agg = data.get("agg", 0.5)
+
+    # VALIDASI 1: Harus ada move yang signifikan dulu
+    if change_5m < 3.0:
+        return False, 0, f"EXHAUSTION_INVALID: move hanya {change_5m:.1f}%, belum ada squeeze"
+
+    # VALIDASI 2: Arah exhaustion harus konsisten dengan funding
+    if funding < -0.003 and greeks_who_dies == "SHORT_TRADERS":
+        return False, 0, "EXHAUSTION_CANCELLED: funding negatif + SHORT dies = squeeze masih valid"
+    if funding > 0.003 and greeks_who_dies == "LONG_TRADERS":
+        return False, 0, "EXHAUSTION_CANCELLED: funding positif + LONG dies = dump masih valid"
+
+    # Hitung exhaustion score normal
+    score = 0
+    if change_5m > 5.0:          score += 1
+    if volume_ratio < 0.7:       score += 1
+    if "NEUTRAL" in obv:         score += 1
+    if agg < 0.4:                score += 1
+    if not gamma_executing:      score += 1
+    if up_energy < 0.5:          score += 1
+
+    if score >= 4:
+        return True, score, f"POST_SQUEEZE_EXHAUSTED (score={score}/6)"
+    return False, score, f"NOT_EXHAUSTED (score={score}/6)"
+
+
 def is_post_squeeze_exhausted(result: dict) -> bool:
     """
     Cek apakah short squeeze sudah exhausted (selesai) dan akan reversal.
@@ -23934,6 +23973,35 @@ class GreeksKillDirectionCorrector:
             ),
             "priority": -10010
         }
+
+
+class AnalysisResult:
+    """Atomic result container — output TIDAK BOLEH dikirim sampai semua compute selesai."""
+    def __init__(self):
+        self._result = {}
+        self._finalized = False
+        self._compute_start = time.time()
+
+    def set(self, key, value):
+        if self._finalized:
+            raise RuntimeError("Result sudah final, tidak bisa diubah!")
+        self._result[key] = value
+
+    def get(self, key, default=None):
+        return self._result.get(key, default)
+
+    def finalize(self):
+        """Panggil ini SETELAH semua gate selesai"""
+        self._finalized = True
+        self._compute_time = time.time() - self._compute_start
+
+    def is_finalized(self):
+        return self._finalized
+
+    def get_dict(self):
+        if not self._finalized:
+            raise RuntimeError("Belum final! Jangan akses result dulu.")
+        return self._result
 
 
 class BinanceAnalyzer:
