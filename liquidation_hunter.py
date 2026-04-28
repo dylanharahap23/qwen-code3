@@ -10801,12 +10801,59 @@ def safe_div(a, b, default=1.0):
 
 # ================= HAWKES SQUEEZE VALIDITY GATE =================
 
+def _hawkes_apply_context_modifiers(mu_L: float, mu_S: float,
+                                    context: dict) -> tuple:
+    """Modifikasi baseline lambda dengan konteks pasar."""
+    lam_L = mu_L
+    lam_S = mu_S
+
+    funding = context.get("funding_rate", 0)
+    up_energy = context.get("up_energy", 0)
+    down_energy = context.get("down_energy", 0)
+    agg = context.get("agg", 0.5)
+    who_dies = context.get("greeks_who_dies_first", "")
+    rsi5m = context.get("rsi6_5m", 50)
+
+    # 1. Funding rate
+    if funding < -0.002:
+        lam_S *= 1 + abs(funding) * 180
+    elif funding > 0.002:
+        lam_L *= 1 + funding * 180
+
+    # 2. Energy momentum
+    if up_energy > 4.0:
+        lam_S *= 1 + up_energy * 0.04
+    if down_energy > 4.0:
+        lam_L *= 1 + down_energy * 0.04
+
+    # 3. Aggregator
+    if agg > 0.75:
+        lam_S *= 1.25
+    elif agg < 0.25:
+        lam_L *= 1.25
+
+    # 4. Greeks
+    if who_dies == "SHORT_TRADERS":
+        lam_S *= 1.5
+    elif who_dies == "LONG_TRADERS":
+        lam_L *= 1.5
+
+    # 5. RSI5m
+    if rsi5m < 20:
+        lam_S *= 1.2
+    elif rsi5m > 80:
+        lam_L *= 1.2
+
+    return lam_L, lam_S
+
+
 def hawkes_squeeze_validity_gate(result: dict, hawkes_predictor) -> tuple:
     """
     Gate paling awal sebelum PostSqueeze (priority -31500).
     Cek apakah squeeze signal masih valid atau sudah exhausted/terlambat.
-    
-    Returns: (result_dict, gate_triggered_bool)
+
+    V2: λ dimodifikasi oleh CONTEXT SIGNALS (funding, energy, agg, greeks),
+        dan Hawkes bisa di-override jika konteks terlalu bertentangan.
     """
     bias = result.get("bias")
     change_5m = abs(result.get("change_5m", 0))
@@ -10814,7 +10861,7 @@ def hawkes_squeeze_validity_gate(result: dict, hawkes_predictor) -> tuple:
     gamma_executing = result.get("greeks_gamma_executing", False)
     agg = result.get("agg", 0.5)
     obv_trend = result.get("obv_trend", "NEUTRAL")
-    
+
     # Hitung squeeze validity score (max 10)
     score = 0
     if change_5m < 5.0:      score += 2   # belum terlalu jauh
@@ -10822,68 +10869,110 @@ def hawkes_squeeze_validity_gate(result: dict, hawkes_predictor) -> tuple:
     if gamma_executing:      score += 3   # institusi ikut
     if agg > 0.6:            score += 2   # aggressor kuat
     if "POSITIVE" in obv_trend: score += 1  # OBV konfirmasi
-    
+
+    # ── V2: CONTEXT-AWARE HAWKES PREDICTION ──
     t_now = time.time()
     long_dist = result.get("long_liq", 99) / 100.0
     short_dist = result.get("short_liq", 99) / 100.0
-    prediction = hawkes_predictor.predict_who_dies_first(t_now, long_dist, short_dist)
-    
-    # Jika LONG signal tapi sudah terlambat atau Hawkes contradict
+
+    # Bangun konteks untuk modifier
+    context = {
+        "funding_rate": result.get("funding_rate", 0) or 0.0,
+        "up_energy": result.get("up_energy", 0),
+        "down_energy": result.get("down_energy", 0),
+        "agg": agg,
+        "ofi_bias": result.get("ofi_bias", "NEUTRAL"),
+        "rsi6_5m": result.get("rsi6_5m", 50),
+        "greeks_who_dies_first": result.get("greeks_who_dies_first", ""),
+    }
+
+    # ── 1. Modifikasi λ dengan konteks ──
+    mod_long, mod_short = _hawkes_apply_context_modifiers(
+        hawkes_predictor.mu_L, hawkes_predictor.mu_S, context
+    )
+
+    def _predict_with_modified_lambda(lam_L, lam_S):
+        score_long_dies  = lam_L * (1.0 / max(long_dist,  0.001))
+        score_short_dies = lam_S * (1.0 / max(short_dist, 0.001))
+        total = score_long_dies + score_short_dies
+        if total == 0:
+            return {"who_dies_first": "UNCLEAR", "confidence": 0.0}
+        prob_long = score_long_dies / total
+        prob_short = score_short_dies / total
+        return {
+            "who_dies_first": "LONG" if prob_long > prob_short else "SHORT",
+            "confidence": abs(prob_long - prob_short),
+        }
+
+    prediction = _predict_with_modified_lambda(mod_long, mod_short)
+
+    # ── 2. Cek apakah Hawkes perlu di-override oleh sinyal konteks ──
+    def _should_override_hawkes(res: dict, pred: dict) -> bool:
+        if pred["who_dies_first"] == "LONG":
+            # Hitung sinyal yang mendukung "LONG aman" (SHORT yang akan mati)
+            safe_score = 0
+            funding = res.get("funding_rate", 0) or 0
+            if funding < -0.002:        safe_score += 2
+            if res.get("up_energy", 0) > 5.0:   safe_score += 1
+            if res.get("agg", 0.5) > 0.75:     safe_score += 1
+            if res.get("greeks_who_dies_first") == "SHORT_TRADERS": safe_score += 2
+            if res.get("rsi6_5m", 50) < 25:    safe_score += 1
+            if res.get("ofi_bias") == "LONG":   safe_score += 1
+            return safe_score >= 5
+        return False
+
+    # ── 3. Evaluasi Gate ──
     if bias == "LONG":
         already_too_late = change_5m > 7.0 and score < 5
         hawkes_contradict = (
-            prediction["who_dies_first"] == "LONG" and 
-            prediction["confidence"] > 0.25  # threshold lebih sensitif
+            prediction["who_dies_first"] == "LONG" and prediction["confidence"] > 0.25
         )
-        
         if already_too_late or hawkes_contradict:
-            reason_parts = []
-            if already_too_late:
-                reason_parts.append(f"move={change_5m:.1f}% sudah terlalu jauh, score={score}/10")
-            if hawkes_contradict:
-                reason_parts.append(
-                    f"Hawkes: LONG dies first (p={prediction['prob_long_dies']:.2f}, "
-                    f"λ_L={prediction['lambda_long']:.4f})"
-                )
-            
-            result["_hawkes_gate_triggered"] = True   # 🔥 LANGKAH 2: TAMBAHKAN FLAG INI
-            result["bias"] = "SHORT"
-            result["confidence"] = "ABSOLUTE"
-            result["priority_level"] = -31500
-            result["entry_allowed"] = True
-            result["reason"] = f"[HAWKES SQUEEZE INVALID] {' | '.join(reason_parts)} → FADE LONG, force SHORT"
-            result["hawkes_squeeze_score"] = score
-            result["_squeeze_validity_gate_triggered"] = True
-            return result, True  # True = gate triggered
-    
-    # Symmetric untuk SHORT
+            # Cek apakah override diperlukan
+            if _should_override_hawkes(result, prediction):
+                result["reason"] += " | [HAWKES_CONTEXT_OVERRIDE] Sinyal konteks terlalu kuat berlawanan → Hawkes dibatalkan"
+            else:
+                result["bias"] = "SHORT"
+                result["_hawkes_gate_triggered"] = True
+                result["confidence"] = "ABSOLUTE"
+                result["priority_level"] = -31500
+                result["entry_allowed"] = True
+                reason_parts = []
+                if already_too_late:
+                    reason_parts.append(f"move={change_5m:.1f}% sudah terlalu jauh, score={score}/10")
+                if hawkes_contradict:
+                    reason_parts.append(
+                        f"Hawkes: LONG dies first (p={prediction['confidence']:.2f})"
+                    )
+                result["reason"] = f"[HAWKES SQUEEZE INVALID] {' | '.join(reason_parts)} → FADE LONG, force SHORT"
+                result["hawkes_squeeze_score"] = score
+                result["_squeeze_validity_gate_triggered"] = True
+                return result, True
+
     if bias == "SHORT":
         already_too_late = change_5m > 7.0 and score < 5
         hawkes_contradict = (
-            prediction["who_dies_first"] == "SHORT" and 
-            prediction["confidence"] > 0.25
+            prediction["who_dies_first"] == "SHORT" and prediction["confidence"] > 0.25
         )
-        
         if already_too_late or hawkes_contradict:
-            reason_parts = []
-            if already_too_late:
-                reason_parts.append(f"move={change_5m:.1f}% sudah terlalu jauh, score={score}/10")
-            if hawkes_contradict:
-                reason_parts.append(
-                    f"Hawkes: SHORT dies first (p={prediction['prob_short_dies']:.2f}, "
-                    f"λ_S={prediction['lambda_short']:.4f})"
-                )
-            
-            result["bias"] = "LONG"
-            result["_hawkes_gate_triggered"] = True   # 🔥 LANGKAH 2: TAMBAHKAN FLAG INI
-            result["confidence"] = "ABSOLUTE"
-            result["priority_level"] = -31500
-            result["entry_allowed"] = True
-            result["reason"] = f"[HAWKES SQUEEZE INVALID] {' | '.join(reason_parts)} → FADE SHORT, force LONG"
-            result["hawkes_squeeze_score"] = score
-            result["_squeeze_validity_gate_triggered"] = True
-            return result, True
-    
+            if _should_override_hawkes(result, prediction):
+                result["reason"] += " | [HAWKES_CONTEXT_OVERRIDE] Sinyal konteks terlalu kuat berlawanan → Hawkes dibatalkan"
+            else:
+                result["bias"] = "LONG"
+                result["_hawkes_gate_triggered"] = True
+                result["confidence"] = "ABSOLUTE"
+                result["priority_level"] = -31500
+                result["entry_allowed"] = True
+                reason_parts = []
+                if already_too_late:
+                    reason_parts.append(f"move={change_5m:.1f}% sudah terlalu jauh, score={score}/10")
+                if hawkes_contradict:
+                    reason_parts.append(f"Hawkes: SHORT dies first (p={prediction['confidence']:.2f})")
+                result["reason"] = f"[HAWKES SQUEEZE INVALID] {' | '.join(reason_parts)} → FADE SHORT, force LONG"
+                result["hawkes_squeeze_score"] = score
+                result["_squeeze_validity_gate_triggered"] = True
+                return result, True
+
     result["hawkes_squeeze_score"] = score
     result["_squeeze_validity_gate_triggered"] = False
     return result, False
