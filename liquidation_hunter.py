@@ -10397,29 +10397,46 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
     votes = {"LONG": 0.0, "SHORT": 0.0}
     reasons = []
 
-    # ========== 0. FUNDING RATE OVERRIDE (bobot tertinggi) ==========
+    # ========== 0. FUNDING RATE OVERRIDE (dengan RSI5m check) ==========
     funding = result.get("funding_rate", 0)
     if funding is None:
         funding = 0.0
-    
+
     if funding > 0.005:
-        # LONGS sangat crowded, bayar mahal → dump imminent
-        votes["SHORT"] += 15.0
-        reasons.append(
-            f"FUNDING_CROWDED_LONG: funding=+{funding:.4f} "
-            f"(+{funding*100:.2f}%/8h) → LONGS terperangkap, dump imminent"
-        )
-        # Debuff semua LONG votes yang sudah masuk (kali ini belum ada, tapi jaga-jaga)
-        votes["LONG"] = votes["LONG"] * 0.3
-    
+        rsi6_5m = result.get("rsi6_5m", 50)
+        if rsi6_5m < 25:
+            # RSI5m oversold = masih ada ruang naik meskipun funding tinggi
+            votes["SHORT"] += 5.0   # turunkan bobot dari 15 ke 5
+            votes["LONG"]  += 8.0   # tambah kontra-vote
+            reasons.append(
+                f"FUNDING_HIGH_BUT_RSI5M_OVERSOLD: funding={funding:.4f} "
+                f"tapi RSI5m={rsi6_5m:.1f} masih oversold → squeeze belum selesai"
+            )
+        else:
+            # RSI5m normal/tinggi + funding tinggi = dump genuine
+            votes["SHORT"] += 15.0
+            votes["LONG"]   = votes["LONG"] * 0.3
+            reasons.append(
+                f"FUNDING_CROWDED_LONG_CONFIRMED: funding={funding:.4f} "
+                f"+ RSI5m={rsi6_5m:.1f} normal → dump imminent"
+            )
+
     elif funding < -0.005:
-        # SHORTS sangat crowded → squeeze incoming
-        votes["LONG"] += 15.0
-        reasons.append(
-            f"FUNDING_CROWDED_SHORT: funding={funding:.4f} "
-            f"({funding*100:.2f}%/8h) → SHORTS terperangkap, squeeze imminent"
-        )
-        votes["SHORT"] = votes["SHORT"] * 0.3
+        rsi6_5m = result.get("rsi6_5m", 50)
+        if rsi6_5m > 75:
+            votes["LONG"] += 5.0
+            votes["SHORT"] += 8.0
+            reasons.append(
+                f"FUNDING_LOW_BUT_RSI5M_OVERBOUGHT: funding={funding:.4f} "
+                f"tapi RSI5m={rsi6_5m:.1f} overbought → dump belum selesai"
+            )
+        else:
+            votes["LONG"] += 15.0
+            votes["SHORT"] = votes["SHORT"] * 0.3
+            reasons.append(
+                f"FUNDING_CROWDED_SHORT_CONFIRMED: funding={funding:.4f} "
+                f"+ RSI5m={rsi6_5m:.1f} normal → squeeze imminent"
+            )
     
     # ========== 0.5. GREEKS CONFIRMATION (bobot tinggi) ==========
     greeks_who = result.get("greeks_who_dies_first", "")
@@ -24002,6 +24019,55 @@ class BinanceAnalyzer:
         print(f"[DEBUG] Snapshot created at {snapshot['_snapshot_timestamp']}")
         return snapshot
 
+    def detect_mirror_trap(self, result: dict) -> tuple:
+        """
+        Deteksi ketika Binance balik arah dengan setup yang terlihat
+        seperti kebalikan dari trade sebelumnya.
+        Kunci: RSI1m dan RSI5m diverge ekstrem setelah move besar
+        """
+        rsi6    = result.get("rsi6", 50)
+        rsi6_5m = result.get("rsi6_5m", 50)
+        change_5m = abs(result.get("change_5m", 0))
+        bias = result.get("bias", "NEUTRAL")
+
+        divergence = abs(rsi6 - rsi6_5m)
+
+        # Divergence ekstrem: 1m dan 5m berlawanan >40 poin
+        if divergence < 40:
+            return result, False
+
+        # Kasus: RSI1m tinggi tapi RSI5m masih sangat rendah
+        # = Spike baru terjadi, tren 5m masih bullish
+        if rsi6 > 65 and rsi6_5m < 25 and change_5m > 3.0:
+            if bias == "SHORT":
+                result["bias"] = "LONG"
+                result["confidence"] = "ABSOLUTE"
+                result["entry_allowed"] = True
+                result["reason"] = (
+                    f"[RSI_DIVERGENCE_OVERRIDE] RSI1m={rsi6:.0f} vs RSI5m={rsi6_5m:.0f} "
+                    f"diverge {divergence:.0f}pt — spike baru mulai, 5m masih oversold "
+                    f"→ batalkan SHORT, FORCE LONG"
+                )
+                result["_mirror_trap_detected"] = True
+                return result, True
+
+        # Kasus kebalikan: RSI1m sangat rendah tapi RSI5m masih tinggi
+        # = Dump baru terjadi, tren 5m masih bearish
+        if rsi6 < 20 and rsi6_5m > 65 and change_5m > 3.0:
+            if bias == "LONG":
+                result["bias"] = "SHORT"
+                result["confidence"] = "ABSOLUTE"
+                result["entry_allowed"] = True
+                result["reason"] = (
+                    f"[RSI_DIVERGENCE_OVERRIDE] RSI1m={rsi6:.0f} vs RSI5m={rsi6_5m:.0f} "
+                    f"diverge {divergence:.0f}pt — dump baru mulai, 5m masih overbought "
+                    f"→ batalkan LONG, FORCE SHORT"
+                )
+                result["_mirror_trap_detected"] = True
+                return result, True
+
+        return result, False
+
     def resolve_priority_chain(self, snapshot: dict) -> dict:
         """
         Menyelesaikan konflik bias berdasarkan priority ladder.
@@ -33441,6 +33507,12 @@ class BinanceAnalyzer:
             
             result = self._apply_stability_filters(result, phase_result, {})
             
+            # Mirror Trap Detection (adversarial adaptation)
+            result, mirror_triggered = self.detect_mirror_trap(result)
+            if mirror_triggered:
+                # Mirror trap sudah mengubah bias & confidence, langsung lock dan lanjut
+                pass
+            
             # ===== APPLY ADVERSARIAL ROTATION DISCOUNT =====
             # Hitung rotation risk setelah stability filters (karena bias bisa berubah)
             final_bias_after = result.get("bias", "NEUTRAL")
@@ -33469,6 +33541,17 @@ class BinanceAnalyzer:
             # Ini adalah langkah terakhir sebelum return, menggantikan priority-based override chaos
             # PENTING: arbitrate_final_decision HARUS jadi keputusan FINAL - tidak boleh ada perubahan bias setelah ini
             result = arbitrate_final_decision(result)
+            
+            # Rekam sinyal untuk deteksi adversarial
+            final_bias = result.get("bias", "NEUTRAL")
+            if final_bias in ("LONG", "SHORT"):
+                self.adversarial_detector.record_signal(self.symbol, final_bias)
+
+            # Jika mirror trap terdeteksi, naikkan threshold confidence 2x
+            if self.adversarial_detector.is_mirror_trap_likely(self.symbol, final_bias):
+                if result.get("confidence") == "HIGH":
+                    result["confidence"] = "MEDIUM"
+                result["reason"] += " | ⚠️ MIRROR TRAP: sinyal berlawanan dalam 60 menit → confidence diturunkan"
             
             # ========== FINAL BIAS LOCK ==========
             # Setelah aggregator, bias TIDAK BOLEH diubah lagi
