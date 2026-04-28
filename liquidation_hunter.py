@@ -10562,6 +10562,38 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
             votes["SHORT"] += 6.0
         reasons.append("POST-KILL FOLLOW active")
 
+    # ========== PAGAR PRE-KILL SWEEP SAAT OVERBOUGHT / OVERSOLD ==========
+    if result.get("_pre_kill_sweep_detected"):
+        sweep_bias = result.get("_pre_kill_sweep_bias")
+        rsi5m = result.get("rsi6_5m", 50)
+        short_liq = result.get("short_liq", 99)
+        long_liq = result.get("long_liq", 99)
+        kill_dir = result.get("greeks_kill_direction", "")
+
+        # Kasus 1: Mau LONG tapi RSI5m sudah overbought ekstrem (>85)
+        if sweep_bias == "LONG" and rsi5m > 85 and kill_dir == "SHORT":
+            result["_pre_kill_sweep_detected"] = False
+            result["bias"] = "SHORT"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = -10100
+            result["reason"] = (
+                f"[PRE-KILL CANCEL OVERBOUGHT] RSI5m={rsi5m:.1f}>85 + kill=SHORT "
+                f"→ short_liq dekat adalah umpan, force SHORT. "
+            ) + result.get("reason", "")
+            return result
+
+        # Kasus 2: Mau SHORT tapi RSI5m sudah oversold ekstrem (<15)
+        if sweep_bias == "SHORT" and rsi5m < 15 and kill_dir == "LONG":
+            result["_pre_kill_sweep_detected"] = False
+            result["bias"] = "LONG"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = -10100
+            result["reason"] = (
+                f"[PRE-KILL CANCEL OVERSOLD] RSI5m={rsi5m:.1f}<15 + kill=LONG "
+                f"→ long_liq dekat adalah umpan, force LONG. "
+            ) + result.get("reason", "")
+            return result
+
     if result.get("_pre_kill_sweep_detected"):
         sweep_bias = result.get("_pre_kill_sweep_bias")
         if sweep_bias == "LONG":
@@ -10608,6 +10640,28 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
         votes["SHORT"] = votes["SHORT"] * 0.5
         reasons.append("REGIME_SKIP: semua bobot di-debuff 50%")
     # ========== AKHIR TAMBAHAN DOSEN ==========
+
+    # ========== 10. SHORT LIQ OVERBOUGHT BAIT (SWARMSUSDT PATTERN) ==========
+    rsi5m = result.get("rsi6_5m", 50)
+    short_liq = result.get("short_liq", 99)
+    long_liq = result.get("long_liq", 99)
+    kill_dir = result.get("greeks_kill_direction", "")
+
+    if short_liq < 1.5 and rsi5m > 85 and kill_dir == "SHORT":
+        votes["SHORT"] += 12.0
+        votes["LONG"] = votes["LONG"] * 0.2
+        reasons.append(
+            f"SHORT_LIQ_OVERBOUGHT_BAIT: short_liq={short_liq:.2f}% "
+            f"tapi RSI5m={rsi5m:.1f}>85 → short_liq umpan, dump ke long_liq {long_liq:.2f}%"
+        )
+    elif long_liq < 1.5 and rsi5m < 15 and kill_dir == "LONG":
+        votes["LONG"] += 12.0
+        votes["SHORT"] = votes["SHORT"] * 0.2
+        reasons.append(
+            f"LONG_LIQ_OVERSOLD_BAIT: long_liq={long_liq:.2f}% "
+            f"tapi RSI5m={rsi5m:.1f}<15 → long_liq umpan, pump ke short_liq {short_liq:.2f}%"
+        )
+    # ========== END OF SHORT LIQ OVERBOUGHT BAIT ==========
 
     # -- Keputusan akhir ---------------------------------------------------
     total_votes = votes["LONG"] + votes["SHORT"]
