@@ -11038,6 +11038,91 @@ def _hawkes_apply_context_modifiers(mu_L: float, mu_S: float,
     return lam_L, lam_S
 
 
+def validate_genuine_short_squeeze(data: dict) -> tuple:
+    """
+    Bedain genuine short squeeze vs fake squeeze bait.
+    Return: (is_genuine, score, reason)
+    """
+    funding = data.get("funding_rate", 0) or 0.0
+    obv = data.get("obv_trend", "NEUTRAL")
+    volume_ratio = data.get("volume_ratio", 1.0)
+    agg = data.get("agg", 0.5)
+    rsi6_5m = data.get("rsi6_5m", 50)
+    gamma_executing = data.get("greeks_gamma_executing", False)
+    change_5m = abs(data.get("change_5m", 0))
+
+    score = 0
+    reasons = []
+
+    # Signal genuine squeeze (harus ada beberapa dari ini)
+    if funding < -0.002:
+        score += 3
+        reasons.append(f"funding={funding:.4f} shorts trapped")
+
+    if "POSITIVE" in obv:
+        score += 2
+        reasons.append(f"OBV={obv} konfirmasi")
+
+    if volume_ratio >= 0.7:
+        score += 2
+        reasons.append(f"volume={volume_ratio:.2f}x adequate")
+
+    if agg > 0.6:
+        score += 2
+        reasons.append(f"agg={agg:.2f} buyers active")
+
+    if gamma_executing:
+        score += 3
+        reasons.append("gamma_executing=True institutional")
+
+    if rsi6_5m > 60:
+        score += 1
+        reasons.append(f"RSI5m={rsi6_5m:.1f} trend confirms")
+
+    # Signal BUKAN genuine squeeze (penalti)
+    if agg < 0.35:
+        score -= 3
+        reasons.append(f"PENALTY: agg={agg:.2f} buyers weak")
+
+    if funding > -0.001:
+        score -= 2
+        reasons.append(f"PENALTY: funding={funding:.4f} no short trap")
+
+    if "NEUTRAL" in obv or "NEGATIVE" in obv:
+        score -= 1
+        reasons.append(f"PENALTY: OBV={obv} not confirming")
+
+    is_genuine = score >= 5
+    return is_genuine, score, " | ".join(reasons)
+
+
+def apply_protect_genuine_squeeze(result: dict) -> tuple:
+    """
+    Override PROTECT_GENUINE_SHORT_SQUEEZE dengan validasi ketat
+    """
+    phase = result.get("phase", "")
+
+    if phase != "PROTECT_GENUINE_SHORT_SQUEEZE":
+        return result, False
+
+    is_genuine, score, reason = validate_genuine_short_squeeze(result)
+
+    if is_genuine:
+        result["reason"] += f" | [SQUEEZE_VALIDATED score={score}] {reason}"
+        return result, False
+    else:
+        result["bias"] = "SHORT"
+        result["confidence"] = "ABSOLUTE"
+        result["priority_level"] = -31800
+        result["entry_allowed"] = True
+        result["_fake_squeeze_detected"] = True
+        result["reason"] = (
+            f"[FAKE_SQUEEZE_BAIT] score={score}/14, tidak memenuhi genuine squeeze. "
+            f"{reason} → FADE LONG, force SHORT"
+        )
+        return result, True
+
+
 def hawkes_squeeze_validity_gate(result: dict, hawkes_predictor) -> tuple:
     """
     Gate paling awal sebelum PostSqueeze (priority -31500).
@@ -30502,6 +30587,12 @@ class BinanceAnalyzer:
         # ========== PERSISTENCE FILTER (GABUNGAN DOSEN + POSITION HOLDING) ==========
         result = self._apply_persistence_filter(result)
         
+        # ========== VALIDASI GENUINE SHORT SQUEEZE (NAORISUSDT PATTERN) ==========
+        if result.get("phase") == "PROTECT_GENUINE_SHORT_SQUEEZE":
+            result, overridden = apply_protect_genuine_squeeze(result)
+            if overridden:
+                return result
+
         # ========== CONDITIONAL UNBLOCK (BUKAN PAKSA) ==========
         # Hanya restore original_bias jika tidak ada gate yang triggered
         _hawkes_blocked = result.get("_hawkes_gate_triggered", False)
