@@ -10663,6 +10663,13 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
         )
     # ========== END OF SHORT LIQ OVERBOUGHT BAIT ==========
 
+    # ========== 11. FAKE SQUEEZE BAIT DETECTOR ==========
+    if result.get("_fake_squeeze_detected"):
+        votes["SHORT"] += 15.0
+        votes["LONG"] = votes["LONG"] * 0.1
+        reasons.append("FAKE_SQUEEZE_BAIT confirmed → SHORT dominant")
+    # ========== END OF FAKE SQUEEZE BAIT DETECTOR ==========
+
     # -- Keputusan akhir ---------------------------------------------------
     total_votes = votes["LONG"] + votes["SHORT"]
     if total_votes > 0:
