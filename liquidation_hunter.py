@@ -10670,6 +10670,31 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
         reasons.append("FAKE_SQUEEZE_BAIT confirmed → SHORT dominant")
     # ========== END OF FAKE SQUEEZE BAIT DETECTOR ==========
 
+    # ========== 12. THIN VOLUME + GREEK KILL MISMATCH ==========
+    latest_volume_vote = result.get("latest_volume", 999999)
+    volume_ratio_vote = result.get("volume_ratio", 1.0)
+    greeks_kill_vote = result.get("greeks_kill_direction", "")
+    current_bias_vote = result.get("bias", "NEUTRAL")
+
+    is_ultra_thin = (latest_volume_vote < 50000) or (volume_ratio_vote < 0.3)
+
+    if is_ultra_thin and greeks_kill_vote in ("LONG", "SHORT"):
+        if greeks_kill_vote == "SHORT" and current_bias_vote == "LONG":
+            votes["SHORT"] += 8.0
+            votes["LONG"] = votes["LONG"] * 0.3
+            reasons.append(
+                f"THIN_VOL_GREEK_MISMATCH: volume={latest_volume_vote:.0f} "
+                f"ultra tipis + kill=SHORT berlawanan dengan LONG -> pump tidak genuine"
+            )
+        elif greeks_kill_vote == "LONG" and current_bias_vote == "SHORT":
+            votes["LONG"] += 8.0
+            votes["SHORT"] = votes["SHORT"] * 0.3
+            reasons.append(
+                f"THIN_VOL_GREEK_MISMATCH: volume={latest_volume_vote:.0f} "
+                f"ultra tipis + kill=LONG berlawanan dengan SHORT"
+            )
+    # ========== END OF THIN VOLUME + GREEK KILL MISMATCH ==========
+
     # -- Keputusan akhir ---------------------------------------------------
     total_votes = votes["LONG"] + votes["SHORT"]
     if total_votes > 0:
@@ -11443,6 +11468,105 @@ def detect_thin_book_vacuum_pump(result: dict) -> tuple:
         f"Konfirmasi ({confirmations}): {' | '.join(conf_reasons)}. "
         f"Harga naik karena vacuum bukan buyer genuine → FADE, force SHORT"
     )
+    return result, True
+
+
+def detect_rsi5m_exhaustion_ceiling(result: dict) -> dict:
+    """
+    Detect RSI5m ceiling/floor exhaustion.
+    Extreme RSI with neutral funding and a still-distant liq target usually means
+    the move can slow-kill instead of reaching target quickly.
+    """
+    rsi6_5m = result.get("rsi6_5m", 50)
+    short_liq = result.get("short_liq", 99)
+    funding = result.get("funding_rate", 0) or 0
+    phase = result.get("market_phase", "UNKNOWN")
+
+    if rsi6_5m >= 98:
+        if short_liq > 0.4 and abs(funding) < 0.001:
+            result["_rsi5m_ceiling_exhaustion"] = True
+            result["position_multiplier"] = result.get("position_multiplier", 1.0) * 0.3
+            result["reason"] = result.get("reason", "") + (
+                f" | [RSI5M_CEILING_EXHAUSTION] RSI5m={rsi6_5m:.0f} "
+                f"(ceiling) + short_liq={short_liq:.2f}% masih >0.4% "
+                f"+ funding netral ({funding:.6f}) -> slow kill territory, size 30%"
+            )
+            if phase == "BAIT":
+                result["entry_allowed"] = False
+                result["reason"] += " | BAIT + RSI ceiling = NO TRADE"
+                result["confidence"] = "BLOCK"
+                result["priority_level"] = -43000
+            return result
+
+    if rsi6_5m <= 2:
+        long_liq = result.get("long_liq", 99)
+        if long_liq > 0.4 and abs(funding) < 0.001:
+            result["_rsi5m_floor_exhaustion"] = True
+            result["position_multiplier"] = result.get("position_multiplier", 1.0) * 0.3
+            result["reason"] = result.get("reason", "") + (
+                f" | [RSI5M_FLOOR_EXHAUSTION] RSI5m={rsi6_5m:.0f} (floor) "
+                f"+ long_liq={long_liq:.2f}% masih >0.4% -> slow recovery, size 30%"
+            )
+            if phase == "BAIT":
+                result["entry_allowed"] = False
+                result["confidence"] = "BLOCK"
+                result["priority_level"] = -43000
+                result["reason"] += " | BAIT + RSI floor = NO TRADE"
+
+    return result
+
+
+def detect_high_up_energy_fake_pump_v2(result: dict, defer_override: bool = False) -> tuple:
+    """
+    Detect high up-energy fake pump with ORCA-style genuine squeeze exemptions.
+    Returns (result, overridden). If defer_override=True, confirmed fake pump is
+    stored as pending so higher-priority guards can run first.
+    """
+    up_energy = result.get("up_energy", 0)
+    volume_ratio = result.get("volume_ratio", 1.0)
+    short_liq = result.get("short_liq", 99)
+    funding = result.get("funding_rate", 0) or 0
+    ofi_bias = result.get("ofi_bias", "NEUTRAL")
+    ofi_strength = result.get("ofi_strength", 0)
+
+    is_high_energy_low_vol = up_energy > 8.0 and volume_ratio < 0.7
+    if not is_high_energy_low_vol:
+        return result, False
+
+    if short_liq < 0.25 and funding < -0.001:
+        result["_high_up_energy_exempted"] = True
+        result["reason"] = result.get("reason", "") + (
+            f" | [FAKE_PUMP_EXEMPT] short_liq={short_liq:.2f}% SANGAT dekat "
+            f"+ funding={funding:.4f} negatif -> up_energy adalah konfirmasi squeeze genuine, "
+            f"bukan fake pump -> CANCEL FAKE PUMP"
+        )
+        return result, False
+
+    if ofi_bias == "LONG" and ofi_strength > 0.75 and funding < -0.001:
+        result["_high_up_energy_exempted"] = True
+        result["reason"] = result.get("reason", "") + (
+            f" | [FAKE_PUMP_EXEMPT] OFI={ofi_strength:.2f} LONG kuat + funding negatif "
+            f"-> genuine buying, cancel fake pump"
+        )
+        return result, False
+
+    fake_pump_reason = (
+        f"[HIGH_UP_ENERGY_FAKE_PUMP] up_energy={up_energy:.1f}, "
+        f"vol={volume_ratio:.2f}x, short_liq={short_liq:.2f}% "
+        f"-> fake buy wall (no exemption), force SHORT"
+    )
+
+    if defer_override:
+        result["_high_up_energy_fake_pump_pending"] = True
+        result["_high_up_energy_fake_pump_pending_reason"] = fake_pump_reason
+        return result, False
+
+    result["bias"] = "SHORT"
+    result["confidence"] = "ABSOLUTE"
+    result["priority_level"] = -30750
+    result["entry_allowed"] = True
+    result["_fake_pump_confirmed"] = True
+    result["reason"] = fake_pump_reason + " | " + result.get("reason", "")
     return result, True
 
 
@@ -25221,6 +25345,39 @@ class BinanceAnalyzer:
         rsi6_val = rsi6  # Sudah ada di atas, pastikan konsisten
         rsi6_5m_val = rsi6_5m  # Sudah ada di atas, pastikan konsisten
         rsi14_val = rsi14  # Sudah ada di atas, pastikan konsisten
+
+        # ========== THIN BOOK VACUUM PUMP (PRIORITY -43000) ==========
+        result, overridden = detect_thin_book_vacuum_pump(result)
+        if overridden:
+            return result
+
+        # ========== RSI5M CEILING/FLOOR EXHAUSTION (PRIORITY -43000) ==========
+        result = detect_rsi5m_exhaustion_ceiling(result)
+        if (
+            result.get("entry_allowed") is False and
+            (result.get("_rsi5m_ceiling_exhaustion") or result.get("_rsi5m_floor_exhaustion"))
+        ):
+            return result
+
+        # ========== HIGH UP ENERGY FAKE PUMP V2 (DEFERRED, PRIORITY -30750) ==========
+        result, _high_up_energy_overridden = detect_high_up_energy_fake_pump_v2(result, defer_override=True)
+
+        # ========== OVERBOUGHT LIQ BAIT GUARD (PRIORITY -42000) ==========
+        result, overridden = apply_liq_absolute_with_rsi_guard(result)
+        if overridden:
+            return result
+
+        if result.get("_high_up_energy_fake_pump_pending"):
+            result["bias"] = "SHORT"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = -30750
+            result["entry_allowed"] = True
+            result["_fake_pump_confirmed"] = True
+            result["reason"] = (
+                result.get("_high_up_energy_fake_pump_pending_reason", "[HIGH_UP_ENERGY_FAKE_PUMP] force SHORT")
+                + " | " + result.get("reason", "")
+            )
+            return result
         
         # ========== HAWKES SQUEEZE VALIDITY GATE (PALING AWAL - PRIORITY -31500) ==========
         # Cek SEBELUM PostSqueeze, SEBELUM unblock
