@@ -24821,6 +24821,30 @@ class BinanceAnalyzer:
         if snapshot.get("_liq_absolute_lock"):
             # Liquidity absolute lock di -40000 sudah terpasang → tidak bisa digoyang
             return snapshot
+        
+        # Guard: Aggregator sudah memutuskan dengan supermayoritas (75%+)
+        agg_votes = snapshot.get("aggregator_votes", {})
+        long_votes = agg_votes.get("LONG", 0)
+        short_votes = agg_votes.get("SHORT", 0)
+        total_votes = long_votes + short_votes
+        if total_votes > 0:
+            dominant_pct = max(long_votes, short_votes) / total_votes
+            if dominant_pct >= 0.75:
+                # Supermayoritas sudah lock → Exchange tidak boleh override
+                return snapshot
+        
+        # Guard: _final_bias_locked sudah set dan berlawanan dengan exchange_safe_direction
+        locked_bias = snapshot.get("_final_bias_locked")
+        exchange_safe = snapshot.get("exchange_safe_direction")
+        if locked_bias in ("LONG", "SHORT") and exchange_safe in ("LONG", "SHORT"):
+            if locked_bias != exchange_safe:
+                # Exchange ingin arah berlawanan dengan yang sudah di-lock → diabaikan
+                return snapshot
+        
+        # Guard: Greeks gamma executing dengan score tinggi (institusi aktif eksekusi)
+        if (snapshot.get("greeks_gamma_executing") and 
+            snapshot.get("greeks_gamma_exec_score", 0) >= 4):
+            return snapshot
         # =================================================
 
         # 1. Exchange Hard Block (priority -30000)
@@ -25335,14 +25359,60 @@ class BinanceAnalyzer:
         
         # === GUARD 4: Exchange Safe Direction Hard Block yang Lebih Cerdas ===
         # Jika exchange_safe_direction berlawanan dengan bias, dan volume lagi kering, langsung paksa.
-        if result.get("exchange_risk_score", 0) >= 6 and result.get("exchange_safe_direction") != result.get("bias"):
-            if volume_ratio < 0.6:   # pasar tipis, exchange lebih tahu
+        # TAPI: harus respect aggregator supermayoritas dan _final_bias_locked
+        
+        # Guard 4a: Aggregator supermayoritas sudah lock → Exchange tidak boleh override
+        agg_votes = result.get("aggregator_votes", {})
+        long_votes = agg_votes.get("LONG", 0)
+        short_votes = agg_votes.get("SHORT", 0)
+        total_votes = long_votes + short_votes
+        if total_votes > 0:
+            dominant_pct = max(long_votes, short_votes) / total_votes
+            if dominant_pct >= 0.75:
+                # Supermayoritas sudah lock → skip Exchange Hard Block
+                pass  # lanjut ke guard berikutnya
+            else:
+                # Bukan supermayoritas, cek guard lain
+                if result.get("_final_bias_locked") in ("LONG", "SHORT"):
+                    locked = result["_final_bias_locked"]
+                    exchange_safe = result.get("exchange_safe_direction")
+                    if locked != exchange_safe:
+                        # _final_bias_locked berlawanan dengan exchange → diabaikan
+                        pass
+                    elif volume_ratio < 0.6:
+                        result["bias"] = result["exchange_safe_direction"]
+                        result["confidence"] = "ABSOLUTE"
+                        result["priority_level"] = -10150
+                        result["reason"] = f"[EXCHANGE HARD BLOCK] High risk + thin market (vol={volume_ratio:.2f}x) → follow exchange ({result['exchange_safe_direction']}). " + result.get("reason", "")
+                        result["entry_allowed"] = True
+                        return result
+                elif volume_ratio < 0.6:
+                    result["bias"] = result["exchange_safe_direction"]
+                    result["confidence"] = "ABSOLUTE"
+                    result["priority_level"] = -10150
+                    result["reason"] = f"[EXCHANGE HARD BLOCK] High risk + thin market (vol={volume_ratio:.2f}x) → follow exchange ({result['exchange_safe_direction']}). " + result.get("reason", "")
+                    result["entry_allowed"] = True
+                    return result
+        elif result.get("_final_bias_locked") in ("LONG", "SHORT"):
+            locked = result["_final_bias_locked"]
+            exchange_safe = result.get("exchange_safe_direction")
+            if locked != exchange_safe:
+                # _final_bias_locked berlawanan dengan exchange → diabaikan
+                pass
+            elif volume_ratio < 0.6:
                 result["bias"] = result["exchange_safe_direction"]
                 result["confidence"] = "ABSOLUTE"
                 result["priority_level"] = -10150
                 result["reason"] = f"[EXCHANGE HARD BLOCK] High risk + thin market (vol={volume_ratio:.2f}x) → follow exchange ({result['exchange_safe_direction']}). " + result.get("reason", "")
                 result["entry_allowed"] = True
                 return result
+        elif volume_ratio < 0.6:
+            result["bias"] = result["exchange_safe_direction"]
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = -10150
+            result["reason"] = f"[EXCHANGE HARD BLOCK] High risk + thin market (vol={volume_ratio:.2f}x) → follow exchange ({result['exchange_safe_direction']}). " + result.get("reason", "")
+            result["entry_allowed"] = True
+            return result
         
         # ========== PRIORITY -10200: CAPITULATION BOUNCE ABSOLUTE ==========
         # Jika RSI6 < 15 (capitulation), change_5m < -5% (dump besar),
