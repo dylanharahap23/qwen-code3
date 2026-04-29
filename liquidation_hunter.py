@@ -11208,6 +11208,9 @@ def apply_liq_absolute_with_rsi_guard(result: dict) -> tuple:
         → Ini adalah OVERBOUGHT LIQ BAIT (pump sudah selesai, short_liq adalah umpan)
         → Force SHORT, priority -42000 (lebih tinggi dari LIQ ABSOLUTE -40000)
     Mirror untuk long_liq < 1.0% dengan RSI oversold.
+    
+    ⚠️ CATATAN: Fungsi ini dipertahankan untuk kasus overbought/oversold liq bait.
+    Untuk LIQ ABSOLUTE (short_liq < 1%), gunakan apply_liq_absolute_v3 yang lebih komprehensif.
     """
     short_liq = result.get("short_liq", 99)
     long_liq = result.get("long_liq", 99)
@@ -11247,6 +11250,130 @@ def apply_liq_absolute_with_rsi_guard(result: dict) -> tuple:
             )
             return result, True
     
+    return result, False
+
+
+def apply_liq_absolute_v3(result: dict) -> tuple:
+    """
+    LIQ ABSOLUTE versi 3 dengan validasi komprehensif:
+    1. _reverse_bait_detected → override LIQ ABSOLUTE
+    2. funding positif & short_liq dekat → override ke SHORT (umpan)
+    3. RSI14 netral (45-65) + Greeks kill berlawanan → block LIQ ABSOLUTE
+    4. OFI sangat kuat berlawanan → veto LIQ ABSOLUTE
+    5. Volume ultra tipis + Greeks kill mismatch → override
+    
+    Priority ladder:
+    - -99985 : REVERSE_BAIT_OVERRIDE_LIQ
+    - -99985 : FUNDING_OVERRIDE_LIQ_ABS
+    - -99986 : RSI14_NETRAL_BLOCK
+    - -99984 : OFI_VETO_LIQ_ABS
+    - -99983 : THIN_VOL_GREEK_MISMATCH
+    """
+    short_liq = result.get("short_liq", 99)
+    long_liq = result.get("long_liq", 99)
+    funding = result.get("funding_rate", 0.0)
+    rsi14 = result.get("rsi14", 50)
+    greeks_kill = result.get("greeks_kill_direction", "")
+    ofi_bias = result.get("ofi_bias", "NEUTRAL")
+    ofi_strength = result.get("ofi_strength", 0.0)
+    latest_volume = result.get("latest_volume", 999999)
+    volume_ratio = result.get("volume_ratio", 1.0)
+    current_bias = result.get("bias", "NEUTRAL")
+    
+    # ========== Fix 1: _reverse_bait_detected override ==========
+    if result.get("_reverse_bait_detected"):
+        reverse_bias = result.get("_reverse_bait_bias", "")
+        if reverse_bias == "SHORT" and short_liq < 1.0:
+            result["bias"] = "SHORT"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = -99985
+            result["entry_allowed"] = True
+            result["reason"] = (
+                f"[REVERSE_BAIT_OVERRIDE_LIQ] short_liq={short_liq:.2f}% "
+                f"dekat TAPI ini umpan (ratio={long_liq/short_liq:.1f}x). "
+                f"{result.get('_reverse_bait_reason', '')} → FORCE SHORT"
+            )
+            return result, True
+    
+    # ========== Fix 3: RSI14 netral + Greeks kill berlawanan ==========
+    # Block LIQ ABSOLUTE jika short_liq dekat tapi RSI14 netral dan Greeks kill SHORT
+    if (short_liq < 1.5 and 45 < rsi14 < 65 and greeks_kill == "SHORT" and result.get("bias") == "LONG"):
+        result["bias"] = "SHORT"
+        result["confidence"] = "ABSOLUTE"
+        result["priority_level"] = -99986
+        result["entry_allowed"] = True
+        result["_rsi14_netral_block"] = True
+        result["reason"] = (
+            f"[RSI14_NETRAL_BLOCK] short_liq={short_liq:.2f}% dekat TAPI "
+            f"RSI14={rsi14:.1f} netral, greeks_kill={greeks_kill} → pump tidak genuine. "
+            f"OVERIDE LIQ ABSOLUTE, force SHORT"
+        )
+        return result, True
+    
+    # ========== Fix 2: Funding positif + short_liq dekat = SHORT ==========
+    if short_liq < 1.0 and funding > 0.002:
+        result["bias"] = "SHORT"
+        result["confidence"] = "ABSOLUTE"
+        result["priority_level"] = -99985
+        result["entry_allowed"] = True
+        result["_funding_overrides_liq_abs"] = True
+        result["reason"] = (
+            f"[FUNDING_OVERRIDE_LIQ_ABS] short_liq={short_liq:.2f}% dekat "
+            f"TAPI funding=+{funding:.4f} → LONGS bleeding, bukan shorts "
+            f"→ short_liq adalah UMPAN → FORCE SHORT"
+        )
+        return result, True
+    
+    # ========== Fix 4: OFI sangat kuat berlawanan ==========
+    liq_abs_direction = "LONG" if short_liq < long_liq and short_liq < 1.0 else "SHORT" if long_liq < short_liq and long_liq < 1.0 else None
+    
+    if liq_abs_direction == "LONG" and ofi_bias == "SHORT" and ofi_strength > 0.85:
+        result["bias"] = "SHORT"
+        result["confidence"] = "ABSOLUTE"
+        result["priority_level"] = -99984
+        result["entry_allowed"] = True
+        result["_ofi_veto_liq_abs"] = True
+        result["reason"] = f"[OFI_VETO_LIQ_ABS] LIQ ABSOLUTE mau LONG tapi OFI SHORT {ofi_strength:.2f} → VETO, force SHORT"
+        return result, True
+    
+    if liq_abs_direction == "SHORT" and ofi_bias == "LONG" and ofi_strength > 0.85:
+        result["bias"] = "LONG"
+        result["confidence"] = "ABSOLUTE"
+        result["priority_level"] = -99984
+        result["entry_allowed"] = True
+        result["_ofi_veto_liq_abs"] = True
+        result["reason"] = f"[OFI_VETO_LIQ_ABS] LIQ ABSOLUTE mau SHORT tapi OFI LONG {ofi_strength:.2f} → VETO, force LONG"
+        return result, True
+    
+    # ========== Fix 5: Volume ultra tipis + Greeks kill mismatch ==========
+    is_ultra_thin = (latest_volume < 50000 or volume_ratio < 0.3)
+    
+    if is_ultra_thin and greeks_kill != "NEUTRAL":
+        if greeks_kill == "SHORT" and current_bias == "LONG":
+            result["bias"] = "SHORT"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = -99983
+            result["entry_allowed"] = True
+            result["_thin_vol_greek_mismatch"] = True
+            result["reason"] = (
+                f"[THIN_VOL_GREEK_MISMATCH] volume={latest_volume:.0f} ultra tipis, "
+                f"greeks_kill={greeks_kill} berlawanan dengan bias LONG → force SHORT"
+            )
+            return result, True
+        
+        if greeks_kill == "LONG" and current_bias == "SHORT":
+            result["bias"] = "LONG"
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = -99983
+            result["entry_allowed"] = True
+            result["_thin_vol_greek_mismatch"] = True
+            result["reason"] = (
+                f"[THIN_VOL_GREEK_MISMATCH] volume={latest_volume:.0f} ultra tipis, "
+                f"greeks_kill={greeks_kill} berlawanan dengan bias SHORT → force LONG"
+            )
+            return result, True
+    
+    # Normal LIQ ABSOLUTE jika lolos semua guard
     return result, False
 
 
