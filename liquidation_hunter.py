@@ -11250,6 +11250,113 @@ def apply_liq_absolute_with_rsi_guard(result: dict) -> tuple:
     return result, False
 
 
+def detect_thin_book_vacuum_pump(result: dict) -> tuple:
+    """
+    Deteksi ketika harga naik signifikan TAPI up_energy hampir nol.
+    Ini adalah "vacuum pump" — harga naik bukan karena buyer, tapi karena thin book.
+    Setelah pump selesai → harga jatuh natural.
+    Returns: (result, overridden)
+    """
+    change_5m = result.get("change_5m", 0)
+    up_energy = result.get("up_energy", 0)
+    down_energy = result.get("down_energy", 0)
+    volume = result.get("volume_ratio", 1.0)
+    agg = result.get("agg", 0.5)
+    rsi6 = result.get("rsi6", 50)
+    rsi6_5m = result.get("rsi6_5m", 50)
+    kill_speed = abs(result.get("greeks_kill_speed", 0))
+    gamma_sigs = result.get("greeks_gamma_exec_signals", [])
+
+    # Cek apakah Greeks sudah detect thin_book_move
+    thin_book_detected = any("thin_book_move" in str(sig) for sig in gamma_sigs)
+
+    # KONDISI UTAMA: harga naik besar tapi energy hampir nol
+    price_energy_divergence = (
+        change_5m > 5.0 and
+        up_energy < 0.3 and
+        down_energy < 0.1
+    )
+    if not price_energy_divergence:
+        return result, False
+
+    # Konfirmasi tambahan (minimal 3)
+    confirmations = 0
+    conf_reasons = []
+    if rsi6 > 70:
+        confirmations += 1
+        conf_reasons.append(f"RSI1m={rsi6:.0f} overbought")
+    if rsi6_5m > 65:
+        confirmations += 1
+        conf_reasons.append(f"RSI5m={rsi6_5m:.0f} overbought")
+    if agg < 0.45:
+        confirmations += 1
+        conf_reasons.append(f"agg={agg:.2f} buyers lemah")
+    if volume < 0.8:
+        confirmations += 1
+        conf_reasons.append(f"volume={volume:.2f}x rendah")
+    if kill_speed < 0.3:
+        confirmations += 1
+        conf_reasons.append(f"kill_speed={kill_speed:.2f} lambat")
+    if thin_book_detected:
+        confirmations += 2  # bobot lebih karena Greeks confirm
+        conf_reasons.append("Greeks confirm: thin_book_move")
+
+    if confirmations < 3:
+        return result, False
+
+    # THIN BOOK VACUUM PUMP CONFIRMED → FADE LONG, force SHORT
+    result["bias"] = "SHORT"
+    result["confidence"] = "ABSOLUTE"
+    result["priority_level"] = -43000   # lebih tinggi dari LIQ ABSOLUTE (-42000) dan GREEKS_OVERRIDE (-9995)
+    result["entry_allowed"] = True
+    result["_thin_book_vacuum_pump"] = True
+    result["reason"] = (
+        f"[THIN_BOOK_VACUUM_PUMP] change={change_5m:.1f}% TAPI "
+        f"up_energy={up_energy:.2f} (hampir nol). "
+        f"Konfirmasi ({confirmations}): {' | '.join(conf_reasons)}. "
+        f"Harga naik karena vacuum bukan buyer genuine → FADE, force SHORT"
+    )
+    return result, True
+
+
+def rsi_both_tf_check_v2(result: dict, hawkes_prediction: dict) -> bool:
+    """
+    RSI Both-TF override hanya valid jika funding MENDUKUNG bounce.
+    Jika RSI oversold tapi funding positif (LONGS trapped): jangan cancel Hawkes SHORT.
+    Jika RSI oversold dan funding negatif (SHORTS trapped): cancel Hawkes SHORT → LONG.
+    Mirror untuk overbought.
+    """
+    rsi6 = result.get("rsi6", 50)
+    rsi6_5m = result.get("rsi6_5m", 50)
+    funding = result.get("funding_rate", 0.0)
+    hawkes_says = hawkes_prediction.get("who_dies_first", "")
+
+    # RSI keduanya oversold
+    if rsi6 < 30 and rsi6_5m < 30 and hawkes_says == "LONG":
+        # Funding positif = LONGS yang trapped, dump masih berlanjut
+        if funding > 0.001:
+            return False   # JANGAN cancel Hawkes → SHORT tetap valid
+        # Funding negatif = SHORTS trapped, bounce genuine
+        if funding < -0.001:
+            return True    # Cancel Hawkes → LONG valid
+        # Ambiguous, lihat Greeks
+        greeks_kill = result.get("greeks_kill_direction", "")
+        greeks_crowded = result.get("greeks_delta_crowded", "")
+        if greeks_kill == "LONG" and greeks_crowded == "SHORT":
+            return True
+        return False
+
+    # RSI keduanya overbought
+    if rsi6 > 70 and rsi6_5m > 65 and hawkes_says == "SHORT":
+        # Funding negatif = SHORTS trapped, pump masih berlanjut
+        if funding < -0.005:
+            return False   # JANGAN cancel Hawkes → LONG valid
+        # Funding normal/positif + overbought = pump sudah selesai
+        return True        # Cancel Hawkes → SHORT valid
+
+    return False
+
+
 def apply_pre_kill_sweep_with_rsi_guard(result: dict) -> tuple:
     """
     PRE_KILL_SWEEP dibatalkan jika RSI berlawanan (overbought saat mau LONG, oversold saat mau SHORT).
@@ -11434,9 +11541,10 @@ def hawkes_squeeze_validity_gate(result: dict, hawkes_predictor) -> tuple:
         result["reason"] += " | " + conflict["reason"]
         hawkes_cancelled = True
 
-    # ========== LAYER 2: RSI BOTH-TF CIRCUIT BREAKER ==========
+    # ========== LAYER 2: RSI BOTH-TF CIRCUIT BREAKER (V2 - WITH FUNDING CHECK) ==========
     hawkes_says_long_dies = (prediction.get("who_dies_first") == "LONG")
-    if rsi_both_tf_oversold_check(result, hawkes_says_long_dies):
+    use_rsi_v2 = rsi_both_tf_check_v2(result, {"who_dies_first": "LONG" if hawkes_says_long_dies else "SHORT"})
+    if use_rsi_v2:
         result["_hawkes_gate_triggered"] = False
         result["_hawkes_cancelled_by_rsi"] = True
         # Jika RSI both oversold, maka LONG yang benar
@@ -11449,7 +11557,7 @@ def hawkes_squeeze_validity_gate(result: dict, hawkes_predictor) -> tuple:
             correct_bias = result.get("bias", "NEUTRAL")
         result["bias"] = correct_bias
         result["reason"] += (
-            f" | [RSI_BOTH_TF_OVERRIDE] RSI6={rsi6_val:.0f} AND RSI5m={rsi6_5m_val:.0f} "
+            f" | [RSI_BOTH_TF_OVERRIDE_V2] RSI6={rsi6_val:.0f} AND RSI5m={rsi6_5m_val:.0f} "
             f"keduanya {'oversold' if rsi6_val<30 else 'overbought'} → cancel Hawkes, force {correct_bias}"
         )
         hawkes_cancelled = True
