@@ -12881,7 +12881,9 @@ def apply_macd_duel_safe(
         return final_bias, "IGNORED", f"duel_too_small={macd_decision.get('duel', 0)}"
 
     # Filter 4: momentum besar & likuiditas dekat
-    if abs(change_5m) > 2.0 and (liq["short_dist"] < 2.0 or liq["long_dist"] < 2.0):
+    short_liq = liq.get("short_dist", 99.0) if isinstance(liq, dict) else 99.0
+    long_liq = liq.get("long_dist", 99.0) if isinstance(liq, dict) else 99.0
+    if abs(change_5m) > 2.0 and (short_liq < 2.0 or long_liq < 2.0):
         if (rsi6_5m >= 75 and final_bias == "LONG") or (rsi6_5m <= 25 and final_bias == "SHORT"):
             pass
         else:
@@ -32095,7 +32097,7 @@ class BinanceAnalyzer:
 
         # ===== PRIORITY -10004: CAPITULATION BOTTOM REVERSAL =====
         capitulation = CapitulationBottomReversal.detect(
-            long_liq=liq["long_dist"],
+            long_liq=long_liq,
             change_5m=change_5m_val,
             rsi6=rsi6_val,
             volume_ratio=volume_ratio,
@@ -32875,19 +32877,23 @@ class BinanceAnalyzer:
             )
             liq = IndicatorCalculator.get_liquidation_zones(highs_1m, lows_1m, price)
             
+            # FIX: Extract long_liq and short_liq to avoid KeyError if liq is malformed
+            long_liq = liq.get("long_dist", 99.0) if isinstance(liq, dict) else 99.0
+            short_liq = liq.get("short_dist", 99.0) if isinstance(liq, dict) else 99.0
+            
             # ========== HAWKES LIQUIDATION EVENT DETECTION ==========
             # Deteksi event likuidasi dari perubahan long_liq dan short_liq
             if hasattr(self, 'last_long_liq') and hasattr(self, 'last_short_liq'):
                 if self.last_long_liq is not None and self.last_short_liq is not None:
                     # Long liq menipis = beberapa long terlikuidasi (threshold 0.01% untuk sensitivitas lebih tinggi)
-                    if liq["long_dist"] < self.last_long_liq - 0.01:
+                    if long_liq < self.last_long_liq - 0.01:
                         self.hawkes_predictor.update_recursive(time.time(), 'LONG_LIQ')
                     # Short liq menipis = beberapa short terlikuidasi (threshold 0.01% untuk sensitivitas lebih tinggi)
-                    if liq["short_dist"] < self.last_short_liq - 0.01:
+                    if short_liq < self.last_short_liq - 0.01:
                         self.hawkes_predictor.update_recursive(time.time(), 'SHORT_LIQ')
 
-            self.last_long_liq = liq["long_dist"]
-            self.last_short_liq = liq["short_dist"]
+            self.last_long_liq = long_liq
+            self.last_short_liq = short_liq
             # ========== END HAWKES LIQUIDATION EVENT DETECTION ==========
             
             ma25 = IndicatorCalculator.calculate_ma(closes_1m, 25)
@@ -32992,25 +32998,25 @@ class BinanceAnalyzer:
 
             # ========== NEW DETECTORS: ShortLiqProximityAggSqueeze & DownEnergyZeroShortLiqClose ==========
             short_liq_agg_squeeze = ShortLiqProximityAggSqueeze.detect(
-                liq["short_dist"], liq["long_dist"], agg,
+                short_liq, long_liq, agg,
                 down_energy, up_energy, change_5m,
                 rsi6, volume_ratio
             )
 
             down_energy_zero_close = DownEnergyZeroShortLiqClose.detect(
-                down_energy, liq["short_dist"], liq["long_dist"],
+                down_energy, short_liq, long_liq,
                 up_energy, agg
             )
 
             # ========== Master Squeeze Rule (untuk digunakan di priority ladder) ==========
             master_squeeze = MasterSqueezeRule.detect(
-                liq["short_dist"], liq["long_dist"], change_5m,
+                short_liq, long_liq, change_5m,
                 down_energy, up_energy, volume_ratio
             )
 
             # ========== Overbought / Oversold Distribution Traps ==========
             overbought_trap = OverboughtDistributionTrap.detect(
-                rsi6, liq["short_dist"], liq["long_dist"], volume_ratio,
+                rsi6, short_liq, long_liq, volume_ratio,
                 down_energy, up_energy, ofi["bias"], ofi["strength"], change_5m,
                 agg=agg  # ← TAMBAHKAN parameter agg
             )
@@ -33029,7 +33035,7 @@ class BinanceAnalyzer:
                 sell_wall_cascade = {"override": False}
             else:
                 oversold_trap = OversoldSqueezeTrap.detect(
-                    rsi6, liq["long_dist"], liq["short_dist"], volume_ratio,
+                    rsi6, long_liq, short_liq, volume_ratio,
                     up_energy, down_energy, ofi["bias"], ofi["strength"], change_5m
                 )
                 if oversold_trap["override"]:
