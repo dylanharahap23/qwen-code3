@@ -11779,7 +11779,7 @@ def apply_liq_absolute_with_rsi_guard(result: dict) -> tuple:
         # ===== PRIORITY -42100: OVERSOLD OBV DISTRIBUTION CONTINUATION =====
         obv_dist_cont = OversoldOBVDistributionContinuation.detect(result)
         if obv_dist_cont[1]:
-            return obv_dist_cont[0]
+            return obv_dist_cont[0], True
 
         # Tapi RSI keduanya oversold dan kill_dir = LONG -> ini bait
         if rsi6 < 30 and rsi6_5m < 25 and kill_dir == "LONG":
