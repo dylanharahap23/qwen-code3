@@ -12127,6 +12127,12 @@ def absolute_agg_ofi_short_liq_override(result: dict) -> tuple:
     if funding_rate > 0.0003 and delta_exposure > 0.90:
         return result, False
 
+    # ── GUARD EXHAUSTION: Jangan LONG jika RSI5m tinggi + energy lemah ──
+    rsi6_5m = result.get("rsi6_5m", 50)
+    up_energy_val = result.get("up_energy", 0)
+    if rsi6_5m > 85 and up_energy_val < 0.5:
+        return result, False
+
     if (
         agg >= 0.90 and
         ofi_bias == "LONG" and
