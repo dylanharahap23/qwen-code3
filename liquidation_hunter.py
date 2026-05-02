@@ -12214,6 +12214,31 @@ def detect_high_up_energy_fake_pump_v2(result: dict, defer_override: bool = Fals
         )
         return result, False
 
+    # ── EXEMPTION: Short squeeze aktif ──
+    short_liq_val = result.get("short_liq", 99)
+    long_liq_val = result.get("long_liq", 99)
+    agg = result.get("agg", 0.5)
+    algo_bias = result.get("algo_type_bias", "NEUTRAL")
+    hft_bias = result.get("hft_6pct_bias", "NEUTRAL")
+    funding_rate = result.get("funding_rate", 0) or 0.0
+
+    # Ciri short squeeze: short_liq ultra dekat + buy pressure + Algo/HFT LONG
+    if (short_liq_val < 0.5 and
+        up_energy > 0.5 and
+        agg > 0.5 and
+        long_liq_val > short_liq_val * 10 and   # long_liq jauh → target squeeze valid
+        algo_bias == "LONG" and
+        hft_bias == "LONG" and
+        funding_rate < 0.005):               # funding tidak crowded-long ekstrem
+        result["_high_up_energy_exempted"] = False  # hapus flag lama
+        result["reason"] = result.get("reason", "") + (
+            f" | [SHORT_SQUEEZE_EXEMPT] short_liq={short_liq_val:.2f}% (<0.5), "
+            f"up_energy={up_energy:.2f}, agg={agg:.2f}, long_liq={long_liq_val:.2f}% (>{short_liq_val*10:.2f}), "
+            f"algo={algo_bias}, hft={hft_bias}, funding={funding_rate:.5f} -> "
+            "short squeeze aktif, jangan trigger fake pump SHORT"
+        )
+        return result, False            # jangan trigger fake pump
+
     fake_pump_reason = (
         f"[HIGH_UP_ENERGY_FAKE_PUMP] up_energy={up_energy:.1f}, "
         f"vol={volume_ratio:.2f}x, short_liq={short_liq:.2f}% "
