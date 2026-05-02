@@ -34081,14 +34081,8 @@ class BinanceAnalyzer:
                         priority_guard_hard_return = None
 
                         # ===== PRIORITY -30745: MICRO LIQ SWEEP THEN REVERSE =====
-                        micro_sweep = MicroLiqSweepThenReverse.detect(result)
-                        if micro_sweep.get("override"):
-                            result["bias"]           = micro_sweep["bias"]
-                            result["confidence"]     = micro_sweep["confidence"]
-                            result["entry_allowed"]  = False
-                            result["reason"]         = f"[MICRO_SWEEP] {micro_sweep['reason']} | " + result.get("reason", "")
-                            result["priority_level"] = micro_sweep["priority"]
-                            return result
+                        # Catatan: Detector ini sudah dipanggil di _apply_stability_filters()
+                        # Tidak perlu dipanggil lagi di sini untuk menghindari UnboundLocalError
 
                         # ===== KATUSUSDT FIX: Funding-Led Squeeze Shakeout Override (Priority -30800) =====
                         # Ini harus dicek PALING PERTAMA, bahkan sebelum High Up-Energy Fake Pump
