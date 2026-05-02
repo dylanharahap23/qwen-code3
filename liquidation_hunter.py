@@ -1277,6 +1277,73 @@ class UltraCloseLiqFakeVacuumTrap:
         }
 
 
+class HighEnergyAccumulationPreSqueeze:
+    """
+    PRIORITY -30700 (di atas HIGH_UP_ENERGY_FAKE_PUMP -30750).
+
+    Ketika up_energy tinggi tapi harga flat/turun, short_liq lebih dekat,
+    long_liq jauh, dan tidak ada seller → ini adalah AKUMULASI sebelum squeeze,
+    bukan fake pump.
+    """
+    @staticmethod
+    def detect(result: dict) -> dict:
+        up_energy   = result.get("up_energy", 0)
+        down_energy = result.get("down_energy", 0)
+        short_liq   = result.get("short_liq", 99)
+        long_liq    = result.get("long_liq", 99)
+        change_5m   = result.get("change_5m", 0)
+        agg         = result.get("agg", 0.5)
+        algo_bias   = result.get("algo_type_bias", "NEUTRAL")
+        hft_bias    = result.get("hft_6pct_bias", "NEUTRAL")
+        ofi_bias    = result.get("ofi_bias", "NEUTRAL")
+        funding     = result.get("funding_rate", 0) or 0.0
+
+        # 1. Up energy tinggi tapi harga tidak naik
+        if up_energy < 1.5 or change_5m > 1.0:
+            return {"override": False}
+
+        # 2. Short liq lebih dekat
+        if short_liq >= long_liq:
+            return {"override": False}
+
+        # 3. Tidak ada seller
+        if down_energy >= 0.1:
+            return {"override": False}
+
+        # 4. Buyer dominan
+        if agg < 0.55:
+            return {"override": False}
+
+        # 5. Minimal satu advisor LONG
+        if algo_bias != "LONG" and hft_bias != "LONG":
+            return {"override": False}
+
+        # 6. OFI tidak konfirmasi SHORT
+        if ofi_bias == "SHORT":
+            return {"override": False}
+
+        # 7. Funding tidak crowded-long ekstrem
+        if funding > 0.006:
+            return {"override": False}
+
+        # 8. Target squeeze harus jauh (long_liq > 8.0) ATAU short_liq tidak ultra dekat (>1.5)
+        if not (long_liq > 8.0 or short_liq > 1.5):
+            return {"override": False}
+
+        return {
+            "override": True,
+            "bias": "LONG",
+            "confidence": "ABSOLUTE",
+            "priority": -30700,
+            "reason": (
+                f"HIGH_ENERGY_ACCUMULATION_PRE_SQUEEZE: up_energy={up_energy:.2f} tinggi "
+                f"tapi change={change_5m:.2f}% + down_energy=0 → HFT akumulasi. "
+                f"short_liq={short_liq:.2f}% < long_liq={long_liq:.2f}% → target squeeze valid. "
+                f"algo={algo_bias}, hft={hft_bias}, agg={agg:.2f} → Force LONG."
+            )
+        }
+
+
 class HighUpEnergyFakePumpGuard:
     """
     PRIORITY -30750 (PALING TINGGI)
@@ -12221,6 +12288,23 @@ def detect_high_up_energy_fake_pump_v2(result: dict, defer_override: bool = Fals
     algo_bias = result.get("algo_type_bias", "NEUTRAL")
     hft_bias = result.get("hft_6pct_bias", "NEUTRAL")
     funding_rate = result.get("funding_rate", 0) or 0.0
+
+    # ── SAFETY NET: Konfirmasi bearish minimum ──
+    bearish_confirms = 0
+    if result.get("ofi_bias") == "SHORT":          bearish_confirms += 1
+    if result.get("greeks_kill_direction") == "SHORT": bearish_confirms += 1
+    if result.get("greeks_liq_7pct") == "LONG_TRADERS_DIE": bearish_confirms += 1
+    if result.get("agg", 0.5) < 0.45:             bearish_confirms += 1
+    if result.get("obv_trend") in ("NEGATIVE", "NEGATIVE_EXTREME"): bearish_confirms += 1
+
+    short_liq_check = result.get("short_liq", 99)
+    if bearish_confirms == 0 and short_liq_check > 2.0:
+        # Tidak ada satupun konfirmasi bearish + short liq tidak ultra dekat
+        # → tidak cukup bukti untuk SHORT
+        result["reason"] = result.get("reason", "") + (
+            f" | [FAKE_PUMP_BEARISH_GUARD] bearish_confirms={bearish_confirms} (ofi={result.get('ofi_bias')}, greeks_kill={result.get('greeks_kill_direction')}, greeks_liq_7pct={result.get('greeks_liq_7pct')}, agg={result.get('agg', 0.5)}, obv={result.get('obv_trend')}) + short_liq={short_liq_check:.2f}% > 2.0 -> tidak cukup bukti bearish untuk SHORT"
+        )
+        return result, False
 
     # Ciri short squeeze: short_liq ultra dekat + buy pressure + Algo/HFT LONG
     if (short_liq_val < 0.5 and
@@ -26766,6 +26850,16 @@ class BinanceAnalyzer:
         elif exhaustion.get("warning"):
             result["_exhaustion_warning"] = True
         # ========== END POST-SQUEEZE GATE ==========
+
+        # ===== PRIORITY -30700: HIGH ENERGY ACCUMULATION PRE-SQUEEZE =====
+        he_accum = HighEnergyAccumulationPreSqueeze.detect(result)
+        if he_accum.get("override"):
+            result["bias"] = he_accum["bias"]
+            result["confidence"] = "ABSOLUTE"
+            result["reason"] = f"[HE_ACCUM] {he_accum['reason']} | " + result.get("reason", "")
+            result["priority_level"] = he_accum["priority"]
+            result["entry_allowed"] = True
+            return result
 
         # ========== HIGH UP ENERGY FAKE PUMP V2 (DEFERRED, PRIORITY -30750) ==========
         result, _high_up_energy_overridden = detect_high_up_energy_fake_pump_v2(result, defer_override=True)
