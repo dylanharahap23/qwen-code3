@@ -1,11 +1,13 @@
 ```
-# Compiled Python files
-*.pyc
+# Python
 __pycache__/
+*.pyc
+*.pyo
+*.pyd
 
-# Virtual environments
-venv/
+# Environment
 .venv/
+venv/
 .env
 .env.local
 *.env.*
@@ -16,22 +18,21 @@ venv/
 # Temporary files
 *.tmp
 *.swp
+*.swo
 
-# Coverage reports
+# Coverage
 .coverage
 coverage/
 htmlcov/
 
-# IDE specific
+# IDE
 .vscode/
 .idea/
 
 # Build artifacts
-build/
 dist/
-*.egg-info/
-
-# OS generated files
-.DS_Store
-Thumbs.db
+build/
+*.o
+*.obj
+*.out
 ```
