@@ -1707,6 +1707,67 @@ class BlowOffTopExhaustionGuard:
         }
 
 
+class HawkesConsensusConflictGuard:
+    """
+    PRIORITY -31490 (tepat di atas HAWKES SQUEEZE INVALID -31500)
+    
+    Guard lapis ke-2 yang mendeteksi konflik antara keputusan Hawkes (SHORT) 
+    dengan konsensus indikator lain yang sangat kuat ke LONG.
+    
+    Jika Hawkes bilang SHORT tapi konsensus_score >= 10/18 untuk LONG,
+    maka force LONG dengan confidence ABSOLUTE.
+    """
+    @staticmethod
+    def detect(result: dict) -> dict:
+        bias = result.get("bias", "NEUTRAL")
+        # Hanya aktif jika bias saat ini adalah SHORT dan Hawkes gate sudah triggered
+        if bias != "SHORT" or not result.get("_hawkes_gate_triggered"):
+            return {"override": False}
+
+        long_liq         = result.get("long_liq", 99)
+        greeks_kill      = result.get("greeks_kill_direction", "")
+        greeks_liq7      = result.get("greeks_liq_7pct", "")
+        greeks_who       = result.get("greeks_who_dies_first", "")
+        greeks_bias      = result.get("greeks_bias", "")
+        hft_bias         = result.get("hft_6pct_bias", "NEUTRAL")
+        exchange_dir     = result.get("exchange_safe_direction", "NEUTRAL")
+        ofi_bias         = result.get("ofi_bias", "NEUTRAL")
+        agg_val          = result.get("agg", 0.5)
+        fuel             = result.get("squeeze_fuel_score", 0)
+        rsi6             = result.get("rsi6", 50)
+        stoch_j          = result.get("stoch_j", 50)
+        down_energy      = result.get("down_energy", 0)
+        up_energy        = result.get("up_energy", 0)
+
+        long_score = 0
+        if greeks_kill == "LONG":           long_score += 2
+        if greeks_liq7 == "SHORT_TRADERS_DIE": long_score += 2
+        if greeks_who == "SHORT_TRADERS":   long_score += 1
+        if greeks_bias == "LONG":           long_score += 2
+        if hft_bias == "LONG":              long_score += 2
+        if exchange_dir == "LONG":          long_score += 1
+        if ofi_bias == "LONG":              long_score += 1
+        if agg_val > 0.7:                   long_score += 1
+        if fuel >= 4:                       long_score += 1
+        if rsi6 < 30 and stoch_j < 10:      long_score += 2
+        if long_liq < 1.5:                 long_score += 2
+        if down_energy < 0.01 and up_energy > 0.5: long_score += 1
+
+        if long_score >= 10:
+            return {
+                "override": True,
+                "bias": "LONG",
+                "confidence": "ABSOLUTE",
+                "priority": -31490,
+                "reason": (
+                    f"HAWKES_CONSENSUS_CONFLICT: Hawkes bilang SHORT tapi "
+                    f"konsensus_score={long_score}/18 sangat kuat ke LONG. "
+                    f"Force LONG."
+                )
+            }
+        return {"override": False}
+
+
 class InstitutionalSellWallCascadeGuard:
     """
     PRIORITY -31000 (TERTINGGI, DI ATAS SEMUA ULTRA CLOSE LIQ DETECTOR):
@@ -13226,6 +13287,48 @@ def hawkes_squeeze_validity_gate(result: dict, hawkes_predictor) -> tuple:
                 if _should_override_hawkes(result, prediction):
                     result["reason"] += " | [HAWKES_CONTEXT_OVERRIDE] Sinyal konteks terlalu kuat berlawanan → Hawkes dibatalkan"
                 else:
+                    # ── GUARD: Hawkes hanya override jika probabilitas cukup kuat ──
+                    hawkes_prob = prediction.get("confidence", 0)
+                    
+                    if hawkes_prob < 0.65:
+                        greeks_kill   = result.get("greeks_kill_direction", "")
+                        greeks_liq7   = result.get("greeks_liq_7pct", "")
+                        greeks_who    = result.get("greeks_who_dies_first", "")
+                        greeks_bias   = result.get("greeks_bias", "")
+                        hft_b         = result.get("hft_6pct_bias", "NEUTRAL")
+                        exchange_dir  = result.get("exchange_safe_direction", "NEUTRAL")
+                        ofi_b         = result.get("ofi_bias", "NEUTRAL")
+                        agg_val       = result.get("agg", 0.5)
+                        fuel          = result.get("squeeze_fuel_score", 0)
+                        long_liq_val  = result.get("long_liq", 99)
+                        rsi6          = result.get("rsi6", 50)
+                        stoch_j       = result.get("stoch_j", 50)
+                        down_energy   = result.get("down_energy", 0)
+                        up_energy     = result.get("up_energy", 0)
+                        
+                        long_score = 0
+                        if greeks_kill == "LONG":           long_score += 2
+                        if greeks_liq7 == "SHORT_TRADERS_DIE": long_score += 2
+                        if greeks_who == "SHORT_TRADERS":   long_score += 1
+                        if greeks_bias == "LONG":           long_score += 2
+                        if hft_b == "LONG":                 long_score += 2
+                        if exchange_dir == "LONG":          long_score += 1
+                        if ofi_b == "LONG":                 long_score += 1
+                        if agg_val > 0.7:                   long_score += 1
+                        if fuel >= 4:                       long_score += 1
+                        if rsi6 < 30 and stoch_j < 10:      long_score += 2
+                        if long_liq_val < 1.5:             long_score += 2
+                        if down_energy < 0.01 and up_energy > 0.5: long_score += 1
+                        
+                        if long_score >= 10:
+                            result["_hawkes_gate_triggered"] = False
+                            result["_hawkes_cancelled_by_consensus"] = True
+                            result["reason"] = result.get("reason", "") + (
+                                f" | [HAWKES_CONSENSUS_CANCEL] prob={hawkes_prob:.2f} tipis, "
+                                f"konsensus LONG={long_score}/18 → Hawkes dibatalkan"
+                            )
+                            return result, False
+                    
                     result["bias"] = "SHORT"
                     result["_hawkes_gate_triggered"] = True
                     result["confidence"] = "ABSOLUTE"
@@ -13274,6 +13377,48 @@ def hawkes_squeeze_validity_gate(result: dict, hawkes_predictor) -> tuple:
                 if _should_override_hawkes(result, prediction):
                     result["reason"] += " | [HAWKES_CONTEXT_OVERRIDE] Sinyal konteks terlalu kuat berlawanan → Hawkes dibatalkan"
                 else:
+                    # ── GUARD: Hawkes hanya override jika probabilitas cukup kuat ──
+                    hawkes_prob = prediction.get("confidence", 0)
+                    
+                    if hawkes_prob < 0.65:
+                        greeks_kill   = result.get("greeks_kill_direction", "")
+                        greeks_liq7   = result.get("greeks_liq_7pct", "")
+                        greeks_who    = result.get("greeks_who_dies_first", "")
+                        greeks_bias   = result.get("greeks_bias", "")
+                        hft_b         = result.get("hft_6pct_bias", "NEUTRAL")
+                        exchange_dir  = result.get("exchange_safe_direction", "NEUTRAL")
+                        ofi_b         = result.get("ofi_bias", "NEUTRAL")
+                        agg_val       = result.get("agg", 0.5)
+                        fuel          = result.get("squeeze_fuel_score", 0)
+                        long_liq_val  = result.get("long_liq", 99)
+                        rsi6          = result.get("rsi6", 50)
+                        stoch_j       = result.get("stoch_j", 50)
+                        down_energy   = result.get("down_energy", 0)
+                        up_energy     = result.get("up_energy", 0)
+                        
+                        long_score = 0
+                        if greeks_kill == "LONG":           long_score += 2
+                        if greeks_liq7 == "SHORT_TRADERS_DIE": long_score += 2
+                        if greeks_who == "SHORT_TRADERS":   long_score += 1
+                        if greeks_bias == "LONG":           long_score += 2
+                        if hft_b == "LONG":                 long_score += 2
+                        if exchange_dir == "LONG":          long_score += 1
+                        if ofi_b == "LONG":                 long_score += 1
+                        if agg_val > 0.7:                   long_score += 1
+                        if fuel >= 4:                       long_score += 1
+                        if rsi6 < 30 and stoch_j < 10:      long_score += 2
+                        if long_liq_val < 1.5:             long_score += 2
+                        if down_energy < 0.01 and up_energy > 0.5: long_score += 1
+                        
+                        if long_score >= 10:
+                            result["_hawkes_gate_triggered"] = False
+                            result["_hawkes_cancelled_by_consensus"] = True
+                            result["reason"] = result.get("reason", "") + (
+                                f" | [HAWKES_CONSENSUS_CANCEL] prob={hawkes_prob:.2f} tipis, "
+                                f"konsensus LONG={long_score}/18 → Hawkes dibatalkan"
+                            )
+                            return result, False
+                    
                     result["bias"] = "LONG"
                     result["_hawkes_gate_triggered"] = True
                     result["confidence"] = "ABSOLUTE"
@@ -27103,6 +27248,17 @@ class BinanceAnalyzer:
             return result
         # ========== END HAWKES SQUEEZE VALIDITY GATE ==========
 
+
+        # ===== PRIORITY -31490: HAWKES CONSENSUS CONFLICT GUARD =====
+        # Guard lapis ke-2: jika Hawkes bilang SHORT tapi konsensus sangat kuat ke LONG
+        hawkes_conflict = HawkesConsensusConflictGuard.detect(result)
+        if hawkes_conflict.get("override"):
+            result["bias"]           = hawkes_conflict["bias"]
+            result["confidence"]     = "ABSOLUTE"
+            result["reason"]         = f"[HAWKES_CONFLICT] {hawkes_conflict['reason']} | " + result.get("reason", "")
+            result["priority_level"] = hawkes_conflict["priority"]
+            result["entry_allowed"]  = True
+            return result
         # ========== AIOTUSDT GUARD: THIN SHORT-LIQ DECOY FADE ==========
         result, overridden = thin_short_liq_decoy_fade(result)
         if overridden:
