@@ -33621,15 +33621,6 @@ class BinanceAnalyzer:
                             funding_rate=funding_rate if funding_rate is not None else 0.0,
                             change_5m=change_5m
                         )
-                        # ===== PRIORITY -30695: FAKE SHORT SQUEEZE OVERBOUGHT GUARD =====
-                        fake_squeeze_guard = ProtectGenuineShortSqueezeGuard_Overbought.detect(result)
-                        if fake_squeeze_guard.get("override"):
-                            result["bias"]          = fake_squeeze_guard["bias"]
-                            result["confidence"]    = "ABSOLUTE"
-                            result["reason"]        = f"[FAKE_SQUEEZE_GUARD_OB] {fake_squeeze_guard['reason']} | " + result.get("reason", "")
-                            result["priority_level"]= fake_squeeze_guard["priority"]
-                            result["entry_allowed"] = True
-                            return result
 
                         genuine_squeeze = ProtectGenuineShortSqueezeGuard.detect(
                             short_liq=liq["short_dist"],
