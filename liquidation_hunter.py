@@ -1561,6 +1561,84 @@ class FundingLedSqueezeShakeoutGuard:
         }
 
 
+class GammaActiveSqueezeNotComplete:
+    """
+    PRIORITY -10185 (di atas BLOW_OFF_TOP_EXHAUSTION -10190).
+    
+    Pump besar terjadi, sistem mau SHORT karena exhaustion,
+    TAPI gamma masih executing + short_liq belum tersapu + HFT masih LONG.
+    Artinya squeeze sedang dalam perjalanan, belum selesai.
+    Jangan SHORT — tunggu short_liq tersapu dulu.
+    """
+    @staticmethod
+    def detect(result: dict) -> dict:
+        change_5m      = result.get("change_5m", 0)
+        short_liq      = result.get("short_liq", 99)
+        long_liq       = result.get("long_liq", 99)
+        gamma_exec     = result.get("greeks_gamma_executing", False)
+        hft_bias       = result.get("hft_6pct_bias", "NEUTRAL")
+        down_energy    = result.get("down_energy", 0)
+        obv            = result.get("obv_trend", "NEUTRAL")
+        ofi_bias       = result.get("ofi_bias", "NEUTRAL")
+        bias           = result.get("bias", "NEUTRAL")
+
+        # Hanya relevan jika sistem mau SHORT setelah pump besar
+        if bias != "SHORT":
+            return {"override": False}
+        if change_5m < 4.0:
+            return {"override": False}
+
+        # Short liq masih ada dan jauh lebih dekat dari long liq
+        if short_liq >= 2.0:
+            return {"override": False}
+        if short_liq >= long_liq * 0.3:
+            return {"override": False}
+
+        # Gamma masih jalan = institusi belum selesai
+        if not gamma_exec:
+            return {"override": False}
+
+        # Tidak ada seller
+        if down_energy >= 0.1:
+            return {"override": False}
+
+        # HFT masih kejar short liq
+        if hft_bias != "LONG":
+            return {"override": False}
+
+        # OBV masih positif = akumulasi belum berbalik
+        if obv not in ("POSITIVE_EXTREME", "POSITIVE"):
+            return {"override": False}
+
+        # OFI SHORT tapi gamma masih executing = reset sesaat
+        if ofi_bias == "SHORT":
+            # Jangan force LONG, tapi block SHORT → NEUTRAL
+            result["bias"] = "NEUTRAL"
+            result["entry_allowed"] = False
+            result["confidence"] = "BLOCK"
+            result["reason"] = (
+                f"[DOUBLE_SQUEEZE_POSSIBLE] OFI SHORT sementara tapi gamma masih executing "
+                f"+ short_liq={short_liq:.2f}% belum tersapu. Terlalu berbahaya. NO TRADE."
+            )
+            return {"override": True, "bias": "NEUTRAL"}
+
+        # Semua kondisi terpenuhi → squeeze belum selesai → LONG
+        return {
+            "override": True,
+            "bias": "LONG",
+            "confidence": "ABSOLUTE",
+            "priority": -10185,
+            "reason": (
+                f"GAMMA_ACTIVE_SQUEEZE_NOT_COMPLETE: pump={change_5m:.1f}% besar "
+                f"tapi short_liq={short_liq:.2f}% BELUM tersapu "
+                f"(long_liq={long_liq:.2f}% jauh), gamma_executing=True, "
+                f"hft={hft_bias}, down_energy=0, OBV={obv} → "
+                f"squeeze masih berjalan, belum selesai. "
+                f"Jangan SHORT sebelum short_liq tersapu. Force LONG."
+            )
+        }
+
+
 class BlowOffTopExhaustionGuard:
     """
     PRIORITY -10190 (DI ATAS PROTECT GENUINE SHORT SQUEEZE -10150):
@@ -1577,9 +1655,25 @@ class BlowOffTopExhaustionGuard:
     @staticmethod
     def detect(short_liq: float, change_5m: float, rsi6: float,
                rsi6_5m: float, stoch_j: float, funding_rate: float,
-               delta_exposure: float, kill_direction: str) -> dict:
+               delta_exposure: float, kill_direction: str,
+               long_liq: float = 99.0, gamma_executing: bool = False,
+               hft_bias: str = "NEUTRAL", obv: str = "NEUTRAL",
+               down_energy: float = 0.0) -> dict:
         
         if funding_rate is None:
+            return {"override": False}
+        
+        # ── GUARD: Jangan SHORT jika gamma masih executing + target belum tersapu ──
+        squeeze_still_active = (
+            short_liq < 2.0 and
+            short_liq < long_liq * 0.2 and
+            gamma_executing and
+            down_energy < 0.01 and
+            hft_bias == "LONG" and
+            obv in ("POSITIVE_EXTREME", "POSITIVE")
+        )
+
+        if squeeze_still_active:
             return {"override": False}
         
         # 1. Short Liq sudah dekat dan harga sudah naik jauh (squeeze sudah terjadi)
@@ -33641,7 +33735,12 @@ class BinanceAnalyzer:
                             stoch_j=stoch_j,
                             funding_rate=funding_rate or 0.0,
                             delta_exposure=provisional_delta.get("delta_exposure", 0.0),
-                            kill_direction=provisional_gamma.get("kill_direction", "")
+                            kill_direction=provisional_gamma.get("kill_direction", ""),
+                            long_liq=liq["long_dist"],
+                            gamma_executing=provisional_gamma.get("gamma_executing", False),
+                            hft_bias=result.get("hft_6pct_bias", "NEUTRAL"),
+                            obv=obv_trend,
+                            down_energy=down_energy
                         )
                         
                         # Guard protect squeeze (priority -30700): paksa LONG kalau genuine squeeze
@@ -33790,9 +33889,27 @@ class BinanceAnalyzer:
                                 "phase": final_phase,
                                 "priority": priority,
                             }
+                        # ===== PRIORITY -10185: GAMMA ACTIVE SQUEEZE NOT COMPLETE =====
+                        gamma_not_done = GammaActiveSqueezeNotComplete.detect(result)
+                        if gamma_not_done.get("override"):
+                            if gamma_not_done.get("bias") == "NEUTRAL":
+                                # OFI SHORT + gamma = double squeeze risk → NO TRADE
+                                result["bias"] = "NEUTRAL"
+                                result["confidence"] = "BLOCK"
+                                result["entry_allowed"] = False
+                                result["reason"] = f"[DOUBLE_SQUEEZE] {gamma_not_done.get('reason')} | " + result.get("reason", "")
+                                return result
+                            else:
+                                result["bias"]           = gamma_not_done["bias"]
+                                result["confidence"]     = "ABSOLUTE"
+                                result["reason"]         = f"[GAMMA_NOT_DONE] {gamma_not_done['reason']} | " + result.get("reason", "")
+                                result["priority_level"] = gamma_not_done["priority"]
+                                result["entry_allowed"]  = True
+                                return result
+
                         # ===== FOLKSUSDT FIX: Blow-Off Top Exhaustion Override (Priority -10190) =====
                         # Ini membatalkan Protect Genuine Short Squeeze jika kondisi exhaustion terpenuhi
-                        elif blowoff_guard["override"]:
+                        if blowoff_guard["override"]:
                             final_bias = blowoff_guard["bias"]
                             final_reason = blowoff_guard["reason"]
                             final_confidence = "ABSOLUTE"
