@@ -12273,6 +12273,26 @@ def detect_high_up_energy_fake_pump_v2(result: dict, defer_override: bool = Fals
         )
         return result, False
 
+    # ── Guard: genuine squeeze dengan short_liq sangat dekat ──
+    short_liq_val = result.get("short_liq", 99)
+    long_liq_val = result.get("long_liq", 99)
+    down_energy_val = result.get("down_energy", 0)
+    change_5m_val = result.get("change_5m", 0)
+    agg_val = result.get("agg", 0.5)
+    
+    if (short_liq_val < 2.0 and short_liq_val < long_liq_val and
+        down_energy_val < 0.01 and change_5m_val > 0 and 
+        up_energy > 2.0 and agg_val > 0.5):
+        # Genuine buying pressure mendekati target, bukan fake pump
+        result["_high_up_energy_exempted"] = True
+        result["reason"] = result.get("reason", "") + (
+            f" | [FAKE_PUMP_EXEMPT] genuine squeeze: short_liq={short_liq_val:.2f}% (<2.0 & <long_liq), "
+            f"down_energy={down_energy_val:.3f} (<0.01), change_5m={change_5m_val:.2f}% (>0), "
+            f"up_energy={up_energy:.2f} (>2.0), agg={agg_val:.2f} (>0.5) -> "
+            "genuine buying pressure mendekati target, bukan fake pump"
+        )
+        return result, False
+
     if ofi_bias == "LONG" and ofi_strength > 0.75 and funding < -0.001:
         result["_high_up_energy_exempted"] = True
         result["reason"] = result.get("reason", "") + (
