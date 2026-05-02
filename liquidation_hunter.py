@@ -12077,6 +12077,19 @@ def apply_liq_absolute_with_rsi_guard(result: dict) -> tuple:
         if obv_dist_cont[1]:
             return obv_dist_cont[0], True
 
+        # ── GUARD: Jangan LONG jika tidak ada fuel / bearish confluence ──
+        squeeze_fuel = result.get("squeeze_fuel_score", 0)
+        agg_val = result.get("agg", 0.5)
+        ofi_bias = result.get("ofi_bias", "NEUTRAL")
+        up_energy_val = result.get("up_energy", 0)
+        
+        if "squeeze_fuel_score" not in result:
+            result["squeeze_fuel_score"] = compute_squeeze_fuel_score(result)
+            squeeze_fuel = result.get("squeeze_fuel_score", 0)
+        
+        if squeeze_fuel <= 0 or (agg_val < 0.3 and ofi_bias == "SHORT" and up_energy_val < 2.0):
+            return result, False   # Jangan paksa LONG
+
         # Tapi RSI keduanya oversold dan kill_dir = LONG -> ini bait
         if rsi6 < 30 and rsi6_5m < 25 and kill_dir == "LONG":
             result["bias"] = "LONG"
