@@ -156,6 +156,17 @@ class PostSqueezeExhaustionDetector:
         # Relax kondisi: score >= 3 sudah warning, >= 4 untuk block override
         if exhaustion_score >= 4:
             new_bias = "SHORT" if data.get("bias") == "LONG" else "LONG"
+            
+            # ── Guard: Jangan reversal ke LONG jika masih bearish kuat ──
+            liq_7pct = data.get("greeks_liq_7pct", "BOTH")
+            ofi_bias = data.get("ofi_bias", "NEUTRAL")
+            agg_val = data.get("agg", 0.5)
+            if (new_bias == "LONG" and
+                liq_7pct == "LONG_TRADERS_DIE" and
+                ofi_bias == "SHORT" and
+                agg_val < 0.4):
+                return {"override": False, "reason": "Exhaustion dibatalkan: LONG_TRADERS_DIE + OFI SHORT + agg rendah"}
+            
             return {
                 "override": True,
                 "new_bias": new_bias,
@@ -6270,7 +6281,8 @@ class ExchangeRiskScoreHardBlock:
         short_liq: float = 99.0,
         change_5m: float = 0.0,
         ask_slope: float = 0,
-        bid_slope: float = 1
+        bid_slope: float = 1,
+        result: dict = None
     ) -> dict:
         if exchange_risk_score < 6:
             return {"override": False}
@@ -6360,6 +6372,21 @@ class ExchangeRiskScoreHardBlock:
         ])
         
         if confirmations < 2:
+            return {"override": False}
+        
+        # ── Guard: Jangan ikuti exchange jika market riil bertentangan ──
+        greeks_liq_7pct = result.get("greeks_liq_7pct", "BOTH")
+        agg_val = result.get("agg", 0.5)
+        ofi_bias = result.get("ofi_bias", "NEUTRAL")
+        if (exchange_safe_direction == "LONG" and
+            greeks_liq_7pct == "LONG_TRADERS_DIE" and
+            agg_val < 0.4 and
+            ofi_bias == "SHORT"):
+            return {"override": False}
+        if (exchange_safe_direction == "SHORT" and
+            greeks_liq_7pct == "SHORT_TRADERS_DIE" and
+            agg_val > 0.6 and
+            ofi_bias == "LONG"):
             return {"override": False}
         
         return {
@@ -29208,7 +29235,8 @@ class BinanceAnalyzer:
             short_liq=short_liq,
             change_5m=change_5m_val,
             ask_slope=result.get("ask_slope", 0),
-            bid_slope=result.get("bid_slope", 1)
+            bid_slope=result.get("bid_slope", 1),
+            result=result  # Pass entire result for guard logic
         )
         if exchange_risk_block["override"]:
             result["bias"] = exchange_risk_block["bias"]
