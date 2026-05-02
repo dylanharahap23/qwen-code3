@@ -1224,6 +1224,72 @@ class DeepOversoldFakeBounceTrap:
         }
 
 
+class MicroLiqSweepThenReverse:
+    """
+    PRIORITY -30745 (di atas ULTRA_LIQ_FAKE_VACUUM -30750)
+    
+    long_liq SANGAT dekat (< 0.3%) sering kali bukan target dump sejati,
+    melainkan micro-sweep kecil. HFT sweep cepat lalu flip LONG
+    untuk mengejar short_liq yang jauh lebih besar.
+    """
+    @staticmethod
+    def detect(result: dict) -> dict:
+        long_liq    = result.get("long_liq", 99)
+        short_liq   = result.get("short_liq", 99)
+        bias        = result.get("bias", "NEUTRAL")
+
+        if bias != "SHORT":
+            return {"override": False}
+        if long_liq >= 0.3:
+            return {"override": False}
+        if short_liq < long_liq * 5:
+            return {"override": False}
+
+        exchange_score = result.get("exchange_risk_score", 0)
+        exchange_dir   = result.get("exchange_safe_direction", "NEUTRAL")
+        gamma_exec     = result.get("greeks_gamma_executing", False)
+        agg_val        = result.get("agg", 0.5)
+        ofi_b          = result.get("ofi_bias", "NEUTRAL")
+        ofi_str        = result.get("ofi_strength", 0)
+        funding        = result.get("funding_rate", 0) or 0.0
+        rsi6           = result.get("rsi6", 50)
+        stoch_j        = result.get("stoch_j", 50)
+        down_energy    = result.get("down_energy", 0)
+        bid_s          = result.get("bid_slope", 0)
+        ask_s          = result.get("ask_slope", 1)
+
+        score = 0
+        if exchange_dir == "LONG" and exchange_score >= 6: score += 3
+        if gamma_exec:                                      score += 2
+        if agg_val > 0.75:                                  score += 2
+        if ofi_b == "LONG" and ofi_str > 0.6:              score += 2
+        if funding > 0.001:                                 score += 1
+        if rsi6 < 25:                                       score += 1
+        if stoch_j < 10:                                    score += 1
+        if down_energy < 0.01:                              score += 1
+        if bid_s > ask_s:                                   score += 1
+
+        if score < 7:
+            return {"override": False}
+
+        return {
+            "override": True,
+            "bias": "NEUTRAL",
+            "entry_allowed": False,
+            "confidence": "BLOCK",
+            "priority": -30745,
+            "reason": (
+                f"MICRO_LIQ_SWEEP_THEN_REVERSE: long_liq={long_liq:.2f}% "
+                f"(micro, bukan target dump), short_liq={short_liq:.2f}% "
+                f"(target squeeze sesungguhnya {short_liq/max(long_liq,0.001):.0f}x lebih jauh). "
+                f"Context_score={score}: exchange={exchange_dir}({exchange_score}), "
+                f"gamma={gamma_exec}, agg={agg_val:.2f}, ofi={ofi_b}({ofi_str:.2f}), "
+                f"funding={funding:.4f}, rsi={rsi6:.1f} → "
+                f"HFT akan micro-sweep long_liq lalu flip LONG. NO TRADE."
+            )
+        }
+
+
 class UltraCloseLiqFakeVacuumTrap:
     """
     PRIORITY -30750
@@ -1235,7 +1301,38 @@ class UltraCloseLiqFakeVacuumTrap:
     @staticmethod
     def detect(long_liq: float, short_liq: float, volume_ratio: float,
                down_energy: float, market_phase: str, change_5m: float,
-               rsi6: float, rsi6_5m: float = 50.0, funding_rate: float = 0.0) -> dict:
+               rsi6: float, rsi6_5m: float = 50.0, funding_rate: float = 0.0,
+               result: dict = None) -> dict:
+        
+        # ── GUARD: Jangan SHORT jika konteks overwhelmingly LONG ──
+        if result is not None:
+            exchange_score  = result.get("exchange_risk_score", 0)
+            exchange_dir    = result.get("exchange_safe_direction", "NEUTRAL")
+            gamma_exec      = result.get("greeks_gamma_executing", False)
+            agg_val         = result.get("agg", 0.5)
+            ofi_b           = result.get("ofi_bias", "NEUTRAL")
+            ofi_str         = result.get("ofi_strength", 0)
+            funding         = result.get("funding_rate", 0) or 0.0
+            rsi6_val        = result.get("rsi6", 50)
+            stoch_j_val     = result.get("stoch_j", 50)
+            bid_s           = result.get("bid_slope", 0)
+            ask_s           = result.get("ask_slope", 1)
+            short_liq_val   = result.get("short_liq", 99)
+            long_liq_val    = result.get("long_liq", 99)
+
+            long_context = 0
+            if exchange_dir == "LONG" and exchange_score >= 7: long_context += 3
+            if gamma_exec:                                      long_context += 2
+            if agg_val > 0.80:                                  long_context += 2
+            if ofi_b == "LONG" and ofi_str > 0.7:              long_context += 2
+            if funding > 0.001:                                 long_context += 1
+            if rsi6_val < 25 and stoch_j_val < 5:              long_context += 2
+            if bid_s > ask_s * 1.5:                            long_context += 1
+            if short_liq_val > long_liq_val * 10:              long_context += 2
+            if long_liq_val < 0.2:                             long_context += 2
+
+            if long_context >= 8:
+                return {"override": False}
         
         # FIX 3: Pensiunkan detector ini untuk BAIT & PREP phase
         if market_phase in ("PREP", "BAIT"):
@@ -33890,7 +33987,8 @@ class BinanceAnalyzer:
                             change_5m=change_5m,
                             rsi6=rsi6,
                             rsi6_5m=rsi6_5m if rsi6_5m is not None else 50.0,
-                            funding_rate=funding_rate if funding_rate is not None else 0.0
+                            funding_rate=funding_rate if funding_rate is not None else 0.0,
+                            result=result
                         )
                         all_rsi_ceiling = AllRSICeilingReversal.detect(
                             rsi6=rsi6,
@@ -33981,6 +34079,16 @@ class BinanceAnalyzer:
                         )
 
                         priority_guard_hard_return = None
+
+                        # ===== PRIORITY -30745: MICRO LIQ SWEEP THEN REVERSE =====
+                        micro_sweep = MicroLiqSweepThenReverse.detect(result)
+                        if micro_sweep.get("override"):
+                            result["bias"]           = micro_sweep["bias"]
+                            result["confidence"]     = micro_sweep["confidence"]
+                            result["entry_allowed"]  = False
+                            result["reason"]         = f"[MICRO_SWEEP] {micro_sweep['reason']} | " + result.get("reason", "")
+                            result["priority_level"] = micro_sweep["priority"]
+                            return result
 
                         # ===== KATUSUSDT FIX: Funding-Led Squeeze Shakeout Override (Priority -30800) =====
                         # Ini harus dicek PALING PERTAMA, bahkan sebelum High Up-Energy Fake Pump
