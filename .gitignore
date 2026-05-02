@@ -1,1 +1,31 @@
-Nothing should be ignored based on the provided file changes. The only modified file is `liquidation_hunter.py`, which is a source code file and should not be added to .gitignore. Since there are no build artifacts, dependencies, temporary files, or other items that should be ignored, the .gitignore remains empty.
+```
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Logs and temp files
+*.log
+*.tmp
+*.swp
+
+# Environment
+.env
+.env.local
+*.env.*
+
+# Editors
+.vscode/
+.idea/
+
+# Dependencies
+.venv/
+venv/
+node_modules/
+
+# Build artifacts
+dist/
+build/
+target/
+```

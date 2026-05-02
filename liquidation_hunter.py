@@ -11689,6 +11689,11 @@ def apply_liq_absolute_with_rsi_guard(result: dict) -> tuple:
     ⚠️ CATATAN: Fungsi ini dipertahankan untuk kasus overbought/oversold liq bait.
     Untuk LIQ ABSOLUTE (short_liq < 1%), gunakan apply_liq_absolute_v3 yang lebih komprehensif.
     """
+    # ── GUARD: Jika liq_7pct = SHORT_TRADERS_DIE, jangan override ke SHORT ──
+    liq_7pct = result.get("greeks_liq_7pct", "BOTH")
+    if liq_7pct == "SHORT_TRADERS_DIE":
+        return result, False
+    
     def _num(value, default=0.0):
         try:
             return float(value)
