@@ -33756,7 +33756,7 @@ class BinanceAnalyzer:
                             kill_direction=provisional_gamma.get("kill_direction", ""),
                             long_liq=liq["long_dist"],
                             gamma_executing=provisional_gamma.get("gamma_executing", False),
-                            hft_bias=result.get("hft_6pct_bias", "NEUTRAL"),
+                            hft_bias="NEUTRAL",  # result belum tersedia, pakai default
                             obv=obv_trend,
                             down_energy=down_energy
                         )
