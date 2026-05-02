@@ -1424,6 +1424,57 @@ class AllRSICeilingReversal:
         return {"override": False}
 
 
+class ProtectGenuineShortSqueezeGuard_Overbought:
+    """
+    PRIORITY -30695 (di atas PROTECT_GENUINE_SHORT_SQUEEZE -30700).
+    
+    Batalkan PROTECT_GENUINE_SHORT_SQUEEZE jika:
+    - Exchange risk tinggi + arah SHORT
+    - Stochastic J ekstrem overbought (>115)
+    - OFI netral/lemah (tidak ada real buy pressure)
+    - Funding negatif (short sudah crowded = tidak ada squeeze fuel)
+    """
+    @staticmethod
+    def detect(result: dict) -> dict:
+        short_liq        = result.get("short_liq", 99)
+        exchange_score   = result.get("exchange_risk_score", 0)
+        exchange_dir     = result.get("exchange_safe_direction", "NEUTRAL")
+        stoch_j          = result.get("stoch_j", 50)
+        ofi_bias         = result.get("ofi_bias", "NEUTRAL")
+        ofi_strength     = result.get("ofi_strength", 0)
+        funding          = result.get("funding_rate", 0) or 0.0
+        bias             = result.get("bias", "NEUTRAL")
+
+        # Hanya relevan jika sistem mau LONG dengan short_liq dekat
+        if bias != "LONG" or short_liq > 1.5:
+            return {"override": False}
+
+        # Konfirmasi bahwa ini adalah false squeeze setup
+        exchange_bearish  = exchange_score >= 6 and exchange_dir == "SHORT"
+        stoch_extreme     = stoch_j > 115
+        ofi_weak          = ofi_bias != "LONG" or ofi_strength < 0.4
+        funding_crowded_short = funding < -0.0001
+
+        bearish_count = sum([exchange_bearish, stoch_extreme, ofi_weak, funding_crowded_short])
+
+        if bearish_count >= 3:
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "confidence": "ABSOLUTE",
+                "priority": -30695,
+                "reason": (
+                    f"FAKE_SQUEEZE_GUARD_OB: short_liq={short_liq:.2f}% dekat "
+                    f"tapi exchange={exchange_dir}(score={exchange_score}), "
+                    f"stoch_j={stoch_j:.1f} (overbought ekstrem), "
+                    f"ofi={ofi_bias}({ofi_strength:.2f}), "
+                    f"funding={funding:.6f} (short crowded = tidak ada squeeze fuel) → "
+                    f"HFT bait LONG dengan ilusi short liq dekat. Force SHORT."
+                )
+            }
+        return {"override": False}
+
+
 class ProtectGenuineShortSqueezeGuard:
     """
     PRIORITY -30700
@@ -11370,6 +11421,9 @@ def greeks_final_screen(result: dict) -> dict:
             f"7% kill: {delta['liq_7pct_touch']} → {delta['kill_direction']}"
         )
 
+    # ===== TAMBAH: SQUEEZE FUEL SCORE =====
+    output["squeeze_fuel_score"] = compute_squeeze_fuel_score(result)
+
     return output
 
 
@@ -11676,6 +11730,36 @@ def rsi_both_tf_oversold_check(result: dict, hawkes_says_long_dies: bool) -> boo
         return True  # Cancel Hawkes LONG
 
     return False
+
+
+def compute_squeeze_fuel_score(result: dict) -> int:
+    """
+    Hitung seberapa banyak 'bahan bakar' untuk squeeze masih tersedia.
+    Score >= 3 : fuel cukup untuk genuine squeeze
+    Score 0-2  : fuel rendah, hati-hati
+    Score < 0  : tidak ada fuel, jangan masuk LONG meskipun short_liq dekat
+    """
+    score = 0
+    funding = result.get("funding_rate", 0) or 0.0
+    ofi_bias = result.get("ofi_bias", "NEUTRAL")
+    ofi_strength = result.get("ofi_strength", 0)
+    stoch_j = result.get("stoch_j", 50)
+    exchange_dir = result.get("exchange_safe_direction", "NEUTRAL")
+    exchange_score = result.get("exchange_risk_score", 0)
+    agg = result.get("agg", 0.5)
+
+    # Fuel positif
+    if funding > 0.0002:   score += 2   # short crowded dengan posisi baru
+    if ofi_bias == "LONG" and ofi_strength > 0.4:  score += 1
+    if stoch_j < 80:       score += 1   # belum overbought
+    if agg > 0.65:         score += 1   # demand nyata
+
+    # Fuel negatif
+    if funding < -0.0001:  score -= 2   # short sudah crowded sebelumnya
+    if stoch_j > 115:      score -= 2   # overbought ekstrem
+    if exchange_score >= 6 and exchange_dir == "SHORT":  score -= 2
+
+    return score
 
 
 def validate_genuine_short_squeeze(data: dict) -> tuple:
@@ -33537,6 +33621,16 @@ class BinanceAnalyzer:
                             funding_rate=funding_rate if funding_rate is not None else 0.0,
                             change_5m=change_5m
                         )
+                        # ===== PRIORITY -30695: FAKE SHORT SQUEEZE OVERBOUGHT GUARD =====
+                        fake_squeeze_guard = ProtectGenuineShortSqueezeGuard_Overbought.detect(result)
+                        if fake_squeeze_guard.get("override"):
+                            result["bias"]          = fake_squeeze_guard["bias"]
+                            result["confidence"]    = "ABSOLUTE"
+                            result["reason"]        = f"[FAKE_SQUEEZE_GUARD_OB] {fake_squeeze_guard['reason']} | " + result.get("reason", "")
+                            result["priority_level"]= fake_squeeze_guard["priority"]
+                            result["entry_allowed"] = True
+                            return result
+
                         genuine_squeeze = ProtectGenuineShortSqueezeGuard.detect(
                             short_liq=liq["short_dist"],
                             change_5m=change_5m,
