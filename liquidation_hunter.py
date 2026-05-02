@@ -12294,13 +12294,17 @@ def detect_high_up_energy_fake_pump_v2(result: dict, defer_override: bool = Fals
         return result, False
 
     # ── Guard 2: Genuine buying pressure dengan energi > 5.0 ──
+    long_liq = result.get("long_liq", 99)
+    down_energy = result.get("down_energy", 0)
+    change_5m = result.get("change_5m", 0)
+    
     if (up_energy > 5.0 and short_liq < 5.0 and short_liq < long_liq and
-        down_energy_val < 0.01 and change_5m_val > 0):
+        down_energy < 0.01 and change_5m > 0):
         result["_high_up_energy_exempted"] = True
         result["reason"] = result.get("reason", "") + (
             f" | [FAKE_PUMP_EXEMPT2] genuine buying pressure energi tinggi: "
             f"up_energy={up_energy:.2f} (>5.0), short_liq={short_liq:.2f}% (<5.0 & <long_liq), "
-            f"down_energy={down_energy_val:.3f} (<0.01), change_5m={change_5m_val:.2f}% (>0) -> "
+            f"down_energy={down_energy:.3f} (<0.01), change_5m={change_5m:.2f}% (>0) -> "
             "bukan fake pump, biarkan detektor lain/HFT signal tentukan arah"
         )
         return result, False
