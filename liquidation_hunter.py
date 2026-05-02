@@ -11707,6 +11707,19 @@ def apply_liq_absolute_with_rsi_guard(result: dict) -> tuple:
     up_energy = result.get("up_energy", 0)
     down_energy = result.get("down_energy", 0)
     agg = result.get("agg", 0.5)
+    
+    # ── Guard: Hanya bypass jika momentum masih ada ──
+    liq_7pct = result.get("greeks_liq_7pct", "BOTH")
+    funding = result.get("funding_rate", 0) or 0.0
+    agg_val = result.get("agg", 0.5)
+    up_energy_val = result.get("up_energy", 0)
+    
+    if liq_7pct == "SHORT_TRADERS_DIE":
+        # Konfirmasi momentum: funding negatif (crowded short) ATAU buy pressure kuat
+        if funding < -0.001 or (agg_val > 0.65 and up_energy_val > 1.0):
+            return result, False
+        # Jika tidak ada momentum → lanjut ke overbought check
+    
     if (short_liq < 2.0 and short_liq < long_liq and
         down_energy < 0.01 and up_energy > 2.0 and agg > 0.75):
         return result, False   # Jangan ubah bias ke SHORT
@@ -11987,6 +12000,15 @@ def detect_thin_book_vacuum_pump(result: dict) -> tuple:
     if confirmations < 3:
         return result, False
 
+    # ── EXEMPTION: Jangan SHORT jika liq_7pct = SHORT_TRADERS_DIE ──
+    liq_7pct = result.get("greeks_liq_7pct", "BOTH")
+    if liq_7pct == "SHORT_TRADERS_DIE":
+        result["reason"] = result.get("reason", "") + (
+            f" | [THIN_PUMP_EXEMPT] liq_7pct=SHORT_TRADERS_DIE "
+            f"→ pump mungkin pre-squeeze genuine, tidak force SHORT"
+        )
+        return result, False
+
     # THIN BOOK VACUUM PUMP CONFIRMED → FADE LONG, force SHORT
     result["bias"] = "SHORT"
     result["confidence"] = "ABSOLUTE"
@@ -12000,6 +12022,74 @@ def detect_thin_book_vacuum_pump(result: dict) -> tuple:
         f"Harga naik karena vacuum bukan buyer genuine → FADE, force SHORT"
     )
     return result, True
+
+
+def detect_double_sweep_zone(result: dict) -> tuple:
+    """
+    PRIORITY -25000.
+    
+    Ketika long_liq dan short_liq keduanya dekat (< 2.5%),
+    Binance akan menyapu yang LEBIH DEKAT dulu.
+    
+    Jika long_liq < short_liq: harga akan TURUN dulu → jangan LONG.
+    Jika short_liq < long_liq: harga akan NAIK dulu → jangan SHORT.
+    """
+    long_liq = result.get("long_liq", 99)
+    short_liq = result.get("short_liq", 99)
+    bias = result.get("bias", "NEUTRAL")
+    
+    # Keduanya harus dekat
+    both_close = long_liq < 2.5 and short_liq < 2.5
+    if not both_close:
+        return result, False
+    
+    # Case 1: long_liq lebih dekat → Binance sweep ke bawah dulu
+    if long_liq < short_liq and bias == "LONG":
+        result["bias"] = "NEUTRAL"
+        result["confidence"] = "BLOCK"
+        result["entry_allowed"] = False
+        result["priority_level"] = -25000
+        result["_double_sweep_blocked"] = True
+        result["reason"] = (
+            f"[DOUBLE_SWEEP_BLOCK] long_liq={long_liq:.2f}% lebih dekat "
+            f"dari short_liq={short_liq:.2f}% → Binance sweep long_liq dulu "
+            f"→ harga turun dulu → NO TRADE (jangan LONG sekarang)"
+        )
+        return result, True
+    
+    # Case 2: short_liq lebih dekat → Binance sweep ke atas dulu
+    if short_liq < long_liq and bias == "SHORT":
+        result["bias"] = "NEUTRAL"
+        result["confidence"] = "BLOCK"
+        result["entry_allowed"] = False
+        result["priority_level"] = -25000
+        result["_double_sweep_blocked"] = True
+        result["reason"] = (
+            f"[DOUBLE_SWEEP_BLOCK] short_liq={short_liq:.2f}% lebih dekat "
+            f"dari long_liq={long_liq:.2f}% → Binance sweep short_liq dulu "
+            f"→ harga naik dulu → NO TRADE (jangan SHORT sekarang)"
+        )
+        return result, True
+    
+    return result, False
+
+
+def check_greeks_internal_contradiction(result: dict) -> bool:
+    """
+    Deteksi kontradiksi internal Greeks:
+    liq_7pct = SHORT_TRADERS_DIE (shorts mati → harga NAIK)
+    tapi who_dies = LONG_TRADERS (longs mati → harga TURUN)
+    
+    Returns True jika ada kontradiksi.
+    """
+    liq_7pct = result.get("greeks_liq_7pct", "BOTH")
+    who_dies = result.get("greeks_who_dies_first", "")
+    
+    if liq_7pct == "SHORT_TRADERS_DIE" and who_dies == "LONG_TRADERS":
+        return True
+    if liq_7pct == "LONG_TRADERS_DIE" and who_dies == "SHORT_TRADERS":
+        return True
+    return False
 
 
 def detect_rsi5m_exhaustion_ceiling(result: dict) -> dict:
@@ -26573,6 +26663,12 @@ class BinanceAnalyzer:
         if overridden:
             return result
 
+
+        # ===== PRIORITY -25000: DOUBLE SWEEP ZONE =====
+        result, overridden = detect_double_sweep_zone(result)
+        if overridden:
+            return result
+
         # ========== THIN BOOK VACUUM PUMP (PRIORITY -43000) ==========
         result, overridden = detect_thin_book_vacuum_pump(result)
         if overridden:
@@ -35697,6 +35793,14 @@ class BinanceAnalyzer:
             # ========== GREEKS FINAL SCREENER INTEGRATION ==========
             result = greeks_final_screen(result)
 
+
+            # ── GREEKS CONTRADICTION CHECK ──
+            if check_greeks_internal_contradiction(result):
+                result["greeks_override_allowed"] = False
+                result["entry_allowed"] = False
+                result["reason"] = result.get("reason", "") + (
+                    " | [GREEKS_CONTRADICTION] liq_7pct vs who_dies kontradiksi → NO TRADE"
+                )
             # ========== FIX 3: Greeks Vega di BAIT Phase tidak boleh unlock (Saran Dosen) ==========
             if result.get("greeks_vega_active", False) and result.get("market_phase") == "BAIT":
                 # Vega spike di BAIT phase = volatilitas palsu untuk memancing retail
