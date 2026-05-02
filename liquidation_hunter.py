@@ -27111,6 +27111,24 @@ class BinanceAnalyzer:
             result["_exhaustion_warning"] = True
         # ========== END POST-SQUEEZE GATE ==========
 
+        # ===== PRIORITY -10185: GAMMA ACTIVE SQUEEZE NOT COMPLETE =====
+        gamma_not_done = GammaActiveSqueezeNotComplete.detect(result)
+        if gamma_not_done.get("override"):
+            if gamma_not_done.get("bias") == "NEUTRAL":
+                # OFI SHORT + gamma = double squeeze risk → NO TRADE
+                result["bias"] = "NEUTRAL"
+                result["confidence"] = "BLOCK"
+                result["entry_allowed"] = False
+                result["reason"] = f"[DOUBLE_SQUEEZE] {gamma_not_done.get('reason')} | " + result.get("reason", "")
+                return result
+            else:
+                result["bias"]           = gamma_not_done["bias"]
+                result["confidence"]     = "ABSOLUTE"
+                result["reason"]         = f"[GAMMA_NOT_DONE] {gamma_not_done['reason']} | " + result.get("reason", "")
+                result["priority_level"] = gamma_not_done["priority"]
+                result["entry_allowed"]  = True
+                return result
+
         # ===== PRIORITY -30700: HIGH ENERGY ACCUMULATION PRE-SQUEEZE =====
         he_accum = HighEnergyAccumulationPreSqueeze.detect(result)
         if he_accum.get("override"):
@@ -33889,23 +33907,6 @@ class BinanceAnalyzer:
                                 "phase": final_phase,
                                 "priority": priority,
                             }
-                        # ===== PRIORITY -10185: GAMMA ACTIVE SQUEEZE NOT COMPLETE =====
-                        gamma_not_done = GammaActiveSqueezeNotComplete.detect(result)
-                        if gamma_not_done.get("override"):
-                            if gamma_not_done.get("bias") == "NEUTRAL":
-                                # OFI SHORT + gamma = double squeeze risk → NO TRADE
-                                result["bias"] = "NEUTRAL"
-                                result["confidence"] = "BLOCK"
-                                result["entry_allowed"] = False
-                                result["reason"] = f"[DOUBLE_SQUEEZE] {gamma_not_done.get('reason')} | " + result.get("reason", "")
-                                return result
-                            else:
-                                result["bias"]           = gamma_not_done["bias"]
-                                result["confidence"]     = "ABSOLUTE"
-                                result["reason"]         = f"[GAMMA_NOT_DONE] {gamma_not_done['reason']} | " + result.get("reason", "")
-                                result["priority_level"] = gamma_not_done["priority"]
-                                result["entry_allowed"]  = True
-                                return result
 
                         # ===== FOLKSUSDT FIX: Blow-Off Top Exhaustion Override (Priority -10190) =====
                         # Ini membatalkan Protect Genuine Short Squeeze jika kondisi exhaustion terpenuhi
