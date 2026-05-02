@@ -1326,8 +1326,8 @@ class HighEnergyAccumulationPreSqueeze:
         if funding > 0.006:
             return {"override": False}
 
-        # 8. Target squeeze harus jauh (long_liq > 8.0) ATAU short_liq tidak ultra dekat (>1.5)
-        if not (long_liq > 8.0 or short_liq > 1.5):
+        # 8. Target squeeze harus jauh (long_liq > 8.0) ATAU short_liq tidak ultra dekat (<1.5)
+        if not (long_liq > 8.0 or short_liq < 1.5):
             return {"override": False}
 
         return {
@@ -12885,6 +12885,8 @@ def hawkes_squeeze_validity_gate(result: dict, hawkes_predictor) -> tuple:
         return {
             "who_dies_first": "LONG" if prob_long > prob_short else "SHORT",
             "confidence": abs(prob_long - prob_short),
+            "prob_long_dies": round(prob_long, 3),
+            "prob_short_dies": round(prob_short, 3),
         }
 
     prediction = _predict_with_modified_lambda(mod_long, mod_short)
@@ -12971,6 +12973,28 @@ def hawkes_squeeze_validity_gate(result: dict, hawkes_predictor) -> tuple:
                 prediction["who_dies_first"] == "LONG" and prediction["confidence"] > 0.25
             )
             if already_too_late or hawkes_contradict:
+                # ── GUARD 1: MINIMUM PROBABILITY 0.60 ──
+                prob_long_dies = prediction.get("prob_long_dies", 0.5)
+                if prob_long_dies < 0.60:
+                    result["reason"] += (
+                        f" | [HAWKES_LOW_CONF] prob_long_dies={prob_long_dies:.2f} < 0.60 → override dibatalkan"
+                    )
+                    return result, False
+
+                # ── GUARD 2: LIQUIDATION_HUNT EXEMPTION ──
+                regime = result.get("market_regime", "")
+                rsi6_val = result.get("rsi6", 50)
+                rsi14_val = result.get("rsi14", 50)
+                rsi6_5m_val = result.get("rsi6_5m", 50)
+                greeks_kill = result.get("greeks_kill_direction", "")
+                if (regime == "LIQUIDATION_HUNT" and
+                    rsi6_val < 25 and rsi14_val < 35 and rsi6_5m_val < 25 and
+                    greeks_kill == "LONG" and prediction["confidence"] < 0.30):
+                    result["reason"] += (
+                        f" | [HAWKES_LIQ_HUNT_EXEMPT] Semua RSI oversold dalam LIQUIDATION_HUNT + kill=LONG → bounce imminent, Hawkes SHORT dibatalkan"
+                    )
+                    return result, False
+
                 # Cek apakah override diperlukan
                 if _should_override_hawkes(result, prediction):
                     result["reason"] += " | [HAWKES_CONTEXT_OVERRIDE] Sinyal konteks terlalu kuat berlawanan → Hawkes dibatalkan"
@@ -12998,6 +13022,28 @@ def hawkes_squeeze_validity_gate(result: dict, hawkes_predictor) -> tuple:
                 prediction["who_dies_first"] == "SHORT" and prediction["confidence"] > 0.25
             )
             if already_too_late or hawkes_contradict:
+                # ── GUARD 1: MINIMUM PROBABILITY 0.60 ──
+                prob_short_dies = prediction.get("prob_short_dies", 0.5)
+                if prob_short_dies < 0.60:
+                    result["reason"] += (
+                        f" | [HAWKES_LOW_CONF] prob_short_dies={prob_short_dies:.2f} < 0.60 → override dibatalkan"
+                    )
+                    return result, False
+
+                # ── GUARD 2: LIQUIDATION_HUNT EXEMPTION ──
+                regime = result.get("market_regime", "")
+                rsi6_val = result.get("rsi6", 50)
+                rsi14_val = result.get("rsi14", 50)
+                rsi6_5m_val = result.get("rsi6_5m", 50)
+                greeks_kill = result.get("greeks_kill_direction", "")
+                if (regime == "LIQUIDATION_HUNT" and
+                    rsi6_val > 75 and rsi14_val > 65 and rsi6_5m_val > 75 and
+                    greeks_kill == "SHORT" and prediction["confidence"] < 0.30):
+                    result["reason"] += (
+                        f" | [HAWKES_LIQ_HUNT_EXEMPT] Semua RSI overbought dalam LIQUIDATION_HUNT + kill=SHORT → dump imminent, Hawkes LONG dibatalkan"
+                    )
+                    return result, False
+
                 if _should_override_hawkes(result, prediction):
                     result["reason"] += " | [HAWKES_CONTEXT_OVERRIDE] Sinyal konteks terlalu kuat berlawanan → Hawkes dibatalkan"
                 else:
