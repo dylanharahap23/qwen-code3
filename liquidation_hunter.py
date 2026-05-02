@@ -11702,12 +11702,18 @@ def apply_liq_absolute_with_rsi_guard(result: dict) -> tuple:
 
     short_liq = _num(result.get("short_liq", 99), 99.0)
     long_liq = _num(result.get("long_liq", 99), 99.0)
+    
+    # ── Guard: Genuine buying pressure mengalahkan indikator overbought ──
+    up_energy = result.get("up_energy", 0)
+    down_energy = result.get("down_energy", 0)
+    agg = result.get("agg", 0.5)
+    if (short_liq < 2.0 and short_liq < long_liq and
+        down_energy < 0.01 and up_energy > 2.0 and agg > 0.75):
+        return result, False   # Jangan ubah bias ke SHORT
+    
     rsi6 = _num(result.get("rsi6", 50), 50.0)
     rsi6_5m = _num(result.get("rsi6_5m", 50), 50.0)
     kill_dir = result.get("greeks_kill_direction", "")
-    up_energy = _num(result.get("up_energy", 0), 0.0)
-    down_energy = _num(result.get("down_energy", 0), 0.0)
-    agg = _num(result.get("agg", 0.5), 0.5)
     flow = _num(result.get("flow", agg), agg)
     agg_display = _num(result.get("agg_display", agg), agg)
     agg_signal = max(agg, flow, agg_display)
