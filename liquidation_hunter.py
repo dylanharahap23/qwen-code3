@@ -12181,6 +12181,45 @@ def _should_allow_critical_lock(result: dict,
     if opp_score >= 7 and exch_score < 8:
         return False
 
+    # ── RULE 4: Hawkes LONG tapi Greeks internal kontradiksi ──
+    # Jika liq_7pct dan who_dies bertentangan = data tidak reliable
+    # Hawkes tidak boleh lock berdasarkan data yang kontradiksi
+    if lock_source in ("HAWKES_SQUEEZE_INVALID", "ARBITRATE_EARLY_RETURN"):
+        greeks_liq7  = result.get("greeks_liq_7pct", "BOTH")
+        greeks_who   = result.get("greeks_who_dies_first", "")
+        
+        greeks_internal_conflict = (
+            # liq7 bilang SHORT mati (harga naik) tapi who_dies bilang LONG mati
+            (greeks_liq7 == "SHORT_TRADERS_DIE" and 
+             greeks_who == "LONG_TRADERS") or
+            # liq7 bilang LONG mati (harga turun) tapi who_dies bilang SHORT mati
+            (greeks_liq7 == "LONG_TRADERS_DIE" and 
+             greeks_who == "SHORT_TRADERS")
+        )
+        
+        if greeks_internal_conflict:
+            return False  # Greeks tidak reliable → Hawkes tidak boleh lock
+
+    # ── RULE 5: Hawkes LONG tapi fuel + energy terlalu lemah ──
+    if (lock_bias == "LONG" and
+        lock_source in ("HAWKES_SQUEEZE_INVALID", "ARBITRATE_EARLY_RETURN")):
+        
+        fuel       = result.get("squeeze_fuel_score", 99)
+        up_energy  = result.get("up_energy", 0)
+        exch_dir   = result.get("exchange_safe_direction", "NEUTRAL")
+        exch_score = result.get("exchange_risk_score", 0)
+        ofi_b      = result.get("ofi_bias", "NEUTRAL")
+
+        # Hawkes mau LONG tapi tidak ada fuel + energy lemah + exchange SHORT
+        weak_long = (
+            fuel <= 2 and
+            up_energy < 0.5 and
+            (exch_dir == "SHORT" or ofi_b == "SHORT")
+        )
+        
+        if weak_long:
+            return False  # Hawkes LONG tanpa backing = jangan lock
+
     return True
 
 
