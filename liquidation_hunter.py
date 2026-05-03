@@ -7487,7 +7487,8 @@ class ReverseSqueezeBaitDetector:
         # NEW parameters for lecturer fix
         rsi6_5m: float = 50.0,
         up_energy: float = 0.0,
-        who_dies_first: str = ""
+        who_dies_first: str = "",
+        result: dict = None  # NEW: untuk akses konsensus LONG dari Greeks/HFT/Algo
     ) -> dict:
         
         if funding_rate is None:
@@ -7510,6 +7511,23 @@ class ReverseSqueezeBaitDetector:
         # This prevents reverse-bait logic from firing when market is clearly set for immediate short squeeze
         if short_liq < 0.6 and down_energy < 0.01:
             return {"override": False}
+        
+        # ── GUARD: Jangan SHORT jika konsensus LONG luar biasa kuat ──
+        # Diambil dari result dict yang akan di-pass dari caller
+        # Guard ini membatalkan Reverse Bait jika semua sinyal utama agree LONG
+        if result is not None:
+            gamma_intensity = result.get("greeks_gamma_intensity", "LOW")
+            kill_speed      = abs(result.get("greeks_kill_speed", 0))
+            greeks_kill     = result.get("greeks_kill_direction", "")
+            hft_bias        = result.get("hft_6pct_bias", "NEUTRAL")
+            algo_bias       = result.get("algo_type_bias", "NEUTRAL")
+            pre_kill        = result.get("greeks_pre_kill", {})
+            pre_kill_long   = pre_kill.get("bias") == "LONG" or pre_kill.get("override")
+            
+            if (greeks_kill == "LONG" or gamma_intensity == "EXTREME" or kill_speed > 5.0) \
+               and hft_bias == "LONG" and (algo_bias == "LONG" or pre_kill_long):
+                # Konsensus LONG terlalu kuat → batalkan Reverse Bait
+                return {"override": False, "reason": "Reverse Bait dibatalkan: konsensus LONG terlalu kuat (gamma/kill/HFT/algo agree)"}
         
         # Core: short_liq dekat tapi long_liq jauh lebih besar
         if long_liq <= short_liq * 3:
@@ -29889,7 +29907,8 @@ class BinanceAnalyzer:
                 # NEW parameters for lecturer fix
                 rsi6_5m=rsi6_5m_val,
                 up_energy=up_energy_val,
-                who_dies_first=who_dies_first
+                who_dies_first=who_dies_first,
+                result=result  # NEW: untuk akses konsensus LONG dari Greeks/HFT/Algo
             )
         if reverse_bait["override"]:
             result["bias"] = reverse_bait["bias"]
