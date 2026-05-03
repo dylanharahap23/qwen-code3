@@ -6690,6 +6690,11 @@ class ExchangeRiskScoreHardBlock:
     tapi sistem output LONG → salah fatal.
     
     Ini adalah "Binance tells you the truth" moment.
+    
+    🔥 LECTURER FIX v11: 
+    - Threshold WAJIB >= 6 (sudah ada)
+    - Jangan override jika Greeks ABSOLUTE + konsensus kuat berlawanan
+    - Exchange score < 8 tidak boleh menang atas Greeks ABSOLUTE
     """
     @staticmethod
     def detect(
@@ -6710,8 +6715,39 @@ class ExchangeRiskScoreHardBlock:
         bid_slope: float = 1,
         result: dict = None
     ) -> dict:
+        # ── THRESHOLD WAJIB: score < 6 = tidak qualify ──
         if exchange_risk_score < 6:
             return {"override": False}
+        
+        # ── GUARD BARU: Jangan override jika Greeks berlawanan ABSOLUTE ──
+        # Ambil data konsensus dari result dict
+        if result:
+            greeks_liq7  = result.get("greeks_liq_7pct", "BOTH")
+            greeks_kill  = result.get("greeks_kill_direction", "")
+            greeks_conf  = result.get("greeks_confidence", "")
+            agg_val      = result.get("agg", 0.5)
+            algo_bias    = result.get("algo_type_bias", "NEUTRAL")
+            hft_bias     = result.get("hft_6pct_bias", "NEUTRAL")
+            
+            # Exchange mau LONG tapi semua bilang SHORT
+            if (exchange_safe_direction == "LONG" and
+                greeks_liq7 == "LONG_TRADERS_DIE" and
+                greeks_kill == "SHORT" and
+                greeks_conf == "ABSOLUTE" and
+                agg_val < 0.35 and
+                algo_bias == "SHORT" and
+                hft_bias == "SHORT"):
+                return {"override": False}
+            
+            # Exchange mau SHORT tapi semua bilang LONG  
+            if (exchange_safe_direction == "SHORT" and
+                greeks_liq7 == "SHORT_TRADERS_DIE" and
+                greeks_kill == "LONG" and
+                greeks_conf == "ABSOLUTE" and
+                agg_val > 0.65 and
+                algo_bias == "LONG" and
+                hft_bias == "LONG"):
+                return {"override": False}
         
         # ========== LANGKAH 5.2: JANGAN LAWAN GENUINE SHORT SQUEEZE ==========
         # Jika short_liq < 1.0% dan ada bukti squeeze, exchange risk tidak relevan
@@ -11098,7 +11134,18 @@ def has_critical_override_lock(result: dict) -> bool:
 
 
 def apply_critical_override_lock(result: dict, source: str = "") -> dict:
+    """
+    LECTURER FIX v11: Tambahkan validasi final sebelum CRITICAL_OVERRIDE_LOCK dikunci.
+    Cegah lock jika konsensus terlalu kuat berlawanan.
+    """
     if has_critical_override_lock(result):
+        # ── VALIDASI FINAL: Jangan lock jika oposisi terlalu kuat ──
+        proposed_bias = result.get("bias", "NEUTRAL")
+        if proposed_bias in ("LONG", "SHORT"):
+            if not _should_allow_critical_lock(result, proposed_bias, source):
+                # Oposisi terlalu kuat - jangan lock, biarkan voting aggregator jalan
+                return result
+        
         result["_override_critical_lock"] = True
         if source and not result.get("_override_critical_source"):
             result["_override_critical_source"] = source
@@ -11107,6 +11154,49 @@ def apply_critical_override_lock(result: dict, source: str = "") -> dict:
             if bias in ("LONG", "SHORT", "NEUTRAL"):
                 result["_final_bias_locked"] = bias
     return result
+
+
+def _should_allow_critical_lock(result: dict, 
+                                 lock_bias: str, 
+                                 lock_source: str) -> bool:
+    """
+    Validasi terakhir sebelum CRITICAL_OVERRIDE_LOCK dikunci.
+    Cegah lock jika konsensus terlalu kuat berlawanan.
+    
+    Returns:
+        bool: True jika lock diperbolehkan, False jika oposisi terlalu kuat (>= 7)
+    """
+    greeks_kill  = result.get("greeks_kill_direction", "")
+    greeks_liq7  = result.get("greeks_liq_7pct", "BOTH")
+    greeks_conf  = result.get("greeks_confidence", "")
+    algo         = result.get("algo_type_bias", "NEUTRAL")
+    hft          = result.get("hft_6pct_bias", "NEUTRAL")
+    agg          = result.get("agg", 0.5)
+    
+    opposite = "SHORT" if lock_bias == "LONG" else "LONG"
+    
+    # Hitung berapa banyak sinyal kuat berlawanan dengan lock
+    opposition_score = 0
+    if greeks_kill == opposite:
+        opposition_score += 2
+    if greeks_liq7 == f"{opposite[:4]}_TRADERS_DIE" if opposite == "LONG" \
+       else greeks_liq7 == "SHORT_TRADERS_DIE":
+        opposition_score += 2  
+    if greeks_conf == "ABSOLUTE":
+        opposition_score += 1
+    if algo == opposite:
+        opposition_score += 2
+    if hft == opposite:
+        opposition_score += 2
+    if (opposite == "SHORT" and agg < 0.35) or \
+       (opposite == "LONG" and agg > 0.65):
+        opposition_score += 2
+    
+    # Jika oposisi terlalu kuat (>= 7), jangan lock
+    if opposition_score >= 7:
+        return False
+        
+    return True
 
 
 def get_valid_ofi(result: dict) -> tuple:
@@ -27378,6 +27468,43 @@ class BinanceAnalyzer:
         rsi6_5m_val = rsi6_5m  # Sudah ada di atas, pastikan konsisten
         rsi14_val = rsi14  # Sudah ada di atas, pastikan konsisten
 
+        # ═══════════════════════════════════════════════════
+        # Greeks ABSOLUTE PROTECTION (LECTURER FIX v11)
+        # Jika Greeks ABSOLUTE + konsensus kuat, 
+        # Exchange Hard Block tidak boleh menang kecuali score >= 8
+        # ═══════════════════════════════════════════════════
+        greeks_conf_now  = result.get("greeks_confidence", "")
+        greeks_kill_now  = result.get("greeks_kill_direction", "")
+        greeks_liq7_now  = result.get("greeks_liq_7pct", "BOTH")
+        algo_now         = result.get("algo_type_bias", "NEUTRAL")
+        hft_now          = result.get("hft_6pct_bias", "NEUTRAL")
+        agg_now          = result.get("agg", 0.5)
+        exch_score_now   = result.get("exchange_risk_score", 0)
+        
+        greeks_absolute_short = (
+            greeks_conf_now == "ABSOLUTE" and
+            greeks_kill_now == "SHORT" and
+            greeks_liq7_now == "LONG_TRADERS_DIE" and
+            algo_now == "SHORT" and
+            hft_now == "SHORT" and
+            agg_now < 0.35
+        )
+        
+        greeks_absolute_long = (
+            greeks_conf_now == "ABSOLUTE" and
+            greeks_kill_now == "LONG" and
+            greeks_liq7_now == "SHORT_TRADERS_DIE" and
+            algo_now == "LONG" and
+            hft_now == "LONG" and
+            agg_now > 0.65
+        )
+        
+        # Jika konsensus mutlak, set flag agar Exchange Hard Block 
+        # tidak bisa override kecuali score >= 8
+        _greeks_consensus_locked = (
+            greeks_absolute_short or greeks_absolute_long
+        ) and exch_score_now < 8
+
         # ========== EXTREME CRASH BOUNCE (PALING AWAL, PRIORITY -99999) ==========
         result, overridden = extreme_crash_bounce_override_v2(result, self.sequential_dump_tracker)
         if overridden:
@@ -29976,31 +30103,36 @@ class BinanceAnalyzer:
         
         # ===== PRIORITY -27200: EXCHANGE RISK SCORE HARD BLOCK =====
         # XNYUSDT case: exchange_risk_score=7, exchange_safe_direction=SHORT tapi sistem output LONG
-        exchange_risk_block = ExchangeRiskScoreHardBlock.detect(
-            exchange_risk_score=result.get("exchange_risk_score", 0),
-            exchange_safe_direction=result.get("exchange_safe_direction", "NEUTRAL"),
-            current_bias=result.get("bias", "NEUTRAL"),
-            who_dies_first=result.get("greeks_who_dies_first", ""),
-            rsi6=rsi6_val,
-            rsi6_5m=rsi6_5m_val,
-            rsi14=rsi14_val,
-            delta_exposure=result.get("greeks_delta_exposure", 0),
-            funding_rate=funding_rate_val,
-            greeks_kill_direction=result.get("greeks_kill_direction", ""),
-            long_liq=long_liq,
-            short_liq=short_liq,
-            change_5m=change_5m_val,
-            ask_slope=result.get("ask_slope", 0),
-            bid_slope=result.get("bid_slope", 1),
-            result=result  # Pass entire result for guard logic
-        )
-        if exchange_risk_block["override"]:
-            result["bias"] = exchange_risk_block["bias"]
-            result["reason"] = f"[EXCHANGE RISK BLOCK] {exchange_risk_block['reason']}"
-            result["confidence"] = "ABSOLUTE"
-            result["priority_level"] = exchange_risk_block["priority"]
-            result["entry_allowed"] = True
-            return result
+        # LECTURER FIX v11: Skip jika _greeks_consensus_locked=True (Greeks ABSOLUTE + konsensus kuat)
+        if not _greeks_consensus_locked:
+            exchange_risk_block = ExchangeRiskScoreHardBlock.detect(
+                exchange_risk_score=result.get("exchange_risk_score", 0),
+                exchange_safe_direction=result.get("exchange_safe_direction", "NEUTRAL"),
+                current_bias=result.get("bias", "NEUTRAL"),
+                who_dies_first=result.get("greeks_who_dies_first", ""),
+                rsi6=rsi6_val,
+                rsi6_5m=rsi6_5m_val,
+                rsi14=rsi14_val,
+                delta_exposure=result.get("greeks_delta_exposure", 0),
+                funding_rate=funding_rate_val,
+                greeks_kill_direction=result.get("greeks_kill_direction", ""),
+                long_liq=long_liq,
+                short_liq=short_liq,
+                change_5m=change_5m_val,
+                ask_slope=result.get("ask_slope", 0),
+                bid_slope=result.get("bid_slope", 1),
+                result=result  # Pass entire result for guard logic
+            )
+            if exchange_risk_block["override"]:
+                result["bias"] = exchange_risk_block["bias"]
+                result["reason"] = f"[EXCHANGE RISK BLOCK] {exchange_risk_block['reason']}"
+                result["confidence"] = "ABSOLUTE"
+                result["priority_level"] = exchange_risk_block["priority"]
+                result["entry_allowed"] = True
+                return result
+        else:
+            # Greeks ABSOLUTE consensus locked - Exchange Hard Block di-skip
+            pass
         
         # ===== PRIORITY -21500: GAMMA EXECUTING KILL DIRECTION LOCK =====
         # Ketika gamma sudah executing, tidak ada yang boleh override kecuali ultra-short squeeze
