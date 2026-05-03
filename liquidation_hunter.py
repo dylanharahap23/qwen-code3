@@ -12255,6 +12255,44 @@ def _should_allow_critical_lock(result: dict,
                 fuel <= 2):
                 return False
 
+    # ── RULE 8: Exchange score < 7 vs Greeks ABSOLUTE konsensus LONG/SHORT ──
+    # Exchange score 5-6 tidak cukup kuat untuk melawan
+    # Greeks ABSOLUTE + Algo + HFT + agg semua sepakat
+    exch_score  = result.get("exchange_risk_score", 0)
+    exch_dir    = result.get("exchange_safe_direction", "NEUTRAL")
+    g_kill      = result.get("greeks_kill_direction", "")
+    g_liq7      = result.get("greeks_liq_7pct", "BOTH")
+    g_conf      = result.get("greeks_confidence", "")
+    g_who       = result.get("greeks_who_dies_first", "")
+    algo_b      = result.get("algo_type_bias", "NEUTRAL")
+    hft_b       = result.get("hft_6pct_bias", "NEUTRAL")
+    agg_v       = result.get("agg", 0.5)
+
+    if exch_score < 7 and lock_source in (
+        "ARBITRATE_EARLY_RETURN", "EXCHANGE_HARD_BLOCK"
+    ):
+        # Exchange mau SHORT tapi semua bilang LONG
+        if (lock_bias == "SHORT" and
+            g_conf == "ABSOLUTE" and
+            g_kill == "LONG" and
+            g_liq7 == "SHORT_TRADERS_DIE" and
+            g_who == "SHORT_TRADERS" and
+            algo_b == "LONG" and
+            hft_b == "LONG" and
+            agg_v > 0.7):
+            return False
+
+        # Exchange mau LONG tapi semua bilang SHORT
+        if (lock_bias == "LONG" and
+            g_conf == "ABSOLUTE" and
+            g_kill == "SHORT" and
+            g_liq7 == "LONG_TRADERS_DIE" and
+            g_who == "LONG_TRADERS" and
+            algo_b == "SHORT" and
+            hft_b == "SHORT" and
+            agg_v < 0.3):
+            return False
+
     return True
 
 
@@ -30209,6 +30247,9 @@ class BinanceAnalyzer:
                 result["confidence"] = "ABSOLUTE"
                 result["priority_level"] = exchange_risk_block["priority"]
                 result["entry_allowed"] = True
+                # ── CRITICAL: Set lock dan panggil _should_allow_critical_lock ──
+                result["_override_critical_lock"] = True
+                result["_override_critical_source"] = "EXCHANGE_HARD_BLOCK"
                 return result
         else:
             # Greeks ABSOLUTE consensus locked - Exchange Hard Block di-skip
