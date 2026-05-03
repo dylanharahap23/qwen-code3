@@ -27744,7 +27744,6 @@ class BinanceAnalyzer:
 
         if result.get("_high_up_energy_fake_pump_pending"):
             result["bias"] = "SHORT"
-            result["_override_critical_lock"] = True
             result["_override_critical_source"] = "HIGH_UP_ENERGY_FAKE_PUMP"
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = -30750
@@ -27754,6 +27753,7 @@ class BinanceAnalyzer:
                 result.get("_high_up_energy_fake_pump_pending_reason", "[HIGH_UP_ENERGY_FAKE_PUMP] force SHORT")
                 + " | " + result.get("reason", "")
             )
+            result = apply_critical_override_lock(result, "HIGH_UP_ENERGY_FAKE_PUMP")
             return result
         
         # ========== LANGKAH 7 : PREP/BAIT PHASE HARD BLOCK ===========
@@ -27830,8 +27830,8 @@ class BinanceAnalyzer:
             if result.get("greeks_kill_direction") == "SHORT":
                 return result
             result["bias"] = "LONG"
-            result["_override_critical_lock"] = True
             result["_override_critical_source"] = "ENERGY_DIVERGENCE"
+            result = apply_critical_override_lock(result, "ENERGY_DIVERGENCE")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = -10200
             result["reason"] = "[ENERGY DIVERGENCE] High up_energy while price dropping → bullish reversal, override SHORT. " + result.get("reason", "")
@@ -30248,9 +30248,11 @@ class BinanceAnalyzer:
                 result["priority_level"] = exchange_risk_block["priority"]
                 result["entry_allowed"] = True
                 # ── CRITICAL: Set lock dan panggil _should_allow_critical_lock ──
-                result["_override_critical_lock"] = True
                 result["_override_critical_source"] = "EXCHANGE_HARD_BLOCK"
-                return result
+                result = apply_critical_override_lock(result, "EXCHANGE_HARD_BLOCK")
+                if result.get("_override_critical_lock"):
+                    return result
+                # Jika lock dibatalkan, jangan return — biarkan detector berikutnya jalan
         else:
             # Greeks ABSOLUTE consensus locked - Exchange Hard Block di-skip
             pass
@@ -33846,8 +33848,8 @@ class BinanceAnalyzer:
         # ── CASE 2: Hawkes CONTRADICT signal (threshold diturunkan ke 0.25 untuk sensitivitas lebih tinggi) ──
         if (not hawkes_blackout and result["bias"] == "LONG" and prediction["who_dies_first"] == "LONG" and prediction["confidence"] > 0.25):
             result["bias"] = "SHORT"
-            result["_override_critical_lock"] = True
             result["_override_critical_source"] = "HAWKES_MULTIVARIATE_SHORT"
+            result = apply_critical_override_lock(result, "HAWKES_MULTIVARIATE_SHORT")
             result["_hawkes_gate_triggered"] = True   # 🔥 LANGKAH 2: TAMBAHKAN FLAG INI
             result["confidence"] = "ABSOLUTE"
             result["reason"] = f"[HAWKES OVERRIDE] LONG dies first despite squeeze signal → force SHORT. " + result.get("reason", "")
@@ -33856,8 +33858,8 @@ class BinanceAnalyzer:
 
         if (not hawkes_blackout and result["bias"] == "SHORT" and prediction["who_dies_first"] == "SHORT" and prediction["confidence"] > 0.25):
             result["bias"] = "LONG"
-            result["_override_critical_lock"] = True
             result["_override_critical_source"] = "HAWKES_MULTIVARIATE_LONG"
+            result = apply_critical_override_lock(result, "HAWKES_MULTIVARIATE_LONG")
             result["_hawkes_gate_triggered"] = True   # 🔥 LANGKAH 2: TAMBAHKAN FLAG INI
             result["confidence"] = "ABSOLUTE"
             result["reason"] = f"[HAWKES OVERRIDE] SHORT dies first despite dump signal → force LONG. " + result.get("reason", "")
