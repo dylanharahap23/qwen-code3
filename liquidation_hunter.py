@@ -11156,49 +11156,6 @@ def apply_critical_override_lock(result: dict, source: str = "") -> dict:
     return result
 
 
-def _should_allow_critical_lock(result: dict, 
-                                 lock_bias: str, 
-                                 lock_source: str) -> bool:
-    """
-    Validasi terakhir sebelum CRITICAL_OVERRIDE_LOCK dikunci.
-    Cegah lock jika konsensus terlalu kuat berlawanan.
-    
-    Returns:
-        bool: True jika lock diperbolehkan, False jika oposisi terlalu kuat (>= 7)
-    """
-    greeks_kill  = result.get("greeks_kill_direction", "")
-    greeks_liq7  = result.get("greeks_liq_7pct", "BOTH")
-    greeks_conf  = result.get("greeks_confidence", "")
-    algo         = result.get("algo_type_bias", "NEUTRAL")
-    hft          = result.get("hft_6pct_bias", "NEUTRAL")
-    agg          = result.get("agg", 0.5)
-    
-    opposite = "SHORT" if lock_bias == "LONG" else "LONG"
-    
-    # Hitung berapa banyak sinyal kuat berlawanan dengan lock
-    opposition_score = 0
-    if greeks_kill == opposite:
-        opposition_score += 2
-    if greeks_liq7 == f"{opposite[:4]}_TRADERS_DIE" if opposite == "LONG" \
-       else greeks_liq7 == "SHORT_TRADERS_DIE":
-        opposition_score += 2  
-    if greeks_conf == "ABSOLUTE":
-        opposition_score += 1
-    if algo == opposite:
-        opposition_score += 2
-    if hft == opposite:
-        opposition_score += 2
-    if (opposite == "SHORT" and agg < 0.35) or \
-       (opposite == "LONG" and agg > 0.65):
-        opposition_score += 2
-    
-    # Jika oposisi terlalu kuat (>= 7), jangan lock
-    if opposition_score >= 7:
-        return False
-        
-    return True
-
-
 def get_valid_ofi(result: dict) -> tuple:
     """
     OFI is ignored when volume is too thin because a small spoof wall can dominate
@@ -12176,6 +12133,55 @@ def compute_squeeze_fuel_score(result: dict) -> int:
     if exchange_score >= 6 and exchange_dir == "SHORT":  score -= 2
 
     return score
+
+
+def _should_allow_critical_lock(result: dict,
+                                lock_bias: str,
+                                lock_source: str) -> bool:
+    """
+    Validasi terakhir sebelum CRITICAL_OVERRIDE_LOCK dikunci.
+    Cegah lock jika kondisi terlalu berbahaya.
+    """
+    greeks_kill  = result.get("greeks_kill_direction", "")
+    greeks_liq7  = result.get("greeks_liq_7pct", "BOTH")
+    greeks_conf  = result.get("greeks_confidence", "")
+    algo         = result.get("algo_type_bias", "NEUTRAL")
+    hft          = result.get("hft_6pct_bias", "NEUTRAL")
+    agg          = result.get("agg", 0.5)
+    exch_score   = result.get("exchange_risk_score", 0)
+    fuel         = result.get("squeeze_fuel_score", 99)
+    short_liq    = result.get("short_liq", 99)
+    long_liq     = result.get("long_liq", 99)
+    obv          = result.get("obv_trend", "NEUTRAL")
+    obv_val      = result.get("obv_value", 0)
+
+    opposite = "SHORT" if lock_bias == "LONG" else "LONG"
+
+    # ── RULE 1: Fuel kosong + liq micro = jangan SHORT ──
+    if lock_bias == "SHORT" and fuel <= 0 and short_liq < 0.3:
+        return False
+
+    # ── RULE 2: Liq micro + OBV distribusi masif = jebakan ──
+    if (lock_bias == "SHORT" and short_liq < 0.3 and
+        obv == "NEGATIVE_EXTREME" and abs(obv_val) > 500_000_000):
+        return False
+
+    # ── RULE 3: Greeks/konsensus berlawanan skor ≥ 7 ──
+    opp_score = 0
+    if greeks_kill == opposite:                           opp_score += 2
+    if (greeks_liq7 == "LONG_TRADERS_DIE" and opposite == "SHORT") or \
+       (greeks_liq7 == "SHORT_TRADERS_DIE" and opposite == "LONG"):
+        opp_score += 2
+    if greeks_conf == "ABSOLUTE":                         opp_score += 1
+    if algo == opposite:                                  opp_score += 2
+    if hft == opposite:                                   opp_score += 2
+    if (opposite == "SHORT" and agg < 0.35) or \
+       (opposite == "LONG"  and agg > 0.65):             opp_score += 2
+
+    if opp_score >= 7 and exch_score < 8:
+        return False
+
+    return True
 
 
 def validate_genuine_short_squeeze(data: dict) -> tuple:
@@ -33819,6 +33825,29 @@ class BinanceAnalyzer:
                 " | [FAKE_REVERSAL] RSI divergence + bias alignment "
                 "-> Binance mungkin fake move dulu"
             )
+
+        # ────────────────────────────────────────────────────────────
+        # CRITICAL LOCK VALIDATION (LECTURER FIX)
+        # Validasi terakhir sebelum CRITICAL_OVERRIDE_LOCK dikunci
+        # ────────────────────────────────────────────────────────────
+        if result.get("_override_critical_lock"):
+            _lock_bias = result.get("bias", "NEUTRAL")
+            _lock_src  = result.get("_override_critical_source", "UNKNOWN")
+
+            if _should_allow_critical_lock(result, _lock_bias, _lock_src):
+                # Lock disetujui
+                result["_final_bias_locked"] = _lock_bias
+            else:
+                # Kunci ditolak → jangan trade, kembalikan ke NEUTRAL
+                result["_override_critical_lock"] = False
+                result["bias"] = "NEUTRAL"
+                result["confidence"] = "BLOCK"
+                result["entry_allowed"] = False
+                result["reason"] = (
+                    f"[CRITICAL LOCK REJECTED] {_lock_src} ingin {_lock_bias} tapi "
+                    f"gagal validasi _should_allow_critical_lock → NO TRADE | "
+                    + result.get("reason", "")
+                )
 
         return result
 
