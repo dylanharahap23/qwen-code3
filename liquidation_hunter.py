@@ -1578,25 +1578,81 @@ class ProtectGenuineShortSqueezeGuard:
     Jangan biarkan Reverse Bait memaksa SHORT kalau ada genuine squeeze signal
     """
     @staticmethod
-    def detect(short_liq: float, change_5m: float, gamma_executing: bool,
-               rsi6: float, ofi_bias: str, market_phase: str) -> dict:
+    def detect(result: dict) -> dict:
+        short_liq      = result.get("short_liq", 99)
+        change_5m      = result.get("change_5m", 0)
+        gamma_exec     = result.get("greeks_gamma_executing", False)
 
-        if short_liq >= 1.0 or change_5m < 1.5:
-            return {"override": False}
-        if not gamma_executing and rsi6 < 85:
-            return {"override": False}
-        if abs(change_5m) > 5.0 and rsi6 > 90:
+        # ── Syarat dasar (existing logic) ──
+        if short_liq > 1.5 or change_5m < 1.5:
             return {"override": False}
 
+        # ════════════════════════════════════════════
+        # WAJIB: Hitung Squeeze Quality Score
+        # Squeeze genuine butuh minimal 3 dari 7
+        # ════════════════════════════════════════════
+        obv            = result.get("obv_trend", "NEUTRAL")
+        obv_val        = result.get("obv_value", 0)
+        funding        = result.get("funding_rate", 0) or 0.0
+        rsi6           = result.get("rsi6", 50)
+        stoch_j        = result.get("stoch_j", 50)
+        algo_bias      = result.get("algo_type_bias", "NEUTRAL")
+        hft_bias       = result.get("hft_6pct_bias", "NEUTRAL")
+        up_energy      = result.get("up_energy", 0)
+        exchange_dir   = result.get("exchange_safe_direction", "NEUTRAL")
+        exchange_score = result.get("exchange_risk_score", 0)
+        volume_ratio   = result.get("volume_ratio", 1.0)
+
+        quality_score = 0
+
+        # Sinyal POSITIF (squeeze valid)
+        if gamma_exec:                                    quality_score += 2
+        if obv in ("POSITIVE_EXTREME", "POSITIVE"):       quality_score += 2
+        if funding > 0.0005:                              quality_score += 1  # short crowded
+        if algo_bias == "LONG":                           quality_score += 2
+        if hft_bias == "LONG":                            quality_score += 2
+        if up_energy > 1.0:                               quality_score += 1
+        if exchange_dir == "LONG":                        quality_score += 1
+
+        # Sinyal NEGATIF (squeeze lemah/palsu)
+        if not gamma_exec:                                quality_score -= 2
+        if obv in ("NEGATIVE_EXTREME", "NEGATIVE"):       quality_score -= 3
+        if obv_val < -100_000_000:                        quality_score -= 2  # distribusi masif
+        if rsi6 > 85:                                     quality_score -= 2  # already pumped
+        if stoch_j > 100:                                 quality_score -= 1
+        if algo_bias == "NEUTRAL" and hft_bias == "NEUTRAL": quality_score -= 2
+        if exchange_dir == "SHORT" and exchange_score >= 6:  quality_score -= 2
+        if volume_ratio < 0.4:                            quality_score -= 1
+        if funding < 0.0002:                              quality_score -= 1  # tidak ada short crowded
+
+        # Threshold: butuh >= 3 untuk genuine squeeze
+        if quality_score < 3:
+            result["_squeeze_quality_blocked"] = True
+            result["_squeeze_quality_score"] = quality_score
+            return {
+                "override": False,
+                "reason": (
+                    f"FAKE_SQUEEZE_BLOCKED: short_liq={short_liq:.2f}% dekat "
+                    f"tapi quality_score={quality_score} < 3. "
+                    f"gamma={gamma_exec}, OBV={obv}({obv_val:,.0f}), "
+                    f"algo={algo_bias}, hft={hft_bias}, "
+                    f"rsi6={rsi6:.1f}, funding={funding:.5f} → "
+                    f"Tidak ada fuel squeeze nyata. Batalkan PROTECT_GENUINE."
+                )
+            }
+
+        # Squeeze genuine terkonfirmasi → proceed dengan logic asli
+        result["_squeeze_quality_score"] = quality_score
         return {
             "override": True,
             "bias": "LONG",
+            "confidence": "ABSOLUTE",
+            "priority": -30700,
             "reason": (
                 f"PROTECT GENUINE SHORT SQUEEZE: short_liq={short_liq:.2f}%, "
-                f"change={change_5m:.2f}%, gamma_executing={gamma_executing} -> "
-                f"batalkan Reverse Bait, FORCE LONG"
-            ),
-            "priority": -30700
+                f"change={change_5m:.2f}%, gamma={gamma_exec}, "
+                f"quality_score={quality_score} → genuine squeeze. Force LONG."
+            )
         }
 
 
@@ -34038,12 +34094,22 @@ class BinanceAnalyzer:
                         )
 
                         genuine_squeeze = ProtectGenuineShortSqueezeGuard.detect(
-                            short_liq=liq["short_dist"],
-                            change_5m=change_5m,
-                            gamma_executing=provisional_gamma.get("gamma_executing", False),
-                            rsi6=rsi6,
-                            ofi_bias=ofi["bias"],
-                            market_phase=provisional_market_phase
+                            result={
+                                "short_liq": liq["short_dist"],
+                                "change_5m": change_5m,
+                                "greeks_gamma_executing": provisional_gamma.get("gamma_executing", False),
+                                "rsi6": rsi6,
+                                "obv_trend": obv_trend,
+                                "obv_value": obv_value,
+                                "funding_rate": funding_rate if funding_rate is not None else 0.0,
+                                "stoch_j": stoch_j,
+                                "algo_type_bias": algo_type["bias"],
+                                "hft_6pct_bias": hft_6pct["bias"],
+                                "up_energy": up_energy,
+                                "exchange_safe_direction": "NEUTRAL",
+                                "exchange_risk_score": 0,
+                                "volume_ratio": volume_ratio
+                            }
                         )
                         
                         # ===== FOLKSUSDT FIX: Blow-Off Top Exhaustion Guard (Priority -10190) =====
