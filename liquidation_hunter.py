@@ -12296,6 +12296,8 @@ def _should_allow_critical_lock(result: dict,
     algo_b      = result.get("algo_type_bias", "NEUTRAL")
     hft_b       = result.get("hft_6pct_bias", "NEUTRAL")
     agg_v       = result.get("agg", 0.5)
+    gamma_exec  = result.get("greeks_gamma_executing", False)
+    obv_now     = result.get("obv_trend", "NEUTRAL")
 
     if exch_score < 7 and lock_source in (
         "ARBITRATE_EARLY_RETURN", "EXCHANGE_HARD_BLOCK"
@@ -12320,6 +12322,31 @@ def _should_allow_critical_lock(result: dict,
             algo_b == "SHORT" and
             hft_b == "SHORT" and
             agg_v < 0.3):
+            return False
+
+        # ── RULE 8B (BARU): Versi dengan gamma_executing + OBV confirm ──
+        # Jika gamma SUDAH executing ke SHORT + OBV confirm,
+        # algo/hft tidak diperlukan — Greeks lebih akurat
+        # Ini fix kasus BUSDT 10:20: exchange block LONG tapi Greeks SHORT ABSOLUTE
+        # dengan gamma sudah executing dan OBV negatif ekstrem
+        if (lock_bias == "LONG" and
+            g_conf == "ABSOLUTE" and
+            g_kill == "SHORT" and
+            g_liq7 == "LONG_TRADERS_DIE" and
+            g_who == "LONG_TRADERS" and
+            gamma_exec and
+            obv_now in ("NEGATIVE_EXTREME", "NEGATIVE")):
+            return False
+
+        # Exchange mau SHORT tapi Greeks ABSOLUTE bilang LONG + gamma executing
+        # (simetris untuk kasus LONG squeeze yang sudah executing)
+        if (lock_bias == "SHORT" and
+            g_conf == "ABSOLUTE" and
+            g_kill == "LONG" and
+            g_liq7 == "SHORT_TRADERS_DIE" and
+            g_who == "SHORT_TRADERS" and
+            gamma_exec and
+            obv_now in ("POSITIVE_EXTREME", "POSITIVE")):
             return False
 
     return True
@@ -33901,11 +33928,11 @@ class BinanceAnalyzer:
         if branching_L > 0.85 or branching_S > 0.85:
             result["bias"] = "NEUTRAL"
             result["_hawkes_gate_triggered"] = True
-            result["_override_critical_lock"] = True
             result["_override_critical_source"] = "HAWKES_CASCADE"
             result["confidence"] = "BLOCK"
             result["entry_allowed"] = False
             result["reason"] = f"[HAWKES CASCADE IMMINENT] Branching {max(branching_L, branching_S):.2f} > 0.85 → NO TRADE. " + result.get("reason", "")
+            result = apply_critical_override_lock(result, "HAWKES_CASCADE")
             return result
         # ========== END HAWKES LIQUIDATION PREDICTOR GATE ==========
         
