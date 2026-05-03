@@ -12220,6 +12220,41 @@ def _should_allow_critical_lock(result: dict,
         if weak_long:
             return False  # Hawkes LONG tanpa backing = jangan lock
 
+    # ── RULE 6: regime_skip = TRUE → TIDAK BOLEH LOCK APAPUN ──
+    # Jika market dalam MANIPULATION/SKIP regime,
+    # tidak ada detector yang boleh force entry via lock
+    if result.get("regime_skip", False):
+        return False
+
+    # ── RULE 7: Hawkes margin terlalu tipis (p < 0.65) ──
+    # + konteks berlawanan kuat → jangan lock
+    if lock_source in ("HAWKES_SQUEEZE_INVALID", "ARBITRATE_EARLY_RETURN"):
+        hawkes_prob = result.get("_hawkes_long_dies_prob",
+                      result.get("_hawkes_short_dies_prob", 0.5))
+
+        if hawkes_prob < 0.65:
+            # Cek konteks berlawanan
+            ofi_b      = result.get("ofi_bias", "NEUTRAL")
+            agg_val    = result.get("agg", 0.5)
+            obv        = result.get("obv_trend", "NEUTRAL")
+            exch_dir   = result.get("exchange_safe_direction", "NEUTRAL")
+            fuel       = result.get("squeeze_fuel_score", 0)
+
+            # Hawkes SHORT tapi konteks overwhelmingly LONG
+            if (lock_bias == "SHORT" and
+                ofi_b == "LONG" and
+                agg_val > 0.7 and
+                obv in ("POSITIVE_EXTREME", "POSITIVE") and
+                fuel >= 4):
+                return False
+
+            # Hawkes LONG tapi konteks overwhelmingly SHORT
+            if (lock_bias == "LONG" and
+                ofi_b == "SHORT" and
+                agg_val < 0.35 and
+                fuel <= 2):
+                return False
+
     return True
 
 
