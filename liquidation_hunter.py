@@ -33987,8 +33987,7 @@ class BinanceAnalyzer:
                             change_5m=change_5m,
                             rsi6=rsi6,
                             rsi6_5m=rsi6_5m if rsi6_5m is not None else 50.0,
-                            funding_rate=funding_rate if funding_rate is not None else 0.0,
-                            result=result
+                            funding_rate=funding_rate if funding_rate is not None else 0.0
                         )
                         all_rsi_ceiling = AllRSICeilingReversal.detect(
                             rsi6=rsi6,
