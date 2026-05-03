@@ -28787,12 +28787,30 @@ class BinanceAnalyzer:
             volume_ma10=result.get("volume_ma10", 1)
         )
         if adv_closer["override"]:
-            result["bias"] = adv_closer["bias"]
-            result["reason"] = f"[CLOSER LIQ] {adv_closer['reason']} | " + result.get("reason", "")
-            result["confidence"] = "ABSOLUTE"
-            result["priority_level"] = adv_closer["priority"]
-            result["entry_allowed"] = True
-            return result
+            # ── GUARD EXHAUSTION: Jangan LONG jika squeeze sudah habis ──
+            rsi6_val    = result.get("rsi6", 50)
+            rsi14_val   = result.get("rsi14", 50)
+            rsi5m_val   = result.get("rsi6_5m", 50)
+            up_energy   = result.get("up_energy", 0)
+            fuel        = result.get("squeeze_fuel_score", 0)
+            agg_json    = result.get("agg", 0.5)      # pakai agg asli dari JSON
+            
+            if (adv_closer["bias"] == "LONG" and
+                rsi6_val > 80 and rsi14_val > 75 and rsi5m_val > 70 and
+                up_energy < 0.5 and fuel < 3 and agg_json < 0.5):
+                # Exhaustion terdeteksi → batalkan override
+                result["reason"] = result.get("reason", "") + (
+                    f" | [CLOSER_LIQ_EXHAUSTED] RSI all-TF overbought + "
+                    f"energy habis + fuel rendah + agg asli={agg_json:.2f} → override dibatalkan"
+                )
+                # Lewati blok ini, jangan ubah bias
+            else:
+                result["bias"] = adv_closer["bias"]
+                result["reason"] = f"[CLOSER LIQ] {adv_closer['reason']} | " + result.get("reason", "")
+                result["confidence"] = "ABSOLUTE"
+                result["priority_level"] = adv_closer["priority"]
+                result["entry_allowed"] = True
+                return result
 
         # ========== PRIORITY -29000: ADVERSARIAL SQUEEZE CONTINUATION ==========
         adv_squeeze = AdversarialSqueezeContinuation.detect(
