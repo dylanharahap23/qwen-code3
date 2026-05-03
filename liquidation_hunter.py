@@ -157,15 +157,44 @@ class PostSqueezeExhaustionDetector:
         if exhaustion_score >= 4:
             new_bias = "SHORT" if data.get("bias") == "LONG" else "LONG"
             
-            # ── Guard: Jangan reversal ke LONG jika masih bearish kuat ──
-            liq_7pct = data.get("greeks_liq_7pct", "BOTH")
-            ofi_bias = data.get("ofi_bias", "NEUTRAL")
-            agg_val = data.get("agg", 0.5)
+            liq_7pct  = data.get("greeks_liq_7pct", "BOTH")
+            ofi_bias  = data.get("ofi_bias", "NEUTRAL")
+            agg_val   = data.get("agg", 0.5)
+            greeks_kill = data.get("greeks_kill_direction", "")
+            greeks_who  = data.get("greeks_who_dies_first", "")
+            short_liq   = data.get("short_liq", 99)
+            long_liq    = data.get("long_liq", 99)
+            funding     = data.get("funding_rate", 0) or 0.0
+
+            # ── Guard 1 (existing): Jangan SHORT→LONG jika bearish kuat ──
             if (new_bias == "LONG" and
                 liq_7pct == "LONG_TRADERS_DIE" and
                 ofi_bias == "SHORT" and
                 agg_val < 0.4):
-                return {"override": False, "reason": "Exhaustion dibatalkan: LONG_TRADERS_DIE + OFI SHORT + agg rendah"}
+                return {"override": False,
+                        "reason": "Exhaustion dibatalkan: LONG_TRADERS_DIE + OFI SHORT + agg rendah"}
+
+            # ── Guard 2 (BARU): Jangan LONG→SHORT jika Greeks kuat bilang LONG ──
+            # UBUSDT case: squeeze masih valid, short yang akan mati
+            if new_bias == "SHORT":
+                long_still_valid = sum([
+                    greeks_kill == "LONG",
+                    liq_7pct == "SHORT_TRADERS_DIE",
+                    greeks_who == "SHORT_TRADERS",
+                    short_liq < long_liq * 0.4,   # short liq jauh lebih dekat
+                    funding < -0.0001,             # short crowded = ada fuel
+                ])
+                if long_still_valid >= 3:
+                    return {
+                        "override": False,
+                        "reason": (
+                            f"Exhaustion SHORT dibatalkan: Greeks masih valid LONG "
+                            f"(score={long_still_valid}/5). "
+                            f"kill={greeks_kill}, liq7={liq_7pct}, "
+                            f"who={greeks_who}, short_liq={short_liq:.2f}%, "
+                            f"funding={funding:.5f}"
+                        )
+                    }
             
             return {
                 "override": True,
