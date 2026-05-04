@@ -1769,7 +1769,24 @@ class ExhaustedSqueezeAbsoluteReversal:
     PRIORITY = -31050
 
     @staticmethod
-    def detect(change_5m, short_liq, long_liq, rsi6_5m, rsi6, volume_ratio, down_energy):
+    def detect(change_5m, short_liq, long_liq, rsi6_5m, rsi6, 
+               volume_ratio, down_energy,
+               latest_volume=0, volume_ma10=1,   # ← parameter baru
+               obv_trend="NEUTRAL", obv_value=0): # ← parameter baru
+
+        # ---- GUARD 1 : short_liq terlalu kecil → bukan exhausted ----
+        if short_liq < 1.5:        # <1.5% masih mungkin lanjut
+            return {"override": False}
+
+        # ---- GUARD 2 : volume spike → bukan exhaustion ----
+        if volume_ma10 > 0 and (latest_volume / volume_ma10) >= 2.0:
+            return {"override": False}
+
+        # ---- GUARD 3 : OBV POSITIVE_EXTREME = akumulasi, bukan exhausted ----
+        if obv_trend == "POSITIVE_EXTREME" and obv_value > 50_000_000:
+            return {"override": False}
+
+        # --- logic asli di bawah ---
         if change_5m <= short_liq * 1.5:
             return {"override": False}
         if rsi6_5m < 90 and rsi6 < 95:
@@ -1778,6 +1795,7 @@ class ExhaustedSqueezeAbsoluteReversal:
             return {"override": False}
         if volume_ratio >= 0.8:
             return {"override": False}
+
         return {
             "override": True,
             "bias": "SHORT",
@@ -11759,7 +11777,11 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
             rsi6_5m=res.get("rsi6_5m", 50),
             rsi6=res.get("rsi6", 50),
             volume_ratio=res.get("volume_ratio", 1.0),
-            down_energy=res.get("down_energy", 0)
+            down_energy=res.get("down_energy", 0),
+            latest_volume=res.get("latest_volume", 0),
+            volume_ma10=res.get("volume_ma10", 1),
+            obv_trend=res.get("obv_trend", "NEUTRAL"),
+            obv_value=res.get("obv_value", 0)
         )
         if exhausted.get("override"):
             res["_exhausted_squeeze_absolute"] = exhausted
@@ -11776,7 +11798,11 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
                 rsi6_5m=res.get("rsi6_5m", 50),
                 rsi6=res.get("rsi6", 50),
                 volume_ratio=res.get("volume_ratio", 1.0),
-                down_energy=res.get("down_energy", 0)
+                down_energy=res.get("down_energy", 0),
+                latest_volume=res.get("latest_volume", 0),
+                volume_ma10=res.get("volume_ma10", 1),
+                obv_trend=res.get("obv_trend", "NEUTRAL"),
+                obv_value=res.get("obv_value", 0)
             )
         res["bias"] = exhausted["bias"]
         res["confidence"] = "ABSOLUTE"
@@ -28429,13 +28455,17 @@ class BinanceAnalyzer:
 
         # ========== EXHAUSTED SQUEEZE ABSOLUTE REVERSAL (PRIORITY -31050) ==========
         exhausted_abs = ExhaustedSqueezeAbsoluteReversal.detect(
-            change_5m=change_5m_val,
-            short_liq=short_liq,
-            long_liq=long_liq,
-            rsi6_5m=rsi6_5m_val,
-            rsi6=rsi6_val,
-            volume_ratio=volume_ratio,
-            down_energy=down_energy_val
+            change_5m    = change_5m_val,
+            short_liq    = short_liq,
+            long_liq     = long_liq,
+            rsi6_5m      = rsi6_5m_val,
+            rsi6         = rsi6_val,
+            volume_ratio = volume_ratio,
+            down_energy  = down_energy_val,
+            latest_volume= result.get("latest_volume", 0),
+            volume_ma10  = result.get("volume_ma10", 1),
+            obv_trend    = result.get("obv_trend", "NEUTRAL"),
+            obv_value    = result.get("obv_value", 0)
         )
         if exhausted_abs["override"]:
             result["bias"] = exhausted_abs["bias"]
