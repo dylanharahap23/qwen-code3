@@ -72,6 +72,10 @@ LAST_SIGNAL_TIME = 0
 # ================= OVERRIDE FREQUENCY LIMITER (Rule 7) =================
 _override_history = {}  # {symbol: [timestamps]} - tracks override attempts per symbol
 
+# ================= HAWKES MULTI-TIMEFRAME CACHE =================
+_hawkes_mtf_cache: Dict[str, Tuple[float, dict]] = {}
+HAWKES_MTF_TTL_SEC = 60
+
 # ================= LECTURER FIX v10: SIGNAL CONSISTENCY VALIDATION =================
 def validate_signal_consistency(result: dict) -> bool:
     """
@@ -362,6 +366,365 @@ def _resolve_neutral_to_bias(result: dict) -> dict:
     return result
 
 
+def _panglima_num(value, default=0.0) -> float:
+    try:
+        if value is None:
+            return float(default)
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _detect_panglima_long_veto_context(result: dict, proposed_bias: str = None) -> tuple:
+    """
+    Final commander veto: never allow a fresh LONG when Greeks says SHORT and
+    the nearby long liquidation has already been swept.
+    """
+    if proposed_bias:
+        current_bias = proposed_bias
+    elif result.get("_final_bias_locked") == "LONG" or result.get("bias") == "LONG":
+        current_bias = "LONG"
+    else:
+        current_bias = result.get("_final_bias_locked") or result.get("bias", "NEUTRAL")
+    if current_bias != "LONG":
+        return False, ""
+
+    greeks_kill = str(result.get("greeks_kill_direction", ""))
+    liq7 = str(result.get("greeks_liq_7pct", "BOTH"))
+    greeks_wants_short = greeks_kill == "SHORT" or liq7 == "LONG_TRADERS_DIE"
+    if not greeks_wants_short:
+        return False, ""
+
+    long_liq = _panglima_num(result.get("long_liq", 99), 99.0)
+    short_liq = _panglima_num(result.get("short_liq", 99), 99.0)
+    change_5m = _panglima_num(result.get("change_5m", 0), 0.0)
+    if long_liq <= 0 or short_liq <= 0:
+        return False, ""
+
+    up_energy = _panglima_num(result.get("up_energy", 0.0), 0.0)
+    rsi6_5m = _panglima_num(result.get("rsi6_5m", 50), 50.0)
+    exchange_dir = str(result.get("exchange_safe_direction", "NEUTRAL"))
+    exchange_score = _panglima_num(result.get("exchange_risk_score", 0), 0.0)
+
+    post_sweep_rebound = (
+        long_liq < 0.15 and
+        exchange_dir == "LONG" and
+        exchange_score >= 7 and
+        up_energy > 3.0 and
+        rsi6_5m < 20
+    )
+    if post_sweep_rebound:
+        return False, ""
+
+    longs_already_dead = long_liq < short_liq * 0.4
+    sweep_finished = change_5m < -long_liq * 1.5
+    who_dies = str(result.get("greeks_who_dies_first", ""))
+
+    if not (longs_already_dead and sweep_finished):
+        return False, ""
+
+    agg = _panglima_num(result.get("agg", 0.5), 0.5)
+    ofi_bias = str(result.get("ofi_bias", "NEUTRAL"))
+    ofi_strength = _panglima_num(result.get("ofi_strength", 0.0), 0.0)
+
+    reason = (
+        f"[PANGLIMA VETO] Greeks kill={greeks_kill}, liq7={liq7}. Long_liq sudah tersapu "
+        f"(long_liq={long_liq:.2f}%, short_liq={short_liq:.2f}%, "
+        f"change_5m={change_5m:.2f}%). LONG adalah jebakan HFT; "
+        f"agg={agg:.2f}, OFI={ofi_bias} {ofi_strength:.2f}, "
+        f"who={who_dies}. NO TRADE."
+    )
+    return True, reason
+
+
+def _detect_panglima_short_veto_context(result: dict, proposed_bias: str = None) -> tuple:
+    """
+    Symmetric commander veto: never allow a fresh SHORT when Greeks says LONG and
+    the nearby short liquidation has already been swept.
+    """
+    if proposed_bias:
+        current_bias = proposed_bias
+    elif result.get("_final_bias_locked") == "SHORT" or result.get("bias") == "SHORT":
+        current_bias = "SHORT"
+    else:
+        current_bias = result.get("_final_bias_locked") or result.get("bias", "NEUTRAL")
+    if current_bias != "SHORT":
+        return False, ""
+
+    greeks_kill = str(result.get("greeks_kill_direction", ""))
+    liq7 = str(result.get("greeks_liq_7pct", "BOTH"))
+    greeks_wants_long = greeks_kill == "LONG" or liq7 == "SHORT_TRADERS_DIE"
+    if not greeks_wants_long:
+        return False, ""
+
+    short_liq = _panglima_num(result.get("short_liq", 99), 99.0)
+    long_liq = _panglima_num(result.get("long_liq", 99), 99.0)
+    change_5m = _panglima_num(result.get("change_5m", 0), 0.0)
+    if short_liq <= 0 or long_liq <= 0:
+        return False, ""
+
+    up_energy = _panglima_num(result.get("up_energy", 0.0), 0.0)
+    rsi6_5m = _panglima_num(result.get("rsi6_5m", 50), 50.0)
+    exchange_dir = str(result.get("exchange_safe_direction", "NEUTRAL"))
+    exchange_score = _panglima_num(result.get("exchange_risk_score", 0), 0.0)
+
+    post_sweep_dump = (
+        short_liq < 0.15 and
+        exchange_dir == "SHORT" and
+        exchange_score >= 7 and
+        up_energy < 0.5 and
+        rsi6_5m > 80
+    )
+    if post_sweep_dump:
+        return False, ""
+
+    shorts_already_dead = short_liq < long_liq * 0.4
+    sweep_finished = change_5m > short_liq * 1.5
+    if not (shorts_already_dead and sweep_finished):
+        return False, ""
+
+    agg = _panglima_num(result.get("agg", 0.5), 0.5)
+    ofi_bias = str(result.get("ofi_bias", "NEUTRAL"))
+    ofi_strength = _panglima_num(result.get("ofi_strength", 0.0), 0.0)
+    who_dies = str(result.get("greeks_who_dies_first", ""))
+
+    reason = (
+        f"[PANGLIMA VETO SHORT] Greeks kill={greeks_kill}, liq7={liq7}. Short_liq sudah tersapu "
+        f"(short_liq={short_liq:.2f}%, long_liq={long_liq:.2f}%, "
+        f"change_5m={change_5m:.2f}%). SHORT adalah jebakan; "
+        f"agg={agg:.2f}, OFI={ofi_bias} {ofi_strength:.2f}, "
+        f"who={who_dies}. NO TRADE."
+    )
+    return True, reason
+
+
+def _detect_hawkes_mtf_veto_context(result: dict, proposed_bias: str = None) -> tuple:
+    if proposed_bias:
+        current_bias = proposed_bias
+    elif result.get("_final_bias_locked") in ("LONG", "SHORT"):
+        current_bias = result.get("_final_bias_locked")
+    else:
+        current_bias = result.get("bias", "NEUTRAL")
+
+    if current_bias not in ("LONG", "SHORT"):
+        return False, ""
+
+    mtf_cascade = bool(result.get("_hawkes_mtf_cascade"))
+    mtf_direction = str(result.get("_hawkes_mtf_direction", "NEUTRAL"))
+    mtf_ratio = _panglima_num(result.get("_hawkes_mtf_ratio", 0), 0.0)
+    if not (mtf_cascade and mtf_ratio > 50 and mtf_direction in ("LONG", "SHORT")):
+        return False, ""
+    if mtf_direction == current_bias:
+        return False, ""
+
+    capitulation_rebound_exception = (
+        current_bias == "LONG" and
+        mtf_direction == "SHORT" and
+        _panglima_num(result.get("rsi6_5m", 50), 50.0) < 20 and
+        str(result.get("exchange_safe_direction", "NEUTRAL")) == "LONG" and
+        _panglima_num(result.get("exchange_risk_score", 0), 0.0) >= 5 and
+        _panglima_num(result.get("up_energy", 0), 0.0) > 1.0 and
+        _panglima_num(result.get("volume_ratio", 1.0), 1.0) < 0.35
+    )
+    if capitulation_rebound_exception:
+        return False, ""
+
+    reason = (
+        f"[HAWKES_MTF_VETO] Cascade {mtf_ratio:.1f}x baseline "
+        f"direction={mtf_direction} berlawanan dengan bias={current_bias}. "
+        f"Trade dibatalkan."
+    )
+    return True, reason
+
+
+def apply_panglima_greeks_veto(result: dict, source: str = "") -> tuple:
+    veto, veto_reason = _detect_hawkes_mtf_veto_context(result)
+    veto_source = "HAWKES_MTF_VETO"
+    if not veto:
+        veto, veto_reason = _detect_panglima_long_veto_context(result)
+        veto_source = "PANGLIMA_GREEKS_LONG_VETO"
+    if not veto:
+        veto, veto_reason = _detect_panglima_short_veto_context(result)
+        veto_source = "PANGLIMA_GREEKS_SHORT_VETO"
+    if not veto:
+        return result, False
+
+    result["bias"] = "NEUTRAL"
+    result["bias_display"] = "NEUTRAL"
+    result["confidence"] = "BLOCK"
+    result["entry_allowed"] = False
+    result["priority_level"] = -99999
+    result["_final_bias_locked"] = "NEUTRAL"
+    result["_override_critical_lock"] = True
+    result["_override_critical_source"] = veto_source
+    result["_panglima_greeks_veto"] = True
+    result["_panglima_veto_source"] = source
+    result["_liquidity_extreme_override"] = False
+    result["_exhaustion_gate_triggered"] = False
+    result["_hawkes_gate_triggered"] = False
+    result["_squeeze_validity_gate_triggered"] = False
+    result["reason"] = f"{veto_reason} | " + result.get("reason", "")
+    return result, True
+
+
+def compute_hawkes_multi_tf_intensity(symbol: str, fetcher=None, client=None) -> dict:
+    """
+    Cached multi-timeframe Hawkes-style liquidation intensity.
+    Uses normalized volume instead of raw volume so low-cap symbols do not make
+    every candle look like a permanent cascade.
+    """
+    now_ts = time.time()
+    cache_key = symbol.upper()
+    cached = _hawkes_mtf_cache.get(cache_key)
+    if cached and now_ts - cached[0] < HAWKES_MTF_TTL_SEC:
+        return dict(cached[1])
+
+    alpha = 0.8
+    beta = 2.0
+    mu = 0.1
+    timeframes = ("1m", "3m", "15m", "1h", "4h")
+    intensities = {}
+    signed_pressure = {}
+
+    def _fetch_raw_klines(interval: str, limit: int = 50):
+        try:
+            if client is not None and hasattr(client, "futures_klines"):
+                return client.futures_klines(symbol=symbol, interval=interval, limit=limit)
+            if fetcher is not None and hasattr(fetcher, "fetch"):
+                return fetcher.fetch("/fapi/v1/klines", {
+                    "symbol": symbol.upper(),
+                    "interval": interval,
+                    "limit": limit
+                })
+            resp = requests.get(
+                "https://fapi.binance.com/fapi/v1/klines",
+                params={"symbol": symbol.upper(), "interval": interval, "limit": limit},
+                timeout=DEFAULT_TIMEOUT,
+                verify=False
+            )
+            if resp.status_code == 200:
+                return resp.json()
+        except Exception:
+            return None
+        return None
+
+    for tf in timeframes:
+        try:
+            klines = _fetch_raw_klines(tf, 50)
+            if not klines:
+                intensities[tf] = mu
+                signed_pressure[tf] = 0.0
+                continue
+
+            volumes = [max(_panglima_num(k[5], 0.0), 0.0) for k in klines]
+            positive_volumes = [v for v in volumes if v > 0]
+            avg_volume = float(np.mean(positive_volumes)) if positive_volumes else 1.0
+            events = []
+            pressure = 0.0
+
+            for k in klines:
+                t = _panglima_num(k[0], 0.0) / 1000.0
+                open_p = _panglima_num(k[1], 0.0)
+                close_p = _panglima_num(k[4], 0.0)
+                volume = max(_panglima_num(k[5], 0.0), 0.0)
+                if open_p <= 0 or volume <= 0:
+                    continue
+
+                signed_move = (close_p - open_p) / open_p
+                move = abs(signed_move)
+                if move <= 0.005:
+                    continue
+
+                volume_factor = min(volume / max(avg_volume, 1e-9), 5.0)
+                magnitude = move * volume_factor * 100.0
+                events.append((t, magnitude))
+                pressure += magnitude if signed_move > 0 else -magnitude
+
+            if not events:
+                intensities[tf] = mu
+                signed_pressure[tf] = round(pressure, 4)
+                continue
+
+            t_now = events[-1][0]
+            lam = mu
+            for t_i, mag in events:
+                dt = max(t_now - t_i, 0.0)
+                lam += alpha * mag * np.exp(-beta * dt / 3600.0)
+
+            intensities[tf] = round(float(lam), 4)
+            signed_pressure[tf] = round(float(pressure), 4)
+
+        except Exception:
+            intensities[tf] = mu
+            signed_pressure[tf] = 0.0
+
+    dominant_tf = max(intensities, key=intensities.get)
+    max_intensity = intensities[dominant_tf]
+    baseline_ratio = max_intensity / mu if mu > 0 else 1.0
+    hot_timeframes = [tf for tf, val in intensities.items() if val > mu * 3.0]
+    dominant_pressure = signed_pressure.get(dominant_tf, 0.0)
+    direction = "LONG" if dominant_pressure > 0 else "SHORT" if dominant_pressure < 0 else "NEUTRAL"
+    momentum_quality = {
+        "1m": "FRESH",
+        "3m": "FRESH",
+        "15m": "DEVELOPING",
+        "1h": "DEVELOPING",
+        "4h": "EXHAUSTED",
+    }.get(dominant_tf, "UNKNOWN")
+
+    result = {
+        "intensities": intensities,
+        "dominant_tf": dominant_tf,
+        "max_intensity": max_intensity,
+        "baseline_ratio": round(float(baseline_ratio), 2),
+        "cascade_active": baseline_ratio > 5.0,
+        "hot_timeframes": hot_timeframes,
+        "signed_pressure": signed_pressure,
+        "direction": direction,
+        "momentum_quality": momentum_quality
+    }
+    _hawkes_mtf_cache[cache_key] = (now_ts, result)
+    return dict(result)
+
+
+class FakeExhaustionContinuationGuard:
+    """
+    PRIORITY -31010. Detect fake exhaustion where long liquidation has been swept,
+    but bearish momentum continues through a phantom bid wall.
+    """
+    @staticmethod
+    def detect(change_5m: float, long_liq: float,
+               up_energy: float, agg: float,
+               greeks_kill_direction: str, greeks_liq_7pct: str,
+               rsi6_5m: float, down_energy: float,
+               ofi_bias: str, ofi_strength: float) -> dict:
+
+        if change_5m > -long_liq * 1.5:
+            return {"override": False}
+
+        if not (up_energy > 2.0 and agg < 0.45):
+            return {"override": False}
+
+        if not (greeks_kill_direction == "SHORT" and greeks_liq_7pct == "LONG_TRADERS_DIE"):
+            return {"override": False}
+
+        if not (rsi6_5m < 20 and change_5m < -0.5):
+            return {"override": False}
+
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"FAKE EXHAUSTION CONTINUATION: long_liq {long_liq:.2f}% already swept "
+                f"(change {change_5m:.1f}%), but agg={agg:.2f} contradicts "
+                f"up_energy={up_energy:.2f} (phantom bid wall). "
+                f"Greeks: kill=SHORT, liq_7pct=LONG_TRADERS_DIE. "
+                f"RSI5m={rsi6_5m:.1f} still declining. Force SHORT, cancel exhaustion LONG."
+            ),
+            "priority": -31010
+        }
+
+
 # ================= POST-SQUEEZE EXHAUSTION DETECTOR =================
 class PostSqueezeExhaustionDetector:
     """
@@ -370,6 +733,17 @@ class PostSqueezeExhaustionDetector:
     """
     @staticmethod
     def detect(data: dict) -> dict:
+        # Guard 0: Hawkes multi-timeframe cascade berlawanan membatalkan exhaustion reversal.
+        if (
+            data.get("_hawkes_mtf_cascade") and
+            data.get("_hawkes_mtf_direction") == "SHORT" and
+            (data.get("_hawkes_mtf_ratio", 0) or 0) > 50
+        ):
+            return {
+                "override": False,
+                "reason": "Hawkes MTF cascade SHORT aktif - exhaustion LONG dibatalkan"
+            }
+
         # Guard 0: reverse bait yang sudah terdeteksi tidak boleh dikalahkan exhaustion.
         if data.get("_reverse_bait_detected"):
             return {
@@ -1961,6 +2335,7 @@ class ProtectGenuineShortSqueezeGuard:
         obv_val        = result.get("obv_value", 0)
         funding        = result.get("funding_rate", 0) or 0.0
         rsi6           = result.get("rsi6", 50)
+        rsi6_5m        = result.get("rsi6_5m", 50)
         stoch_j        = result.get("stoch_j", 50)
         algo_bias      = result.get("algo_type_bias", "NEUTRAL")
         hft_bias       = result.get("hft_6pct_bias", "NEUTRAL")
@@ -1968,6 +2343,27 @@ class ProtectGenuineShortSqueezeGuard:
         exchange_dir   = result.get("exchange_safe_direction", "NEUTRAL")
         exchange_score = result.get("exchange_risk_score", 0)
         volume_ratio   = result.get("volume_ratio", 1.0)
+
+        post_squeeze_danger = (
+            short_liq < 0.3 and
+            rsi6_5m > 90 and
+            funding > 0.002 and
+            (exchange_dir == "SHORT" or exchange_score >= 6)
+        )
+        if post_squeeze_danger:
+            result["_squeeze_quality_blocked"] = True
+            result["_post_squeeze_danger"] = True
+            return {
+                "override": False,
+                "_squeeze_quality_blocked": True,
+                "reason": (
+                    f"POST_SQUEEZE_DANGER: short_liq={short_liq:.2f}% micro, "
+                    f"RSI5m={rsi6_5m:.1f} extreme, RSI6={rsi6:.1f}, "
+                    f"stochJ={stoch_j:.1f}, funding={funding:.4f} crowded, "
+                    f"exchange={exchange_dir}/{exchange_score} -> squeeze hampir selesai, "
+                    f"fase dump berikutnya. Batalkan LONG."
+                )
+            }
 
         quality_score = 0
 
@@ -4855,7 +5251,9 @@ class UltraLowVolumeAggSpoofingGuard:
                funding_rate: float, kill_direction: str, delta_crowded: str,
                delta_exposure: float, long_liq: float, short_liq: float,
                market_phase: str, rsi6: float, rsi6_5m: float,
-               down_energy: float) -> dict:
+               down_energy: float, up_energy: float = 0.0,
+               exchange_safe_direction: str = "NEUTRAL",
+               exchange_risk_score: float = 0.0) -> dict:
         
         if volume_ma10 <= 0 or funding_rate is None:
             return {"override": False}
@@ -4870,6 +5268,20 @@ class UltraLowVolumeAggSpoofingGuard:
         # agg harus tinggi (terlihat bullish)
         if agg < 0.80:
             return {"override": False}
+
+        if (
+            rsi6_5m < 20 and
+            exchange_safe_direction == "LONG" and
+            up_energy > 1.0
+        ):
+            return {
+                "override": False,
+                "reason": (
+                    f"ULTRA_LOW_VOL_SPOOF_CANCELLED: RSI5m={rsi6_5m:.1f} extreme oversold, "
+                    f"exchange={exchange_safe_direction} score={exchange_risk_score}, "
+                    f"up_energy={up_energy:.2f} -> capitulation genuine, agg tinggi bukan spoof"
+                )
+            }
         
         # Funding harus positif (crowded LONG)
         if funding_rate <= 0:
@@ -8612,11 +9024,43 @@ class GenuineShortSqueezeAbsolute:
         ofi_strength: float,
         funding_rate: float,
         change_5m: float,
-        volume_ratio: float = 1.0  # tidak digunakan sebagai syarat, hanya info
+        volume_ratio: float = 1.0,  # tidak digunakan sebagai syarat, hanya info
+        rsi6_5m: float = 50.0,
+        exchange_safe_direction: str = "NEUTRAL",
+        hawkes_mtf_direction: str = "NEUTRAL",
+        hawkes_mtf_dominant_tf: str = "",
+        hawkes_mtf_ratio: float = 0.0,
+        hawkes_mtf_momentum_quality: str = "UNKNOWN"
     ) -> dict:
         
         if funding_rate is None:
             funding_rate = 0.0
+
+        # Hawkes MTF LONG yang didominasi 1h/4h sering berarti trend lama
+        # sudah matang, bukan awal squeeze baru. Jika RSI5m sudah overbought,
+        # funding netral, dan exchange justru SHORT, jangan force LONG.
+        old_hawkes_long = (
+            hawkes_mtf_direction == "LONG" and
+            (
+                hawkes_mtf_dominant_tf in ("4h", "1h") or
+                hawkes_mtf_momentum_quality == "EXHAUSTED"
+            ) and
+            hawkes_mtf_ratio > 200 and
+            rsi6_5m > 80 and
+            abs(funding_rate) < 0.0003 and
+            exchange_safe_direction == "SHORT"
+        )
+        if old_hawkes_long:
+            return {
+                "override": False,
+                "reason": (
+                    f"HAWKES_4H_EXHAUSTION: Hawkes {hawkes_mtf_ratio:.0f}x tapi dominated by "
+                    f"{hawkes_mtf_dominant_tf or hawkes_mtf_momentum_quality} "
+                    f"(trend lama bukan momentum baru), RSI5m={rsi6_5m:.1f} overbought, "
+                    f"funding={funding_rate:.6f} tidak ada short crowded, exchange=SHORT -> "
+                    "squeeze tidak punya fuel. Batalkan LONG."
+                )
+            }
         
         # Syarat 1: short_liq sangat dekat
         c1 = short_liq < 1.5 and short_liq < long_liq
@@ -11548,6 +11992,10 @@ def apply_critical_override_lock(result: dict, source: str = "") -> dict:
     LECTURER FIX v11: Tambahkan validasi final sebelum CRITICAL_OVERRIDE_LOCK dikunci.
     Cegah lock jika konsensus terlalu kuat berlawanan.
     """
+    result, panglima_vetoed = apply_panglima_greeks_veto(result, source)
+    if panglima_vetoed:
+        return result
+
     if has_critical_override_lock(result):
         # ── VALIDASI FINAL: Jangan lock jika oposisi terlalu kuat ──
         proposed_bias = result.get("bias", "NEUTRAL")
@@ -11590,6 +12038,8 @@ def render_final_output(result: dict) -> dict:
     Single source of truth for anything rendered or returned to the bot.
     _final_bias_locked wins over stale bias fields.
     """
+    result, _ = apply_panglima_greeks_veto(result, "RENDER_FINAL_OUTPUT")
+
     final_locked = result.get("_final_bias_locked")
     if final_locked in ("LONG", "SHORT", "NEUTRAL"):
         result["bias_display"] = final_locked
@@ -11611,6 +12061,10 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
     jika kondisi SUPER KETAT terpenuhi. Jika tidak, semua detektormu
     tetap berperan sebagai penasihat lewat voting yang sudah disempurnakan.
     """
+    result, panglima_vetoed = apply_panglima_greeks_veto(result, "ARBITRATE_START")
+    if panglima_vetoed:
+        return result
+
     # ========== FUNGSI PEMBANTU (biar rapi) =================================
     def _is_no_trade_zone(res: dict) -> bool:
         """Blokir entry hanya jika PREP/ACCUMULATION belum punya target liq jelas."""
@@ -12814,6 +13268,20 @@ def _should_allow_critical_lock(result: dict,
 
     opposite = "SHORT" if lock_bias == "LONG" else "LONG"
 
+    # RULE 0: Panglima veto. A LONG lock is not allowed after long liq has been
+    # swept and Greeks is actively killing LONG traders.
+    if lock_bias == "LONG":
+        panglima_veto, _ = _detect_panglima_long_veto_context(result, lock_bias)
+        if panglima_veto:
+            return False
+    if lock_bias == "SHORT":
+        panglima_veto, _ = _detect_panglima_short_veto_context(result, lock_bias)
+        if panglima_veto:
+            return False
+    hawkes_mtf_veto, _ = _detect_hawkes_mtf_veto_context(result, lock_bias)
+    if hawkes_mtf_veto:
+        return False
+
     # ── RULE 1: Fuel kosong + liq micro = jangan SHORT ──
     if lock_bias == "SHORT" and fuel <= 0 and short_liq < 0.3:
         return False
@@ -13966,6 +14434,24 @@ def oversold_long_liq_close_distribution_trap_v2(result: dict) -> tuple:
             f" | [DISTRIBUSI_SELESAI] OBV negatif tapi liq_7pct={liq_7pct}, "
             f"gamma_exec={gamma_exec}, agg={agg_val:.2f}, hawkes={hawkes_val} "
             f"-> distribusi selesai, CANCEL OVERSOLD_DISTRIBUTION_TRAP"
+        )
+        return result, False
+
+    # Guard: jangan SHORT jika distribusi sudah selesai dan buyer/bid mulai dominan.
+    ofi_b = result.get("ofi_bias", "NEUTRAL")
+    bid_s = result.get("bid_slope", 0) or 0
+    ask_s = result.get("ask_slope", 1) or 1
+    up_e = result.get("up_energy", 0) or 0
+    double_extreme_oversold = rsi6 < 20 and rsi6_5m < 20
+    buyer_dominant = agg_val > 0.7 and ofi_b == "LONG" and up_e > 0.5
+    bid_dominant = bid_s > ask_s * 1.2
+
+    if double_extreme_oversold and buyer_dominant and bid_dominant:
+        result["_oversold_distribution_trap_blocked"] = True
+        result["reason"] = result.get("reason", "") + (
+            f" | [OVERSOLD_DISTRIBUTION_BLOCKED] double oversold RSI={rsi6:.1f}/{rsi6_5m:.1f}, "
+            f"agg={agg_val:.2f}, OFI={ofi_b}, up_energy={up_e:.2f}, bid/ask={bid_s:.0f}/{ask_s:.0f} "
+            f"-> distribusi selesai, bounce imminent, jangan force SHORT"
         )
         return result, False
 
@@ -16563,8 +17049,24 @@ class OversoldDistributionContinuation:
     @staticmethod
     def detect(change_5m: float, rsi6: float, long_liq: float, short_liq: float = 99.0,
                obv_trend: str = "NEUTRAL", obv_value: float = 0.0, volume_ratio: float = 1.0,
-               agg: float = 0.5, ofi_bias: str = "NEUTRAL") -> Dict:
+               agg: float = 0.5, ofi_bias: str = "NEUTRAL", rsi6_5m: float = 50.0,
+               bid_slope: float = 0.0, ask_slope: float = 1.0, up_energy: float = 0.0) -> Dict:
         
+        ask_ref = ask_slope if ask_slope else 1.0
+        double_extreme_oversold = rsi6 < 20 and rsi6_5m < 20
+        buyer_dominant = agg > 0.7 and ofi_bias == "LONG" and up_energy > 0.5
+        bid_dominant = bid_slope > ask_ref * 1.2
+
+        if double_extreme_oversold and buyer_dominant and bid_dominant:
+            return {
+                "override": False,
+                "reason": (
+                    f"OVERSOLD DISTRIBUTION BLOCKED: double oversold RSI={rsi6:.1f}/{rsi6_5m:.1f}, "
+                    f"agg={agg:.2f}, OFI={ofi_bias}, up_energy={up_energy:.2f}, "
+                    f"bid/ask={bid_slope:.0f}/{ask_ref:.0f} -> bounce imminent, jangan SHORT"
+                )
+            }
+
         # Kasus SHORT: oversold tapi OBV negatif ekstrem → masih dump
         if (change_5m < -2.0 and
             rsi6 < 30 and
@@ -28187,6 +28689,25 @@ class BinanceAnalyzer:
         4. Gamma Delay (Gamma EXTREME tapi delta exposure < 0.95 => tunda)
         5. Entry Filter (tambahkan rekomendasi entry di output)
         """
+        # Rule 6 harus berlaku di semua path: jika regime detector sudah
+        # menandai MANIPULATION/SKIP, detector high-priority tidak boleh
+        # return lebih dulu dan memaksa entry.
+        if result.get("regime_skip"):
+            result["bias"] = "NEUTRAL"
+            result["bias_display"] = "NEUTRAL"
+            result["confidence"] = "BLOCK"
+            result["entry_allowed"] = False
+            result["priority_level"] = -99998
+            result["_final_bias_locked"] = "NEUTRAL"
+            result["_override_critical_lock"] = True
+            result["_override_critical_source"] = "REGIME_SKIP_RULE_6"
+            result["reason"] = (
+                f"[REGIME_SKIP_RULE_6] {result.get('regime_reason', 'Manipulation/skip regime')} "
+                "-> NO TRADE sebelum detector override apa pun. | "
+                + result.get("reason", "")
+            )
+            return result
+
         # ========== HAPUS PAKSA SEMUA BLOK ==========
         # Jika sinyal sudah LONG/SHORT, jangan pedulikan fase atau veto
         if result.get("bias") in ("LONG", "SHORT"):
@@ -28409,6 +28930,31 @@ class BinanceAnalyzer:
                 result = apply_critical_override_lock(result, "REVERSE_BAIT_PROTECTED")
                 return result
 
+        # ========== FAKE EXHAUSTION CONTINUATION GUARD (PRIORITY -31010) ==========
+        fake_exhaust = FakeExhaustionContinuationGuard.detect(
+            change_5m=result.get("change_5m", 0),
+            long_liq=result.get("long_liq", 99),
+            up_energy=result.get("up_energy", 0),
+            agg=result.get("agg", 0.5),
+            greeks_kill_direction=result.get("greeks_kill_direction", ""),
+            greeks_liq_7pct=result.get("greeks_liq_7pct", "BOTH"),
+            rsi6_5m=result.get("rsi6_5m", 50),
+            down_energy=result.get("down_energy", 0),
+            ofi_bias=result.get("ofi_bias", "NEUTRAL"),
+            ofi_strength=result.get("ofi_strength", 0.0)
+        )
+        if fake_exhaust["override"]:
+            result["bias"] = fake_exhaust["bias"]
+            result["confidence"] = "ABSOLUTE"
+            result["reason"] = f"[FAKE EXHAUST GUARD] {fake_exhaust['reason']} | " + result.get("reason", "")
+            result["priority_level"] = fake_exhaust["priority"]
+            result["entry_allowed"] = True
+            result["_liquidity_extreme_override"] = False
+            result["_exhaustion_gate_triggered"] = False
+            result["_hawkes_gate_triggered"] = False
+            result = apply_critical_override_lock(result, "FAKE_EXHAUSTION_GUARD")
+            return result
+
         # ========== POST-SQUEEZE EXHAUSTION GATE (PRIORITY -31000) ==========
         # Batalkan sinyal LONG jika squeeze sudah selesai dan akan reversal
         exhaustion = PostSqueezeExhaustionDetector.detect(result)
@@ -28572,22 +29118,39 @@ class BinanceAnalyzer:
             micro_extreme = (ofi_strength > 0.95 and ofi_bias != "NEUTRAL") or \
                             (agg > 0.95 or agg < 0.05)
             if micro_extreme:
-                fundamental = algo_bias if algo_bias != "NEUTRAL" else \
-                              greeks_kill if greeks_kill != "NEUTRAL" else \
-                              hft_bias
-                if fundamental != "NEUTRAL" and fundamental != ofi_bias:
-                    # Veto! Mikro bertentangan dengan fundamental
-                    result["bias"] = fundamental
-                    result["confidence"] = "ABSOLUTE"
-                    result["priority_level"] = -10110
-                    result["entry_allowed"] = True
+                rsi6_5m_val = result.get("rsi6_5m", 50)
+                exchange_dir_val = result.get("exchange_safe_direction", "NEUTRAL")
+                exchange_score_val = result.get("exchange_risk_score", 0)
+                capitulation_genuine = (
+                    rsi6_5m_val < 20 and
+                    exchange_dir_val == "LONG" and
+                    result.get("up_energy", 0) > 1.0
+                )
+                if capitulation_genuine:
+                    result["_ultra_low_vol_spoof_veto_blocked"] = True
                     result["reason"] = (
-                        f"[ULTRA LOW VOL SPOOF VETO] Vol {volume_ratio:.2f}x, "
-                        f"OFI/Agg ekstrem ({ofi_bias} {ofi_strength:.2f}, agg {agg:.2f}) "
-                        f"tapi fundamental={fundamental}. Sinyal mikro adalah spoof. "
-                        f"Paksa {fundamental}. | " + result.get("reason", "")
+                        f"[ULTRA LOW VOL SPOOF VETO BLOCKED] RSI5m={rsi6_5m_val:.1f} extreme oversold, "
+                        f"exchange={exchange_dir_val} score={exchange_score_val}, "
+                        f"up_energy={result.get('up_energy', 0):.2f} -> capitulation genuine. | "
+                        + result.get("reason", "")
                     )
-                    return result
+                else:
+                    fundamental = algo_bias if algo_bias != "NEUTRAL" else \
+                                  greeks_kill if greeks_kill != "NEUTRAL" else \
+                                  hft_bias
+                    if fundamental != "NEUTRAL" and fundamental != ofi_bias:
+                        # Veto! Mikro bertentangan dengan fundamental
+                        result["bias"] = fundamental
+                        result["confidence"] = "ABSOLUTE"
+                        result["priority_level"] = -10110
+                        result["entry_allowed"] = True
+                        result["reason"] = (
+                            f"[ULTRA LOW VOL SPOOF VETO] Vol {volume_ratio:.2f}x, "
+                            f"OFI/Agg ekstrem ({ofi_bias} {ofi_strength:.2f}, agg {agg:.2f}) "
+                            f"tapi fundamental={fundamental}. Sinyal mikro adalah spoof. "
+                            f"Paksa {fundamental}. | " + result.get("reason", "")
+                        )
+                        return result
 
         # ========== END OF LANGKAH 6 ==========
         
@@ -28769,7 +29332,13 @@ class BinanceAnalyzer:
             ofi_strength=ofi_strength,
             funding_rate=funding_rate,
             change_5m=change_5m,
-            volume_ratio=volume_ratio
+            volume_ratio=volume_ratio,
+            rsi6_5m=rsi6_5m,
+            exchange_safe_direction=result.get("exchange_safe_direction", "NEUTRAL"),
+            hawkes_mtf_direction=result.get("_hawkes_mtf_direction", "NEUTRAL"),
+            hawkes_mtf_dominant_tf=result.get("_hawkes_mtf_dominant_tf", ""),
+            hawkes_mtf_ratio=result.get("_hawkes_mtf_ratio", 0),
+            hawkes_mtf_momentum_quality=result.get("_hawkes_mtf_momentum_quality", "UNKNOWN")
         )
         if genuine_squeeze["override"]:
             result["bias"] = genuine_squeeze["bias"]
@@ -31119,7 +31688,10 @@ class BinanceAnalyzer:
             market_phase=result.get("market_phase", "UNKNOWN"),
             rsi6=rsi6_val,
             rsi6_5m=rsi6_5m_val,
-            down_energy=down_energy_val
+            down_energy=down_energy_val,
+            up_energy=up_energy_val,
+            exchange_safe_direction=result.get("exchange_safe_direction", "NEUTRAL"),
+            exchange_risk_score=result.get("exchange_risk_score", 0)
         )
         if ultra_low_vol["override"]:
             result["bias"] = ultra_low_vol["bias"]
@@ -34779,7 +35351,15 @@ class BinanceAnalyzer:
                     + result.get("reason", "")
                 )
 
+        result, panglima_vetoed = apply_panglima_greeks_veto(result, "STABILITY_FINAL")
+        if panglima_vetoed:
+            return result
+
         result = _resolve_neutral_to_bias(result)
+
+        result, panglima_vetoed = apply_panglima_greeks_veto(result, "STABILITY_POST_RESOLVE")
+        if panglima_vetoed:
+            return result
 
         return result
 
@@ -35198,12 +35778,22 @@ class BinanceAnalyzer:
                             change_5m=change_5m
                         )
 
+                        protect_exchange_risk = ExchangeRiskScore.calculate(
+                            funding_rate if funding_rate is not None else 0.0,
+                            liq["short_dist"],
+                            liq["long_dist"],
+                            volume_ratio,
+                            change_5m,
+                            oi_delta
+                        )
+
                         genuine_squeeze = ProtectGenuineShortSqueezeGuard.detect(
                             result={
                                 "short_liq": liq["short_dist"],
                                 "change_5m": change_5m,
                                 "greeks_gamma_executing": provisional_gamma.get("gamma_executing", False),
                                 "rsi6": rsi6,
+                                "rsi6_5m": rsi6_5m if rsi6_5m is not None else 50.0,
                                 "obv_trend": obv_trend,
                                 "obv_value": obv_value,
                                 "funding_rate": funding_rate if funding_rate is not None else 0.0,
@@ -35211,8 +35801,8 @@ class BinanceAnalyzer:
                                 "algo_type_bias": algo_type["bias"],
                                 "hft_6pct_bias": hft_6pct["bias"],
                                 "up_energy": up_energy,
-                                "exchange_safe_direction": "NEUTRAL",
-                                "exchange_risk_score": 0,
+                                "exchange_safe_direction": protect_exchange_risk.get("safe_direction", "NEUTRAL"),
+                                "exchange_risk_score": protect_exchange_risk.get("risk_score", 0),
                                 "volume_ratio": volume_ratio
                             }
                         )
@@ -35782,7 +36372,11 @@ class BinanceAnalyzer:
                             change_5m, rsi6,
                             liq["long_dist"], liq["short_dist"],
                             obv_trend, obv_value, volume_ratio,
-                            agg, ofi["bias"]
+                            agg, ofi["bias"],
+                            rsi6_5m=rsi6_5m,
+                            bid_slope=bid_slope,
+                            ask_slope=ask_slope,
+                            up_energy=up_energy
                         )
                         if not has_extreme_override and not post_squeeze.get("override") and not low_vol_dist.get("override") and not profit_reversal.get("override") and oversold_dist["override"]:
                             final_bias = oversold_dist["bias"]
@@ -37675,6 +38269,7 @@ class BinanceAnalyzer:
                 result["market_phase"] = locals().get("provisional_market_phase", "UNKNOWN")
                 result["priority_level"] = priority_guard.get("priority", result.get("priority_level", 0))
                 result["greeks_gamma_executing"] = locals().get("provisional_gamma", {}).get("gamma_executing", False)
+                result, _ = apply_panglima_greeks_veto(result, "PROVISIONAL_PRIORITY_GUARD")
                 return result
 
             # ========== MARKET PHASE DETECTOR INTEGRATION ==========
@@ -37705,6 +38300,7 @@ class BinanceAnalyzer:
                 result["reason"] = prep_vacuum["reason"]
                 result["priority_level"] = -30800
                 result["_liquidity_extreme_override"] = False
+                result, _ = apply_panglima_greeks_veto(result, "PREP_VACUUM")
                 return result   # langsung stop
             
             result = apply_phase_override(result, phase_result)
@@ -37875,6 +38471,19 @@ class BinanceAnalyzer:
             result["algo_type_bias"] = primary_algo
             result["hft_6pct_bias"] = primary_hft
             # ================================================================
+
+            # Hawkes MTF harus tersedia sebelum stability filters, karena
+            # beberapa squeeze detector perlu membedakan fresh momentum vs
+            # trend lama yang sudah exhausted.
+            pre_hawkes_mtf = compute_hawkes_multi_tf_intensity(self.symbol, fetcher=self.fetcher)
+            result["_hawkes_mtf_intensities"] = pre_hawkes_mtf.get("intensities", {})
+            result["_hawkes_mtf_dominant_tf"] = pre_hawkes_mtf.get("dominant_tf", "1m")
+            result["_hawkes_mtf_cascade"] = pre_hawkes_mtf.get("cascade_active", False)
+            result["_hawkes_mtf_hot_tfs"] = pre_hawkes_mtf.get("hot_timeframes", [])
+            result["_hawkes_mtf_ratio"] = pre_hawkes_mtf.get("baseline_ratio", 1.0)
+            result["_hawkes_mtf_direction"] = pre_hawkes_mtf.get("direction", "NEUTRAL")
+            result["_hawkes_mtf_signed_pressure"] = pre_hawkes_mtf.get("signed_pressure", {})
+            result["_hawkes_mtf_momentum_quality"] = pre_hawkes_mtf.get("momentum_quality", "UNKNOWN")
             
             result = self._apply_stability_filters(result, phase_result, {})
             
@@ -37908,6 +38517,27 @@ class BinanceAnalyzer:
                     result["position_multiplier"] = max(0.3, result["position_multiplier"])
                     result["reason"] += f" | Rotation risk: {rotation.get('reason', '')}"
 
+            # ========== HAWKES MULTI-TIMEFRAME INTENSITY ==========
+            hawkes_mtf = compute_hawkes_multi_tf_intensity(self.symbol, fetcher=self.fetcher)
+            result["_hawkes_mtf_intensities"] = hawkes_mtf.get("intensities", {})
+            result["_hawkes_mtf_dominant_tf"] = hawkes_mtf.get("dominant_tf", "1m")
+            result["_hawkes_mtf_cascade"] = hawkes_mtf.get("cascade_active", False)
+            result["_hawkes_mtf_hot_tfs"] = hawkes_mtf.get("hot_timeframes", [])
+            result["_hawkes_mtf_ratio"] = hawkes_mtf.get("baseline_ratio", 1.0)
+            result["_hawkes_mtf_direction"] = hawkes_mtf.get("direction", "NEUTRAL")
+            result["_hawkes_mtf_signed_pressure"] = hawkes_mtf.get("signed_pressure", {})
+            result["_hawkes_mtf_momentum_quality"] = hawkes_mtf.get("momentum_quality", "UNKNOWN")
+
+            if hawkes_mtf.get("cascade_active"):
+                result["position_multiplier"] = min(result.get("position_multiplier", 1.0), 0.3)
+                result["reason"] = (
+                    f"[HAWKES_CASCADE_ACTIVE] MTF liquidation intensity "
+                    f"{hawkes_mtf.get('baseline_ratio', 1.0):.1f}x baseline di "
+                    f"{hawkes_mtf.get('dominant_tf', '1m')} "
+                    f"(dir={hawkes_mtf.get('direction', 'NEUTRAL')}) -> size max 30%. | "
+                    + result.get("reason", "")
+                )
+
             # ========== DECISION AGGREGATOR: Evidence-Based Voting with Arbitration ==========
             # Ini adalah langkah terakhir sebelum return, menggantikan priority-based override chaos
             # PENTING: arbitrate_final_decision HARUS jadi keputusan FINAL - tidak boleh ada perubahan bias setelah ini
@@ -37928,6 +38558,8 @@ class BinanceAnalyzer:
             if pattern_risk != "NORMAL":
                 result["adversarial_pattern_risk"] = pattern_risk
                 result = self.pattern_memory.apply_risk_adjustment(result, pattern_risk)
+
+            result, _ = apply_panglima_greeks_veto(result, "ANALYZE_PRE_FINAL_LOCK")
 
             # ========== FINAL BIAS LOCK ==========
             # Setelah aggregator, bias TIDAK BOLEH diubah lagi
