@@ -113,6 +113,255 @@ def validate_signal_consistency(result: dict) -> bool:
     return True
 
 
+def _should_block_bearish_override_in_spring(result: dict) -> bool:
+    """
+    Mencegah sistem memaksakan SHORT ketika RSI 5m oversold (<30)
+    dan harga mulai naik dengan buying pressure (spring reversal).
+    Kondisi tambahan: short_liq < 5% dan lebih dekat dari long_liq.
+    """
+    rsi6_5m = result.get("rsi6_5m", 50)
+    up_energy = result.get("up_energy", 0)
+    down_energy = result.get("down_energy", 0)
+    change_5m = result.get("change_5m", 0)
+    short_liq = result.get("short_liq", 99)
+    long_liq = result.get("long_liq", 99)
+
+    # Spring: 5m oversold, harga mulai naik, dan ada tenaga beli.
+    if rsi6_5m < 30 and change_5m > 0 and up_energy > 0:
+        # Hindari dead-cat bounce: short_liq harus dekat dan lebih dekat dari long_liq.
+        if short_liq < 5.0 and short_liq < long_liq:
+            return True
+    return False
+
+
+def _should_block_bearish_override_in_overbought_squeeze(result: dict) -> bool:
+    """
+    Mencegah sistem memaksakan SHORT ketika RSI 5m overbought (>85)
+    tetapi short_liq masih dekat dan ada buying pressure.
+    Ini adalah squeeze continuation, bukan pullback.
+    """
+    rsi6_5m = result.get("rsi6_5m", 50)
+    up_energy = result.get("up_energy", 0)
+    down_energy = result.get("down_energy", 0)
+    change_5m = result.get("change_5m", 0)
+    short_liq = result.get("short_liq", 99)
+    long_liq = result.get("long_liq", 99)
+
+    # Guard hanya untuk overbought ekstrem.
+    if rsi6_5m < 85:
+        return False
+
+    # Short liq harus dekat dan lebih dekat dari long.
+    if not (short_liq < 3.0 and short_liq < long_liq):
+        return False
+
+    # Harus ada buying pressure nyata.
+    if up_energy <= 0:
+        return False
+
+    # Harga tidak sedang anjlok agar bukan falling knife yang tertunda.
+    if change_5m < -1.5:
+        return False
+
+    # Jangan blokir SHORT jika blow-off ekstrem atau short target sudah tersapu.
+    if rsi6_5m > 92:
+        return False
+    if short_liq > 0 and change_5m > short_liq * 1.3:
+        return False
+
+    return True
+
+
+def _should_block_bearish_override_in_rsi6_extreme_squeeze(result: dict) -> bool:
+    """
+    Mencegah sistem memaksakan SHORT ketika RSI 1m = 100 (pump super cepat)
+    tapi RSI 5m masih netral, short_liq sangat dekat, dan ada buying pressure.
+    Ini adalah momentum squeeze 1m yang belum exhausted di 5m.
+    """
+    rsi6 = result.get("rsi6", 50)
+    rsi6_5m = result.get("rsi6_5m", 50)
+    up_energy = result.get("up_energy", 0)
+    short_liq = result.get("short_liq", 99)
+    long_liq = result.get("long_liq", 99)
+    change_5m = result.get("change_5m", 0)
+    funding = result.get("funding_rate", 0) or 0.0
+
+    # Guard hanya untuk RSI 1m di atas 99 (ekstrem absolut).
+    if rsi6 < 99:
+        return False
+
+    # RSI 5m belum boleh overbought agar tidak tumpang tindih dengan guard sebelumnya.
+    if rsi6_5m >= 85:
+        return False
+
+    # Short liq harus sangat dekat.
+    if not (short_liq < 1.5 and short_liq < long_liq):
+        return False
+
+    # Harus ada buying pressure nyata.
+    if up_energy <= 0:
+        return False
+
+    # Harga harus sudah naik.
+    if change_5m <= 0:
+        return False
+
+    # Hindari funding sangat positif (crowded long) yang bisa jadi genuine dump.
+    if funding > 0.003:
+        return False
+
+    return True
+
+
+def _should_block_bearish_override_when_greeks_long_and_short_liq_close(result: dict) -> bool:
+    """
+    Mencegah sistem memaksakan SHORT ketika Greeks sudah committed LONG,
+    short_liq sangat dekat, dan ada konsensus squeeze.
+    """
+    short_liq = result.get("short_liq", 99)
+    long_liq = result.get("long_liq", 99)
+    change_5m = result.get("change_5m", 0)
+    greeks_kill = result.get("greeks_kill_direction", "")
+    delta_crowded = result.get("greeks_delta_crowded", "")
+    pre_kill = result.get("greeks_pre_kill", {})
+    up_energy = result.get("up_energy", 0)
+    down_energy = result.get("down_energy", 0)
+    gamma_intensity = result.get("greeks_gamma_intensity", "LOW")
+    kill_speed = result.get("greeks_kill_speed", 0)
+
+    if not isinstance(pre_kill, dict):
+        pre_kill = {}
+
+    # Short liq harus ultra dekat (target squeeze nyata).
+    if not (short_liq < 1.0 and short_liq < long_liq):
+        return False
+
+    # Greeks harus committed LONG.
+    greeks_long = (
+        greeks_kill == "LONG" or
+        delta_crowded == "SHORT" or
+        pre_kill.get("bias") == "LONG"
+    )
+    if not greeks_long:
+        return False
+
+    # Harus ada buying pressure.
+    if down_energy > up_energy:
+        return False
+
+    # Harga harus bergerak naik, meskipun mungkin sudah melewati short_liq.
+    if change_5m <= 0:
+        return False
+
+    # Jika sudah melewati short_liq, Greeks harus sangat yakin.
+    if change_5m >= short_liq:
+        if not (
+            gamma_intensity in ("HIGH", "EXTREME") or
+            kill_speed > 2.0 or
+            pre_kill.get("override")
+        ):
+            return False
+
+    return True
+
+
+def _is_high_up_energy_oversold_accumulation(result: dict) -> bool:
+    """
+    Deteksi akumulasi diam-diam di area oversold dengan up_energy tinggi.
+    HFT menggunakan sell order palsu untuk menakuti retail sambil akumulasi LONG.
+    """
+    rsi6 = result.get("rsi6", 50)
+    up_energy = result.get("up_energy", 0)
+    down_energy = result.get("down_energy", 0)
+    change_5m = result.get("change_5m", 0)
+    short_liq = result.get("short_liq", 99)
+    long_liq = result.get("long_liq", 99)
+
+    return (
+        up_energy > 3.0 and
+        rsi6 < 30 and
+        change_5m < 0 and
+        down_energy < 0.1 and
+        short_liq < long_liq
+    )
+
+
+def _resolve_neutral_to_bias(result: dict) -> dict:
+    """
+    Jika ada liq yang jelas lebih dekat, NEUTRAL tanpa hard block dikonversi
+    menjadi directional bias dengan confidence menengah/tinggi.
+    """
+    if result.get("bias") != "NEUTRAL":
+        return result
+    if result.get("entry_allowed") == False:
+        return result
+
+    short_liq = result.get("short_liq", 99)
+    long_liq = result.get("long_liq", 99)
+    greeks_kill = result.get("greeks_kill_direction", "")
+    liq_7pct = result.get("greeks_liq_7pct", "BOTH")
+    up_energy = result.get("up_energy", 0)
+    down_energy = result.get("down_energy", 0)
+
+    if liq_7pct == "SHORT_TRADERS_DIE":
+        result["bias"] = "LONG"
+        result["confidence"] = "HIGH"
+        result["entry_allowed"] = True
+        result["reason"] = (
+            f"[NEUTRAL_RESOLVED] liq_7pct=SHORT_TRADERS_DIE -> target jelas LONG. "
+            f"short_liq={short_liq:.2f}%, kill={greeks_kill}. "
+            + result.get("reason", "")
+        )
+        return result
+
+    if liq_7pct == "LONG_TRADERS_DIE":
+        result["bias"] = "SHORT"
+        result["confidence"] = "HIGH"
+        result["entry_allowed"] = True
+        result["reason"] = (
+            f"[NEUTRAL_RESOLVED] liq_7pct=LONG_TRADERS_DIE -> target jelas SHORT. "
+            f"long_liq={long_liq:.2f}%, kill={greeks_kill}. "
+            + result.get("reason", "")
+        )
+        return result
+
+    liq_ratio_long = short_liq / max(long_liq, 0.01)
+    liq_ratio_short = long_liq / max(short_liq, 0.01)
+
+    if (
+        liq_ratio_long < 0.5 and
+        greeks_kill == "LONG" and
+        up_energy > down_energy and
+        down_energy < 0.1
+    ):
+        result["bias"] = "LONG"
+        result["confidence"] = "HIGH"
+        result["entry_allowed"] = True
+        result["reason"] = (
+            f"[NEUTRAL_RESOLVED] short_liq={short_liq:.2f}% << long_liq={long_liq:.2f}%, "
+            f"kill=LONG, energy=LONG -> arah LONG. "
+            + result.get("reason", "")
+        )
+        return result
+
+    if (
+        liq_ratio_short < 0.5 and
+        greeks_kill == "SHORT" and
+        down_energy > up_energy * 0.3
+    ):
+        result["bias"] = "SHORT"
+        result["confidence"] = "HIGH"
+        result["entry_allowed"] = True
+        result["reason"] = (
+            f"[NEUTRAL_RESOLVED] long_liq={long_liq:.2f}% << short_liq={short_liq:.2f}%, "
+            f"kill=SHORT -> arah SHORT. "
+            + result.get("reason", "")
+        )
+        return result
+
+    return result
+
+
 # ================= POST-SQUEEZE EXHAUSTION DETECTOR =================
 class PostSqueezeExhaustionDetector:
     """
@@ -121,6 +370,13 @@ class PostSqueezeExhaustionDetector:
     """
     @staticmethod
     def detect(data: dict) -> dict:
+        # Guard 0: reverse bait yang sudah terdeteksi tidak boleh dikalahkan exhaustion.
+        if data.get("_reverse_bait_detected"):
+            return {
+                "override": False,
+                "reason": "Reverse bait aktif - exhaustion dibatalkan"
+            }
+
         raw_change_5m = data.get("change_5m", 0)
         change_5m = abs(raw_change_5m)
         volume_ratio = data.get("volume_ratio", 1.0)
@@ -1303,18 +1559,17 @@ class MicroLiqSweepThenReverse:
 
         return {
             "override": True,
-            "bias": "NEUTRAL",
+            "bias": "LONG",
             "entry_allowed": False,
-            "confidence": "BLOCK",
+            "confidence": "MEDIUM",
             "priority": -30745,
             "reason": (
-                f"MICRO_LIQ_SWEEP_THEN_REVERSE: long_liq={long_liq:.2f}% "
-                f"(micro, bukan target dump), short_liq={short_liq:.2f}% "
-                f"(target squeeze sesungguhnya {short_liq/max(long_liq,0.001):.0f}x lebih jauh). "
+                f"MICRO_LIQ_SWEEP_SETUP: long_liq={long_liq:.2f}% micro akan tersapu, "
+                f"setelah itu short_liq={short_liq:.2f}% adalah target berikutnya. "
                 f"Context_score={score}: exchange={exchange_dir}({exchange_score}), "
                 f"gamma={gamma_exec}, agg={agg_val:.2f}, ofi={ofi_b}({ofi_str:.2f}), "
                 f"funding={funding:.4f}, rsi={rsi6:.1f} → "
-                f"HFT akan micro-sweep long_liq lalu flip LONG. NO TRADE."
+                f"Tunggu konfirmasi post-sweep. Bias LONG disiapkan."
             )
         }
 
@@ -1348,6 +1603,9 @@ class UltraCloseLiqFakeVacuumTrap:
             ask_s           = result.get("ask_slope", 1)
             short_liq_val   = result.get("short_liq", 99)
             long_liq_val    = result.get("long_liq", 99)
+            change_5m_val   = result.get("change_5m", 0)
+            up_e            = result.get("up_energy", 0)
+            down_e          = result.get("down_energy", 0)
 
             long_context = 0
             if exchange_dir == "LONG" and exchange_score >= 7: long_context += 3
@@ -1359,8 +1617,17 @@ class UltraCloseLiqFakeVacuumTrap:
             if bid_s > ask_s * 1.5:                            long_context += 1
             if short_liq_val > long_liq_val * 10:              long_context += 2
             if long_liq_val < 0.2:                             long_context += 2
+            if change_5m_val < -3.0 and up_e > 0.5 and down_e < 0.01:
+                long_context += 2
 
-            if long_context >= 8:
+            extreme_oversold = rsi6_val < 25 and stoch_j_val < 0
+            threshold = 6 if (
+                exchange_dir == "LONG" and
+                exchange_score >= 7 and
+                extreme_oversold
+            ) else 8
+
+            if long_context >= threshold:
                 return {"override": False}
         
         # FIX 3: Pensiunkan detector ini untuk BAIT & PREP phase
@@ -1467,6 +1734,58 @@ class HighEnergyAccumulationPreSqueeze:
                 f"short_liq={short_liq:.2f}% < long_liq={long_liq:.2f}% → target squeeze valid. "
                 f"algo={algo_bias}, hft={hft_bias}, agg={agg:.2f} → Force LONG."
             )
+        }
+
+
+class GenuineMicroShortSqueezeOverride:
+    PRIORITY = -30800
+
+    @staticmethod
+    def detect(up_energy, down_energy, volume_ratio, short_liq, long_liq,
+               ofi_bias, ofi_strength, agg, change_5m, funding_rate):
+        if short_liq >= 1.0 or long_liq / max(short_liq, 0.0001) < 5.0:
+            return {"override": False}
+        if up_energy < max(4.0, volume_ratio * 10):
+            return {"override": False}
+        if ofi_bias != "LONG" or ofi_strength < 0.7:
+            if agg < 0.7:
+                return {"override": False}
+        if funding_rate is not None and funding_rate > 0.003:
+            return {"override": False}
+        if change_5m < 0:
+            return {"override": False}
+        return {
+            "override": True,
+            "bias": "LONG",
+            "reason": (
+                f"GENUINE MICRO SHORT SQUEEZE: short_liq={short_liq:.2f}% ultra close, "
+                f"up_energy={up_energy:.2f}, order flow bullish -> take out short stops first, force LONG"
+            ),
+            "priority": GenuineMicroShortSqueezeOverride.PRIORITY
+        }
+
+
+class ExhaustedSqueezeAbsoluteReversal:
+    PRIORITY = -31050
+
+    @staticmethod
+    def detect(change_5m, short_liq, long_liq, rsi6_5m, rsi6, volume_ratio, down_energy):
+        if change_5m <= short_liq * 1.5:
+            return {"override": False}
+        if rsi6_5m < 90 and rsi6 < 95:
+            return {"override": False}
+        if long_liq <= short_liq * 3:
+            return {"override": False}
+        if volume_ratio >= 0.8:
+            return {"override": False}
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"EXHAUSTED SQUEEZE ABSOLUTE: short swept ({change_5m:.1f}% > {short_liq * 1.5:.1f}%), "
+                f"RSI extreme ({rsi6_5m:.1f}/{rsi6:.1f}), target dump {long_liq:.2f}% -> force SHORT"
+            ),
+            "priority": ExhaustedSqueezeAbsoluteReversal.PRIORITY
         }
 
 
@@ -2418,10 +2737,19 @@ class UpEnergyAbsorbedBearish:
 class KillDirectionOverboughtGuard:
     """Refined - Lebih ketat"""
     @staticmethod
-    def detect(kill_direction, rsi6_5m, gamma_executing, kill_speed):
+    def detect(kill_direction, rsi6_5m, gamma_executing, kill_speed,
+               up_energy=0, down_energy=0, agg=0.5, liq_7pct="BOTH"):
         if kill_direction != "LONG" or gamma_executing or kill_speed > 1.0:
             return {"override": False}
         if rsi6_5m < 80:
+            return {"override": False}
+
+        # Jangan SHORT jika buyer pressure tinggi dan tidak ada seller nyata.
+        if up_energy > 1.5 and down_energy < 0.1:
+            return {"override": False}
+
+        # NONE_IN_RANGE = tidak ada target 7%, jangan force overbought shortcut.
+        if liq_7pct == "NONE_IN_RANGE":
             return {"override": False}
 
         return {
@@ -5520,7 +5848,7 @@ class MaximumCrowdingAbsoluteBlock:
         
         if exchange_risk_score < 6:
             return {"override": False}
-        
+
         if kill_direction != "SHORT":
             return {"override": False}
         
@@ -6757,6 +7085,30 @@ class ExchangeRiskScoreHardBlock:
             agg_val      = result.get("agg", 0.5)
             algo_bias    = result.get("algo_type_bias", "NEUTRAL")
             hft_bias     = result.get("hft_6pct_bias", "NEUTRAL")
+
+            long_liq_val = result.get("long_liq", long_liq)
+            short_liq_val = result.get("short_liq", short_liq)
+            funding_val = result.get("funding_rate", funding_rate) or 0.0
+            if (
+                exchange_safe_direction == "LONG" and
+                long_liq_val < 1.0 and
+                long_liq_val < short_liq_val and
+                funding_val > 0.0005
+            ):
+                return {"override": False}
+
+            change_5m_val = result.get("change_5m", 0)
+            up_e = result.get("up_energy", 0)
+            down_e = result.get("down_energy", 1)
+            rsi6_v = result.get("rsi6", 50)
+            if (
+                exchange_safe_direction == "SHORT" and
+                change_5m_val < -4.0 and
+                up_e > 2.0 and
+                down_e < 0.01 and
+                rsi6_v < 40
+            ):
+                return {"override": False}
             
             # Exchange mau LONG tapi semua bilang SHORT
             if (exchange_safe_direction == "LONG" and
@@ -9770,13 +10122,24 @@ class ExchangeSafeDirectionRespector:
         up_energy: float,
         down_energy: float,
         long_liq: float,
-        short_liq: float
+        short_liq: float,
+        change_5m: float = 0.0,
+        rsi6: float = 50.0
     ) -> dict:
         
         if exchange_safe_direction == "NEUTRAL":
             return {"override": False}
         
         if exchange_risk_score < 4:
+            return {"override": False}
+
+        if (
+            exchange_safe_direction == "SHORT" and
+            change_5m < -4.0 and
+            up_energy > 2.0 and
+            down_energy < 0.01 and
+            rsi6 < 40
+        ):
             return {"override": False}
         
         # Bias harus berlawanan dengan exchange recommendation
@@ -11232,21 +11595,37 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
     """
     # ========== FUNGSI PEMBANTU (biar rapi) =================================
     def _is_no_trade_zone(res: dict) -> bool:
-        """Blokir entry jika PREP/ACCUMULATION HIGH RISK tanpa konfirmasi gila."""
+        """Blokir entry hanya jika PREP/ACCUMULATION belum punya target liq jelas."""
         phase = res.get("market_phase", "UNKNOWN")
         regime = res.get("market_regime", "UNKNOWN")
         risk = res.get("regime_risk", "UNKNOWN")
-        # PREP phase = absolut NO TRADE kecuali ada gamma execute skor 4+ dan vol spike
+        short_liq = res.get("short_liq", 99)
+        long_liq = res.get("long_liq", 99)
+        greeks_kill = res.get("greeks_kill_direction", "")
+        liq_7pct = res.get("greeks_liq_7pct", "BOTH")
+
+        liq_clear = (
+            (short_liq < long_liq * 0.6 and greeks_kill == "LONG") or
+            (long_liq < short_liq * 0.6 and greeks_kill == "SHORT") or
+            liq_7pct in ("SHORT_TRADERS_DIE", "LONG_TRADERS_DIE")
+        )
+        if liq_clear:
+            return False
+
         if phase == "PREP":
             exec_score = res.get("greeks_gamma_exec_score", 0)
-            vol_spike = (res.get("latest_volume", 0) / max(res.get("volume_ma10", 1), 1))
-            if not (res.get("greeks_gamma_executing") and exec_score >= 4 and vol_spike >= 2.5):
-                return True
-        # ACCUMULATION + HIGH RISK -> jangan entry
+            if res.get("greeks_gamma_executing") and exec_score >= 2:
+                return False
+            if short_liq < 1.5 or long_liq < 1.5:
+                return False
+            return True
+
         if regime == "ACCUMULATION" and risk == "HIGH_RISK":
-            # Kecuali ada sinyal kill yang sudah executing & short_liq < 0.5%
-            if not (res.get("greeks_gamma_executing") and res.get("short_liq", 99) < 0.5):
-                return True
+            if res.get("greeks_gamma_executing") and short_liq < 1.5:
+                return False
+            if liq_7pct in ("SHORT_TRADERS_DIE", "LONG_TRADERS_DIE"):
+                return False
+            return True
         return False
 
     def _physics_lock_valid(res: dict) -> bool:
@@ -11308,9 +11687,208 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
             return (kill_dir == "SHORT" or (agg < 0.2 and up_energy < 0.01))
         return False
 
+    def _spring_reversal_allowed(res: dict) -> bool:
+        lock_source = str(res.get("_override_critical_source", ""))
+        hawkes_final = (
+            res.get("_hawkes_gate_triggered") or
+            res.get("_squeeze_validity_gate_triggered") or
+            lock_source.startswith("HAWKES")
+        )
+        return (
+            _should_block_bearish_override_in_spring(res) and
+            res.get("bias") == "SHORT" and
+            not hawkes_final and
+            not res.get("_thin_short_liq_decoy_fade")
+        )
+
+    def _apply_spring_reversal(res: dict) -> dict:
+        res["bias"] = "LONG"
+        res["confidence"] = "ABSOLUTE"
+        res["priority_level"] = -32000
+        res["entry_allowed"] = True
+        res["reason"] = (
+            "[SPRING REVERSAL] 5m RSI oversold + up energy + short liq dekat -> "
+            "cancel all SHORT, force LONG. "
+            + res.get("reason", "")
+        )
+        res["_final_bias_locked"] = "LONG"
+        res["_override_critical_source"] = "SPRING_REVERSAL"
+        return apply_critical_override_lock(res, "SPRING_REVERSAL")
+
+    def _overbought_squeeze_allowed(res: dict) -> bool:
+        lock_source = str(res.get("_override_critical_source", ""))
+        hawkes_final = (
+            res.get("_hawkes_gate_triggered") or
+            res.get("_squeeze_validity_gate_triggered") or
+            lock_source.startswith("HAWKES")
+        )
+        return (
+            _should_block_bearish_override_in_overbought_squeeze(res) and
+            res.get("bias") == "SHORT" and
+            not hawkes_final and
+            not res.get("_thin_short_liq_decoy_fade")
+        )
+
+    def _apply_overbought_squeeze(res: dict) -> dict:
+        res["bias"] = "LONG"
+        res["confidence"] = "ABSOLUTE"
+        res["priority_level"] = -32100
+        res["entry_allowed"] = True
+        res["reason"] = (
+            "[OVERBOUGHT SQUEEZE CONT] RSI5m overbought tapi short_liq dekat + up energy "
+            "-> squeeze masih berjalan, batalkan semua sinyal SHORT. Force LONG. "
+            + res.get("reason", "")
+        )
+        res["_final_bias_locked"] = "LONG"
+        res["_override_critical_source"] = "OVERBOUGHT_SQUEEZE"
+        return apply_critical_override_lock(res, "OVERBOUGHT_SQUEEZE")
+
+    def _exhausted_squeeze_absolute_allowed(res: dict) -> bool:
+        lock_source = str(res.get("_override_critical_source", ""))
+        hawkes_final = (
+            res.get("_hawkes_gate_triggered") or
+            res.get("_squeeze_validity_gate_triggered") or
+            lock_source.startswith("HAWKES")
+        )
+        if hawkes_final or res.get("_reverse_bait_detected"):
+            return False
+        exhausted = ExhaustedSqueezeAbsoluteReversal.detect(
+            change_5m=res.get("change_5m", 0),
+            short_liq=res.get("short_liq", 99),
+            long_liq=res.get("long_liq", 99),
+            rsi6_5m=res.get("rsi6_5m", 50),
+            rsi6=res.get("rsi6", 50),
+            volume_ratio=res.get("volume_ratio", 1.0),
+            down_energy=res.get("down_energy", 0)
+        )
+        if exhausted.get("override"):
+            res["_exhausted_squeeze_absolute"] = exhausted
+            return True
+        return False
+
+    def _apply_exhausted_squeeze_absolute(res: dict) -> dict:
+        exhausted = res.pop("_exhausted_squeeze_absolute", None)
+        if not exhausted:
+            exhausted = ExhaustedSqueezeAbsoluteReversal.detect(
+                change_5m=res.get("change_5m", 0),
+                short_liq=res.get("short_liq", 99),
+                long_liq=res.get("long_liq", 99),
+                rsi6_5m=res.get("rsi6_5m", 50),
+                rsi6=res.get("rsi6", 50),
+                volume_ratio=res.get("volume_ratio", 1.0),
+                down_energy=res.get("down_energy", 0)
+            )
+        res["bias"] = exhausted["bias"]
+        res["confidence"] = "ABSOLUTE"
+        res["priority_level"] = exhausted["priority"]
+        res["entry_allowed"] = True
+        res["reason"] = f"[EXHAUSTED SQUEEZE ABSOLUTE] {exhausted['reason']} | " + res.get("reason", "")
+        res["_final_bias_locked"] = exhausted["bias"]
+        res["_override_critical_source"] = "EXHAUSTED_SQUEEZE_ABSOLUTE"
+        return apply_critical_override_lock(res, "EXHAUSTED_SQUEEZE_ABSOLUTE")
+
+    def _rsi6_extreme_squeeze_allowed(res: dict) -> bool:
+        lock_source = str(res.get("_override_critical_source", ""))
+        hawkes_final = (
+            res.get("_hawkes_gate_triggered") or
+            res.get("_squeeze_validity_gate_triggered") or
+            lock_source.startswith("HAWKES")
+        )
+        return (
+            _should_block_bearish_override_in_rsi6_extreme_squeeze(res) and
+            res.get("bias") == "SHORT" and
+            not hawkes_final and
+            not res.get("_thin_short_liq_decoy_fade")
+        )
+
+    def _apply_rsi6_extreme_squeeze(res: dict) -> dict:
+        res["bias"] = "LONG"
+        res["confidence"] = "ABSOLUTE"
+        res["priority_level"] = -32050
+        res["entry_allowed"] = True
+        res["reason"] = (
+            "[RSI6 EXTREME SQUEEZE] RSI1m=100 dengan RSI5m netral + short_liq ultra dekat "
+            "+ up_energy -> momentum squeeze belum habis, batalkan semua SHORT. Force LONG. "
+            + res.get("reason", "")
+        )
+        res["_final_bias_locked"] = "LONG"
+        res["_override_critical_source"] = "RSI6_EXTREME_SQUEEZE"
+        return apply_critical_override_lock(res, "RSI6_EXTREME_SQUEEZE")
+
+    def _greeks_long_short_liq_allowed(res: dict) -> bool:
+        lock_source = str(res.get("_override_critical_source", ""))
+        hawkes_final = (
+            res.get("_hawkes_gate_triggered") or
+            res.get("_squeeze_validity_gate_triggered") or
+            lock_source.startswith("HAWKES")
+        )
+        return (
+            _should_block_bearish_override_when_greeks_long_and_short_liq_close(res) and
+            res.get("bias") == "SHORT" and
+            not hawkes_final and
+            not res.get("_thin_short_liq_decoy_fade")
+        )
+
+    def _apply_greeks_long_short_liq(res: dict) -> dict:
+        res["bias"] = "LONG"
+        res["confidence"] = "ABSOLUTE"
+        res["priority_level"] = -31250
+        res["entry_allowed"] = True
+        res["reason"] = (
+            "[GREEKS LONG + SHORT LIQ CLOSE] Greeks kill LONG + short_liq <1.0% "
+            "+ up_energy + harga belum melewati target -> squeeze masih aktif, "
+            "batalkan exhaustion/exchange block. Force LONG. "
+            + res.get("reason", "")
+        )
+        res["_final_bias_locked"] = "LONG"
+        res["_override_critical_source"] = "GREEKS_LONG_SHORT_LIQ"
+        return apply_critical_override_lock(res, "GREEKS_LONG_SHORT_LIQ")
+
+    def _oversold_accumulation_allowed(res: dict) -> bool:
+        lock_source = str(res.get("_override_critical_source", ""))
+        hawkes_final = (
+            res.get("_hawkes_gate_triggered") or
+            res.get("_squeeze_validity_gate_triggered") or
+            lock_source.startswith("HAWKES")
+        )
+        return (
+            _is_high_up_energy_oversold_accumulation(res) and
+            res.get("bias") == "SHORT" and
+            not hawkes_final and
+            not res.get("_thin_short_liq_decoy_fade") and
+            not res.get("_reverse_bait_detected")
+        )
+
+    def _apply_oversold_accumulation(res: dict) -> dict:
+        res["bias"] = "LONG"
+        res["confidence"] = "ABSOLUTE"
+        res["priority_level"] = -30800
+        res["entry_allowed"] = True
+        res["reason"] = (
+            "[HIGH UP-ENERGY OVERSOLD ACCUMULATION] up_energy tinggi + RSI1m oversold + "
+            "harga koreksi + no seller -> akumulasi diam-diam, bukan fake pump. "
+            "Batalkan semua sinyal SHORT. Force LONG. "
+            + res.get("reason", "")
+        )
+        res["_final_bias_locked"] = "LONG"
+        res["_override_critical_source"] = "OVERSOLD_ACCUMULATION"
+        return apply_critical_override_lock(res, "OVERSOLD_ACCUMULATION")
+
     # ========== EKSEKUSI LAPISAN ============================================
 
     if has_critical_override_lock(result):
+        if _spring_reversal_allowed(result):
+            return _apply_spring_reversal(result)
+        if _exhausted_squeeze_absolute_allowed(result):
+            return _apply_exhausted_squeeze_absolute(result)
+        if _overbought_squeeze_allowed(result):
+            return _apply_overbought_squeeze(result)
+        if _rsi6_extreme_squeeze_allowed(result):
+            return _apply_rsi6_extreme_squeeze(result)
+        if _greeks_long_short_liq_allowed(result):
+            return _apply_greeks_long_short_liq(result)
+        if _oversold_accumulation_allowed(result):
+            return _apply_oversold_accumulation(result)
         result = apply_critical_override_lock(result, "ARBITRATE_EARLY_RETURN")
         locked_bias = result.get("_final_bias_locked", result.get("bias", "NEUTRAL"))
         if locked_bias in ("LONG", "SHORT", "NEUTRAL"):
@@ -11344,6 +11922,30 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
         result["reason"] = "[DECOY FADE LOCK] Thin short-liq decoy confirmed -> NO OVERRIDE. " + result.get("reason", "")
         result = apply_critical_override_lock(result, "DECOY_FADE_LOCK")
         return result
+
+    # --- LAPISAN 0.6: 5M OVERSOLD SPRING REVERSAL (LABUSDT PATTERN) --------
+    if _spring_reversal_allowed(result):
+        return _apply_spring_reversal(result)
+
+    # --- LAPISAN 0.65: EXHAUSTED SQUEEZE ABSOLUTE REVERSAL -----------------
+    if _exhausted_squeeze_absolute_allowed(result):
+        return _apply_exhausted_squeeze_absolute(result)
+
+    # --- LAPISAN 0.7: RSI5M OVERBOUGHT SQUEEZE CONTINUATION (LABUSDT v2) ----
+    if _overbought_squeeze_allowed(result):
+        return _apply_overbought_squeeze(result)
+
+    # --- LAPISAN 0.8: RSI6 EXTREME SQUEEZE (UBUSDT PATTERN) -----------------
+    if _rsi6_extreme_squeeze_allowed(result):
+        return _apply_rsi6_extreme_squeeze(result)
+
+    # --- LAPISAN 0.9: GREEKS LONG + SHORT LIQ CLOSE (UBUSDT 12:10) ----------
+    if _greeks_long_short_liq_allowed(result):
+        return _apply_greeks_long_short_liq(result)
+
+    # --- LAPISAN 0.10: HIGH UP-ENERGY OVERSOLD ACCUMULATION (LABUSDT 17:29) --
+    if _oversold_accumulation_allowed(result):
+        return _apply_oversold_accumulation(result)
 
     # --- LAPISAN 1: PHYSICS LOCK (Hawkes / Exhaustion) ---------------------
     if (result.get("_hawkes_gate_triggered") or result.get("_exhaustion_gate_triggered")) and _physics_lock_valid(result):
@@ -13081,6 +13683,12 @@ def absolute_agg_ofi_short_liq_override(result: dict) -> tuple:
     long_liq = result.get("long_liq", 99.0)
     funding_rate = result.get("funding_rate", 0) or 0.0
     delta_exposure = result.get("greeks_delta_exposure", 0.0)
+    rsi6_5m = result.get("rsi6_5m", 50)
+    squeeze_fuel = result.get("squeeze_fuel_score", 0)
+    volume_ratio = result.get("volume_ratio", 1.0)
+    greeks_kill = result.get("greeks_kill_direction", "")
+    exchange_dir = result.get("exchange_safe_direction", "NEUTRAL")
+    exchange_score = result.get("exchange_risk_score", 0)
 
     # Guard: crowded long + reverse bait.
     # Short_liq dekat bisa jadi umpan, bukan target squeeze genuine.
@@ -13088,9 +13696,27 @@ def absolute_agg_ofi_short_liq_override(result: dict) -> tuple:
         return result, False
 
     # ── GUARD EXHAUSTION: Jangan LONG jika RSI5m tinggi + energy lemah ──
-    rsi6_5m = result.get("rsi6_5m", 50)
-    up_energy_val = result.get("up_energy", 0)
-    if rsi6_5m > 85 and up_energy_val < 0.5:
+    if rsi6_5m > 85 and up_energy < 0.5:
+        return result, False
+
+    # Guard: RSI5m ceiling perlu fuel besar; fuel tipis = squeeze sudah habis.
+    if rsi6_5m >= 95 and squeeze_fuel <= 3:
+        return result, False
+
+    # Guard: fuel sangat rendah = tidak ada bahan bakar squeeze.
+    if squeeze_fuel <= 1:
+        return result, False
+
+    # Guard: funding negatif berarti short sudah crowded sebelumnya.
+    if funding_rate < -0.0001:
+        return result, False
+
+    # Guard: volume tipis + agg/OFI ekstrem mudah jadi spoofing di BAIT phase.
+    if volume_ratio < 0.4 and agg > 0.95 and ofi_strength > 0.95:
+        return result, False
+
+    # Guard: Greeks kill berlawanan + exchange SHORT.
+    if greeks_kill == "SHORT" and exchange_dir == "SHORT" and exchange_score >= 4:
         return result, False
 
     if (
@@ -13108,6 +13734,7 @@ def absolute_agg_ofi_short_liq_override(result: dict) -> tuple:
         result["priority_level"] = -30760
         result["entry_allowed"] = True
         result["_agg_ofi_short_liq_override"] = True
+        result["_override_critical_source"] = "AGG_OFI_SHORT_LIQ_OVERRIDE"
         result["reason"] = (
             f"[AGG_OFI_SHORT_LIQ_OVERRIDE] agg={agg:.2f}, OFI LONG {ofi_strength:.2f}, "
             f"down_energy=0, short_liq={short_liq:.2f}% dekat, long_liq={long_liq:.2f}% jauh "
@@ -27677,7 +28304,7 @@ class BinanceAnalyzer:
         # tidak bisa override kecuali score >= 8
         _greeks_consensus_locked = (
             greeks_absolute_short or greeks_absolute_long
-        ) and exch_score_now < 8
+        ) and exch_score_now <= 8
 
         # ========== EXTREME CRASH BOUNCE (PALING AWAL, PRIORITY -99999) ==========
         result, overridden = extreme_crash_bounce_override_v2(result, self.sequential_dump_tracker)
@@ -27736,6 +28363,26 @@ class BinanceAnalyzer:
         if overridden:
             return result
         
+        # ===== REVERSE BAIT PROTECTION =====
+        # Jika reverse bait sudah dikonfirmasi, exhaustion/override lain tidak boleh membaliknya.
+        if result.get("_reverse_bait_detected") and result.get("_reverse_bait_bias"):
+            rb_bias = result["_reverse_bait_bias"]
+            if result.get("bias") != rb_bias:
+                result["bias"] = rb_bias
+                result["confidence"] = "ABSOLUTE"
+                result["entry_allowed"] = True
+                result["priority_level"] = -99985
+                result["_final_bias_locked"] = rb_bias
+                result["_override_critical_source"] = "REVERSE_BAIT_PROTECTED"
+                result["reason"] = (
+                    f"[REVERSE_BAIT_PROTECTED] Reverse bait dikonfirmasi ({rb_bias}), "
+                    f"batalkan override yang berlawanan. "
+                    + result.get("_reverse_bait_reason", "")
+                    + " | " + result.get("reason", "")
+                )
+                result = apply_critical_override_lock(result, "REVERSE_BAIT_PROTECTED")
+                return result
+
         # ========== POST-SQUEEZE EXHAUSTION GATE (PRIORITY -31000) ==========
         # Batalkan sinyal LONG jika squeeze sudah selesai dan akan reversal
         exhaustion = PostSqueezeExhaustionDetector.detect(result)
@@ -27780,12 +28427,54 @@ class BinanceAnalyzer:
             result["entry_allowed"] = True
             return result
 
+        # ========== EXHAUSTED SQUEEZE ABSOLUTE REVERSAL (PRIORITY -31050) ==========
+        exhausted_abs = ExhaustedSqueezeAbsoluteReversal.detect(
+            change_5m=change_5m_val,
+            short_liq=short_liq,
+            long_liq=long_liq,
+            rsi6_5m=rsi6_5m_val,
+            rsi6=rsi6_val,
+            volume_ratio=volume_ratio,
+            down_energy=down_energy_val
+        )
+        if exhausted_abs["override"]:
+            result["bias"] = exhausted_abs["bias"]
+            result["confidence"] = "ABSOLUTE"
+            result["reason"] = f"[EXHAUSTED SQUEEZE ABSOLUTE] {exhausted_abs['reason']} | " + result.get("reason", "")
+            result["priority_level"] = exhausted_abs["priority"]
+            result["entry_allowed"] = True
+            result["_override_critical_source"] = "EXHAUSTED_SQUEEZE_ABSOLUTE"
+            result = apply_critical_override_lock(result, "EXHAUSTED_SQUEEZE_ABSOLUTE")
+            return result
+
+        # ========== GENUINE MICRO SHORT SQUEEZE (PRIORITY -30800) ==========
+        micro_sqz = GenuineMicroShortSqueezeOverride.detect(
+            up_energy=up_energy_val,
+            down_energy=down_energy_val,
+            volume_ratio=volume_ratio,
+            short_liq=short_liq,
+            long_liq=long_liq,
+            ofi_bias=ofi_bias,
+            ofi_strength=ofi_strength,
+            agg=agg_val,
+            change_5m=change_5m_val,
+            funding_rate=funding_rate_val
+        )
+        if micro_sqz["override"]:
+            result["bias"] = micro_sqz["bias"]
+            result["confidence"] = "ABSOLUTE"
+            result["reason"] = f"[GENUINE MICRO SHORT SQUEEZE] {micro_sqz['reason']} | " + result.get("reason", "")
+            result["priority_level"] = micro_sqz["priority"]
+            result["entry_allowed"] = True
+            return result
+
         # ========== HIGH UP ENERGY FAKE PUMP V2 (DEFERRED, PRIORITY -30750) ==========
         result, _high_up_energy_overridden = detect_high_up_energy_fake_pump_v2(result, defer_override=True)
 
         # ========== AGG+OFI+SHORT_LIQ OVERRIDE (AIOTUSDT, PRIORITY -30760) ==========
         result, overridden = absolute_agg_ofi_short_liq_override(result)
         if overridden:
+            result = apply_critical_override_lock(result, "AGG_OFI_SHORT_LIQ_OVERRIDE")
             return result
 
         # ========== ABSOLUTE AGG+OFI LONG OVERRIDE V3 (SWARMSUSDT/SOLVUSDT) ==========
@@ -28141,7 +28830,11 @@ class BinanceAnalyzer:
             kill_direction=greeks_kill,
             rsi6_5m=rsi6_5m,
             gamma_executing=gamma_executing,
-            kill_speed=result.get("greeks_kill_speed", 0.0)
+            kill_speed=abs(result.get("greeks_kill_speed", 0.0)),
+            up_energy=result.get("up_energy", 0),
+            down_energy=result.get("down_energy", 0),
+            agg=result.get("agg", 0.5),
+            liq_7pct=result.get("greeks_liq_7pct", "BOTH")
         )
         if kill_direction_ob_guard["override"]:
             result["bias"] = kill_direction_ob_guard["bias"]
@@ -28210,6 +28903,38 @@ class BinanceAnalyzer:
             no_vega_ambiguity = not (vega_active and who_dies == "BOTH_POSSIBLE")
 
             if target_ok and phase_ok and no_vega_ambiguity:
+                obv_now = result.get("obv_trend", "NEUTRAL")
+                obv_val = result.get("obv_value", 0)
+                ofi_b = result.get("ofi_bias", "NEUTRAL")
+                agg_now = result.get("agg", 0.5)
+                up_e = result.get("up_energy", 0)
+
+                # Guard: OBV distribusi masif + OFI/Agg buy = false SHORT signal.
+                false_short_signal = (
+                    algo_bias == "SHORT" and
+                    obv_now == "NEGATIVE_EXTREME" and
+                    abs(obv_val) > 300_000_000 and
+                    ofi_b == "LONG" and
+                    agg_now > 0.65 and
+                    up_e > 0.3
+                )
+
+                if false_short_signal:
+                    result["bias"] = "NEUTRAL"
+                    result["entry_allowed"] = False
+                    result["confidence"] = "BLOCK"
+                    result["priority_level"] = -10100
+                    result["_final_bias_locked"] = "NEUTRAL"
+                    result["_override_critical_source"] = "ALGO_HFT_OBV_OFI_CONFLICT"
+                    result["reason"] = (
+                        f"[ALGO_HFT_OBV_OFI_CONFLICT] Algo/HFT SHORT tapi "
+                        f"OBV={obv_now}({obv_val:,.0f}) vs OFI={ofi_b} agg={agg_now:.2f} "
+                        f"-> sinyal SHORT adalah manipulasi. NO TRADE. | "
+                        + result.get("reason", "")
+                    )
+                    result = apply_critical_override_lock(result, "ALGO_HFT_OBV_OFI_CONFLICT")
+                    return result
+
                 result["bias"] = algo_bias
                 result["confidence"] = "ABSOLUTE"
                 result["priority_level"] = -10100
@@ -31476,7 +32201,9 @@ class BinanceAnalyzer:
             up_energy=up_energy_val,
             down_energy=down_energy_val,
             long_liq=long_liq,
-            short_liq=short_liq
+            short_liq=short_liq,
+            change_5m=change_5m_val,
+            rsi6=rsi6_val
         )
         if exchange_safe_resp["override"]:
             result["bias"] = exchange_safe_resp["bias"]
@@ -34022,6 +34749,8 @@ class BinanceAnalyzer:
                     + result.get("reason", "")
                 )
 
+        result = _resolve_neutral_to_bias(result)
+
         return result
 
 
@@ -34359,6 +35088,18 @@ class BinanceAnalyzer:
                             provisional_greeks_data,
                             provisional_delta
                         )
+                        micro_sqz_guard = GenuineMicroShortSqueezeOverride.detect(
+                            up_energy=up_energy,
+                            down_energy=down_energy,
+                            volume_ratio=volume_ratio,
+                            short_liq=liq["short_dist"],
+                            long_liq=liq["long_dist"],
+                            ofi_bias=ofi["bias"],
+                            ofi_strength=ofi["strength"],
+                            agg=agg,
+                            change_5m=change_5m,
+                            funding_rate=funding_rate or 0.0
+                        )
                         fake_pump = HighUpEnergyFakePumpGuard.detect(
                             up_energy=up_energy,
                             down_energy=down_energy,
@@ -34522,7 +35263,22 @@ class BinanceAnalyzer:
 
                         # ===== KATUSUSDT FIX: Funding-Led Squeeze Shakeout Override (Priority -30800) =====
                         # Ini harus dicek PALING PERTAMA, bahkan sebelum High Up-Energy Fake Pump
-                        if shakeout_guard["override"]:
+                        if micro_sqz_guard["override"]:
+                            final_bias = micro_sqz_guard["bias"]
+                            final_reason = micro_sqz_guard["reason"]
+                            final_confidence = "ABSOLUTE"
+                            final_phase = "GENUINE_MICRO_SHORT_SQUEEZE"
+                            priority = micro_sqz_guard["priority"]
+                            prob_engine.add(final_bias, 10.0)
+                            _liquidity_extreme_override = False
+                            priority_guard_hard_return = {
+                                "bias": final_bias,
+                                "reason": final_reason,
+                                "confidence": final_confidence,
+                                "phase": final_phase,
+                                "priority": priority,
+                            }
+                        elif shakeout_guard["override"]:
                             final_bias = shakeout_guard["bias"]
                             final_reason = shakeout_guard["reason"]
                             final_confidence = "ABSOLUTE"
