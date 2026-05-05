@@ -13850,6 +13850,16 @@ def apply_liq_absolute_with_rsi_guard(result: dict) -> tuple:
     agg_val = result.get("agg", 0.5)
     up_energy_val = result.get("up_energy", 0)
     
+    # Variabel untuk BullishBookBearishFlowOverride detector
+    bid_slope = float(result.get("bid_slope", 1.0))
+    ask_slope = float(result.get("ask_slope", 0.0))
+    change_5m_val = float(result.get("change_5m", 0.0))
+    volume_ratio = float(result.get("volume_ratio", 1.0))
+    ofi_bias = result.get("ofi_bias", "NEUTRAL")
+    ofi_strength = float(result.get("ofi_strength", 0.0))
+    funding_rate_val = funding
+    obv_trend = result.get("obv_trend", "NEUTRAL")
+    
     if liq_7pct == "SHORT_TRADERS_DIE":
         # Konfirmasi momentum: funding negatif (crowded short) ATAU buy pressure kuat
         if funding < -0.001 or (agg_val > 0.65 and up_energy_val > 1.0):
@@ -13940,6 +13950,27 @@ def apply_liq_absolute_with_rsi_guard(result: dict) -> tuple:
         obv_dist_cont = OversoldOBVDistributionContinuation.detect(result)
         if obv_dist_cont[1]:
             return obv_dist_cont[0], True
+
+        # ===== PRIORITY -42100: BULLISH BOOK + BEARISH FLOW TRAP (TAGUSDT FIX) =====
+        bull_book_bear_flow = BullishBookBearishFlowOverride.detect(
+            bid_slope=bid_slope, ask_slope=ask_slope,
+            agg=agg_val,
+            ofi_bias=result.get("ofi_bias", ofi_bias),
+            ofi_strength=result.get("ofi_strength", ofi_strength),
+            change_5m=change_5m_val,
+            algo_bias=result.get("algo_type_bias", "NEUTRAL"),
+            obv_trend=obv_trend,
+            funding_rate=funding_rate_val,
+            down_energy=down_energy_val,
+            volume_ratio=volume_ratio
+        )
+        if bull_book_bear_flow["override"]:
+            result["bias"] = bull_book_bear_flow["bias"]
+            result["reason"] = f"[BULL BOOK BEAR FLOW] {bull_book_bear_flow['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = bull_book_bear_flow["priority"]
+            result["entry_allowed"] = True
+            return result, True
 
         # ── GUARD: Jangan LONG jika tidak ada fuel / bearish confluence ──
         squeeze_fuel = result.get("squeeze_fuel_score", 0)
@@ -16510,6 +16541,62 @@ class OversoldOBVDistributionContinuation:
             f"lanjut turun untuk bersihkan longs. Force SHORT."
         )
         return result, True
+
+
+class BullishBookBearishFlowOverride:
+    """
+    🔥 PRIORITY -42100 (MENGALAHKAN OVERSOLD_LIQ_BAIT -42000)
+    Deteksi jebakan LONG: order book BULLISH (bid >> ask) tapi real-time
+    flow BEARISH (agg rendah, OFI SHORT, harga turun, Algo SHORT).
+    Ini adalah bid wall spoofing – HFT pancing LONG lalu dump.
+    
+    Kasus TAGUSDT: Order book BULLISH (bid_slope 5.8T >> ask_slope 1.0T) dan OBV POSITIVE_EXTREME,
+    sehingga sistem mengira akan bounce. Tapi real-time membongkar semuanya:
+    - agg = 0.36 → 64% transaksi SELL
+    - OFI = SHORT 1.00 → order flow institusi jual
+    - Algo type bias = SHORT → smart money jual
+    - change_5m = -1.74% → harga terus turun
+    
+    Bid wall raksasa hanyalah spoofing untuk memancing retail LONG, 
+    sementara HFT terus mendistribusikan posisi. Akhirnya harga dump 8%.
+    """
+    @staticmethod
+    def detect(bid_slope: float, ask_slope: float,
+               agg: float, ofi_bias: str, ofi_strength: float,
+               change_5m: float, algo_bias: str,
+               obv_trend: str, funding_rate: float,
+               down_energy: float, volume_ratio: float) -> dict:
+        # Order book sangat BULLISH (bid >> ask)
+        if not (ask_slope > 0 and bid_slope > ask_slope * 3.0):
+            return {"override": False}
+
+        # Real-time flow BEARISH
+        if agg >= 0.4:                     # minimal 60% SELL
+            return {"override": False}
+        if ofi_bias != "SHORT" or ofi_strength < 0.6:
+            return {"override": False}
+        if change_5m >= 0:                 # harga tidak turun
+            return {"override": False}
+
+        # Algo sudah SHORT (konfirmasi smart money)
+        if algo_bias != "SHORT":
+            return {"override": False}
+
+        # Guard: jangan trigger jika ini capitulation bounce genuine (RSI super oversold + buyer kuat)
+        # Tapi kondisi ini sudah tidak mungkin karena flow bearish, jadi aman.
+
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"BULLISH BOOK + BEARISH FLOW TRAP: "
+                f"bid/ask ratio={bid_slope/ask_slope:.1f}x (bullish book) "
+                f"TAPI agg={agg:.2f} ({(1-agg)*100:.0f}% SELL), OFI={ofi_bias} {ofi_strength:.2f}, "
+                f"change_5m={change_5m:.1f}%, Algo={algo_bias} → "
+                f"HFT spoofing bid wall untuk menjebak LONG. Force SHORT."
+            ),
+            "priority": -42100
+        }
 
 
 class OversoldOBVNegativeContinuation:
