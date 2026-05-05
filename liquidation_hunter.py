@@ -3756,6 +3756,59 @@ class AdversarialCapitulationDump:
         return {"override": False}
 
 
+class DeepCapitulationBounceOverride:
+    """
+    🔥 PRIORITY -30100 (DI ATAS ADVERSARIAL CAPITULATION DUMP -30000)
+    Tangkap capitulation bottom meski exchange safe belum LONG.
+    Kondisi: drop >7%, RSI super oversold, ada buy pressure, funding tidak
+    crowded long ekstrem.
+    """
+    @staticmethod
+    def detect(change_5m: float, rsi6: float, rsi14: float, rsi6_5m: float,
+               up_energy: float, down_energy: float,
+               funding_rate: float, long_liq: float,
+               exchange_risk_score: int, agg: float,
+               volume_ratio: float) -> dict:
+        # Drop minimal 7%
+        if change_5m > -7.0:
+            return {"override": False}
+
+        # RSI super oversold di multi-timeframe
+        if not (rsi6 < 10 and rsi14 < 20 and rsi6_5m < 25):
+            return {"override": False}
+
+        # Ada buyer mulai masuk (up_energy > 0)
+        if up_energy <= 0:
+            return {"override": False}
+
+        # Tidak ada seller kuat
+        if down_energy > 0.5:
+            return {"override": False}
+
+        # Guard: jika funding sangat positif + exchange risk tinggi, dump mungkin berlanjut
+        if funding_rate is not None and funding_rate > 0.001 and exchange_risk_score >= 8:
+            return {"override": False}
+
+        # Guard: jika volume sangat tinggi (panic selling genuine), bounce mungkin tertunda
+        if volume_ratio > 2.0 and agg < 0.2:
+            return {"override": False}
+
+        return {
+            "override": True,
+            "bias": "LONG",
+            "reason": (
+                f"DEEP CAPITULATION BOUNCE: price dropped {change_5m:.1f}%, "
+                f"RSI6={rsi6:.1f} RSI14={rsi14:.1f} RSI5m={rsi6_5m:.1f} (super oversold), "
+                f"up_energy={up_energy:.2f} (buyers stepping in), "
+                f"down_energy={down_energy:.2f} (no strong sellers), "
+                f"funding={funding_rate:.6f} (shorts already crowded) → "
+                f"capitulation bounce imminent. Override all SHORT signals. Force LONG."
+            ),
+            "priority": -30100
+        }
+
+
+
 class MassiveDistributionOverride:
     """
     🔥 PRIORITY -28010: DOGSUSDT FIX
@@ -30749,6 +30802,28 @@ class BinanceAnalyzer:
             result["reason"] = f"[FAKE SHORT DIST] {fake_short_dist['reason']} | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = fake_short_dist["priority"]
+            result["entry_allowed"] = True
+            return result
+
+        # ===== PRIORITY -30100: DEEP CAPITULATION BOUNCE (ZEREBROUSDT FIX) =====
+        deep_cap = DeepCapitulationBounceOverride.detect(
+            change_5m=change_5m_val,
+            rsi6=rsi6_val,
+            rsi14=rsi14_val,
+            rsi6_5m=rsi6_5m_val,
+            up_energy=up_energy_val,
+            down_energy=down_energy_val,
+            funding_rate=funding_rate_val,
+            long_liq=long_liq,
+            exchange_risk_score=result.get("exchange_risk_score", 0),
+            agg=agg_val,
+            volume_ratio=volume_ratio
+        )
+        if deep_cap["override"]:
+            result["bias"] = deep_cap["bias"]
+            result["reason"] = f"[DEEP CAPITULATION] {deep_cap['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = deep_cap["priority"]
             result["entry_allowed"] = True
             return result
 
