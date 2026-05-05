@@ -28045,6 +28045,61 @@ class LongLiqCloserButZeroSellers:
         return {"override": False}
 
 
+class GenuineShortSqueezeExchangeShield:
+    """
+    🔥 PRIORITY -10300 (mengalahkan Exchange Hard Block -10150)
+    Mencegah Exchange Hard Block memaksakan SHORT ketika terjadi genuine
+    short squeeze dengan bukti order flow nyata: short_liq ultra dekat,
+    agg/OFI 100% bullish, tidak ada seller, dan tidak ada crowded long.
+    """
+    @staticmethod
+    def detect(short_liq: float, long_liq: float,
+               agg: float, ofi_bias: str, ofi_strength: float,
+               down_energy: float, up_energy: float,
+               funding_rate: float, obv_trend: str,
+               exchange_safe: str, exchange_risk_score: int,
+               volume_ratio: float, change_5m: float) -> dict:
+        # Syarat utama: short_liq ultra dekat + order flow sangat bullish
+        if not (short_liq < 0.5 and short_liq < long_liq):
+            return {"override": False}
+        if not (agg > 0.8 and ofi_bias == "LONG" and ofi_strength > 0.7):
+            return {"override": False}
+        if down_energy >= 0.01:           # ada seller nyata
+            return {"override": False}
+        if up_energy <= 0:                # tidak ada buyer
+            return {"override": False}
+
+        # Guard: jika funding sangat positif (crowded long berbahaya) → jangan paksa LONG
+        if funding_rate is not None and funding_rate > 0.0015:
+            return {"override": False}
+
+        # Guard: jika OBV distribusi masif → jangan paksa LONG
+        if obv_trend == "NEGATIVE_EXTREME":
+            return {"override": False}
+
+        # Guard: jika harga sudah turun drastis → mungkin capitulation, bukan squeeze
+        if change_5m < -5.0:
+            return {"override": False}
+
+        # Guard: jika exchange_risk_score sangat tinggi (>=9) DAN volume kering → hati-hati
+        if exchange_risk_score >= 9 and volume_ratio < 0.3:
+            return {"override": False}
+
+        return {
+            "override": True,
+            "bias": "LONG",
+            "reason": (
+                f"GENUINE SHORT SQUEEZE SHIELD: "
+                f"short_liq={short_liq:.2f}% ultra close, "
+                f"agg={agg:.2f}, OFI={ofi_bias} {ofi_strength:.2f}, "
+                f"down_energy=0, up_energy={up_energy:.2f}, "
+                f"funding={funding_rate:.6f} (safe), OBV={obv_trend} → "
+                f"genuine squeeze in progress. Override Exchange Hard Block. Force LONG."
+            ),
+            "priority": -10300
+        }
+
+
 class CapitulationExhaustionBounce:
     """
     🔥 PRIORITY -28020: ORDIUSDT FIX
@@ -29790,6 +29845,29 @@ class BinanceAnalyzer:
         # === GUARD 4: Exchange Safe Direction Hard Block yang Lebih Cerdas ===
         # Jika exchange_safe_direction berlawanan dengan bias, dan volume lagi kering, langsung paksa.
         # TAPI: harus respect aggregator supermayoritas dan _final_bias_locked
+        
+        # ===== PRIORITY -10300: GENUINE SHORT SQUEEZE SHIELD (TAGUSDT FIX) =====
+        genuine_sqz_shield = GenuineShortSqueezeExchangeShield.detect(
+            short_liq=short_liq, long_liq=long_liq,
+            agg=agg_val,
+            ofi_bias=result.get("ofi_bias", ofi_bias),
+            ofi_strength=result.get("ofi_strength", ofi_strength),
+            down_energy=down_energy_val,
+            up_energy=up_energy_val,
+            funding_rate=funding_rate_val,
+            obv_trend=obv_trend,
+            exchange_safe=result.get("exchange_safe_direction", "NEUTRAL"),
+            exchange_risk_score=result.get("exchange_risk_score", 0),
+            volume_ratio=volume_ratio,
+            change_5m=change_5m_val
+        )
+        if genuine_sqz_shield["override"]:
+            result["bias"] = genuine_sqz_shield["bias"]
+            result["reason"] = f"[SQUEEZE SHIELD] {genuine_sqz_shield['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = genuine_sqz_shield["priority"]
+            result["entry_allowed"] = True
+            return result
         
         # Guard 4a: Aggregator supermayoritas sudah lock → Exchange tidak boleh override
         agg_votes = result.get("aggregator_votes", {})
