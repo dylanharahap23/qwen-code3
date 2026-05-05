@@ -4591,6 +4591,72 @@ class AccumulationPhaseGuard:
         return {"override": False}
 
 
+class AlgoHFTBearishConsensusOverride:
+    """
+    PRIORITY -10200 (mengalahkan Exchange Hard Block)
+    Jika Algo & HFT sama-sama SHORT + OFI SHORT + harga turun + long_liq lebih dekat,
+    ini adalah sinyal jual kuat yang tidak boleh dikalahkan oleh Exchange/Greeks.
+    
+    DOGSUSDT 15:22 – Algo+HFT+OFI Triple Bearish Override
+    """
+    @staticmethod
+    def detect(algo_bias: str, hft_bias: str, ofi_bias: str, ofi_strength: float,
+               long_liq: float, short_liq: float, change_5m: float,
+               volume_ratio: float) -> dict:
+        if algo_bias != "SHORT" or hft_bias != "SHORT":
+            return {"override": False}
+        if ofi_bias != "SHORT" or ofi_strength < 0.7:
+            return {"override": False}
+        if not (long_liq < short_liq and long_liq < 2.5):
+            return {"override": False}
+        if change_5m > 1.0:          # harga tidak turun, mungkin reversal
+            return {"override": False}
+        if volume_ratio >= 0.75:     # volume terlalu tinggi, bukan manipulasi sunyi
+            return {"override": False}
+
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"ALGO+HFT+OFI TRIPLE BEARISH: Algo=SHORT, HFT=SHORT, OFI=SHORT {ofi_strength:.2f}, "
+                f"long_liq={long_liq:.2f}% < short_liq={short_liq:.2f}%, price down {change_5m:.1f}% → "
+                f"strong sell consensus, override all LONG signals."
+            ),
+            "priority": -10200
+        }
+
+
+class MicroShortLiqSqueezeShield:
+    """
+    PRIORITY -30760 (lebih tinggi dari HIGH_UP_ENERGY_FAKE_PUMP -30750)
+    Batalkan FAKE_PUMP jika short_liq < 0.5% dan harga bergerak naik,
+    karena itu adalah genuine micro squeeze.
+    
+    DOGSUSDT 16:45 – Lindungi Squeeze Mikro dari Fake Pump
+    """
+    @staticmethod
+    def detect(short_liq: float, long_liq: float, change_5m: float,
+               down_energy: float, volume_ratio: float) -> dict:
+        if short_liq >= 0.5 or short_liq >= long_liq:
+            return {"override": False}
+        if change_5m <= 0:            # harga tidak naik, bukan squeeze
+            return {"override": False}
+        if down_energy >= 0.01:       # ada seller nyata
+            return {"override": False}
+        if volume_ratio >= 0.7:       # volume besar, mungkin bukan micrometer
+            return {"override": False}
+
+        return {
+            "override": True,
+            "bias": "LONG",
+            "reason": (
+                f"MICRO SHORT LIQ SQUEEZE SHIELD: short_liq={short_liq:.2f}% ultra close, "
+                f"price up {change_5m:.1f}%, no sellers → genuine squeeze, cancel fake pump."
+            ),
+            "priority": -30760
+        }
+
+
 class HighUpEnergyCloseLongLiqReversal:
     """
     PRIORITY -27450: Jika bid wall / up-energy sangat dominan saat long_liq dekat,
@@ -29927,6 +29993,23 @@ class BinanceAnalyzer:
         # ========== HIGH UP ENERGY FAKE PUMP V2 (DEFERRED, PRIORITY -30750) ==========
         result, _high_up_energy_overridden = detect_high_up_energy_fake_pump_v2(result, defer_override=True)
 
+
+        # ===== PRIORITY -30760: MICRO SHORT LIQ SQUEEZE SHIELD (DOGSUSDT 16:45 FIX) =====
+        # Harus dipanggil SEBELUM HIGH_UP_ENERGY_FAKE_PUMP diproses, agar bisa membatalkan fake pump
+        micro_squeeze_shield = MicroShortLiqSqueezeShield.detect(
+            short_liq=short_liq,
+            long_liq=long_liq,
+            change_5m=change_5m_val,
+            down_energy=down_energy_val,
+            volume_ratio=volume_ratio
+        )
+        if micro_squeeze_shield["override"]:
+            result["bias"] = micro_squeeze_shield["bias"]
+            result["confidence"] = "ABSOLUTE"
+            result["reason"] = f"[MICRO SHORT LIQ SQUEEZE SHIELD] {micro_squeeze_shield['reason']} | " + result.get("reason", "")
+            result["priority_level"] = micro_squeeze_shield["priority"]
+            result["entry_allowed"] = True
+            return result
         # ========== AGG+OFI+SHORT_LIQ OVERRIDE (AIOTUSDT, PRIORITY -30760) ==========
         result, overridden = absolute_agg_ofi_short_liq_override(result)
         if overridden:
@@ -33027,6 +33110,26 @@ class BinanceAnalyzer:
             result["entry_allowed"] = True
             return result
         
+
+        # ===== PRIORITY -10200: ALGO+HFT+OFI TRIPLE BEARISH OVERRIDE (DOGSUSDT 15:22 FIX) =====
+        # Detector ini mendeteksi konsensus bearish kuat yang tidak boleh dikalahkan oleh Exchange/Greeks
+        triple_bear = AlgoHFTBearishConsensusOverride.detect(
+            algo_bias=result.get("algo_type_bias", "NEUTRAL"),
+            hft_bias=result.get("hft_6pct_bias", "NEUTRAL"),
+            ofi_bias=result.get("ofi_bias", "NEUTRAL"),
+            ofi_strength=result.get("ofi_strength", 0),
+            long_liq=long_liq,
+            short_liq=short_liq,
+            change_5m=change_5m_val,
+            volume_ratio=volume_ratio
+        )
+        if triple_bear["override"]:
+            result["bias"] = triple_bear["bias"]
+            result["reason"] = f"[TRIPLE BEARISH] {triple_bear['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = triple_bear["priority"]
+            result["entry_allowed"] = True
+            return result
         # ================= NEW HIGH PRIORITY ANTI-HFT TRAPS (2026 Edition) =================
         # Taruh setelah semua guard liquidity extreme / crowded long
         micro_blowoff = MicroShortLiqBlowOffTopTrap.detect(
