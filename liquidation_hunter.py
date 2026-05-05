@@ -27830,6 +27830,53 @@ class ExtremeCapitulationBounceOverride:
         }
 
 
+class RSI100ExtremeOverboughtAggOFIBearishTrap:
+    """
+    🔥 PRIORITY -10250 (MENGALAHKAN ENERGY DIVERGENCE -10200)
+    Batalkan sinyal LONG yang dipaksakan oleh indikator teknikal (seperti energy divergence)
+    jika real‑time ground truth menunjukkan distribusi besar:
+    RSI6=100 + agg<0.3 + OFI SHORT + exchange SHORT CRITICAL + funding crowded long.
+    """
+    @staticmethod
+    def detect(rsi6: float, agg: float, ofi_bias: str, ofi_strength: float,
+               exchange_safe: str, exchange_risk_score: int,
+               funding_rate: float, volume_ratio: float,
+               market_phase: str, change_5m: float) -> dict:
+        # Core: RSI6 = 100 (blow‑off) + bearish real‑time flow
+        if rsi6 < 99:
+            return {"override": False}
+        if agg >= 0.3:                     # tidak cukup banyak SELL
+            return {"override": False}
+        if ofi_bias != "SHORT" or ofi_strength < 0.8:
+            return {"override": False}
+        if exchange_safe != "SHORT" or exchange_risk_score < 6:
+            return {"override": False}
+        if funding_rate is None or funding_rate <= 0.0005:
+            return {"override": False}
+        if volume_ratio >= 0.5:            # volume tidak kering, manipulasi sulit
+            return {"override": False}
+        if market_phase != "BAIT":         # harus dalam fase jebakan
+            return {"override": False}
+        # Harga bergerak kecil (fake pump)
+        if abs(change_5m) > 2.0:           # gerakan terlalu besar, mungkin genuine
+            return {"override": False}
+
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"RSI100 EXTREME OVERBOUGHT + BEARISH FLOW TRAP: "
+                f"RSI6={rsi6:.1f} (blow‑off top), "
+                f"agg={agg:.2f} ({(1-agg)*100:.0f}% SELL), OFI={ofi_bias} {ofi_strength:.2f}, "
+                f"exchange_safe={exchange_safe} (score {exchange_risk_score}/10), "
+                f"funding={funding_rate:.6f} (crowded long), "
+                f"volume={volume_ratio:.2f}x (dry), BAIT phase → "
+                f"HFT distribusi puncak. Override semua sinyal LONG. Force SHORT."
+            ),
+            "priority": -10250
+        }
+
+
 class PhantomBidWallCrowdedLongShield:
     """
     PRIORITY -31550: Detects a phantom bid-wall crowded-long trap.
@@ -29611,6 +29658,29 @@ class BinanceAnalyzer:
         market_phase = phase_result.phase if phase_result else "UNKNOWN"
         
         # ==================== TAHAP 2: 4 GUARD ANTI-JEBAKAN UTAMA ====================
+        
+        # ===== PRIORITY -10250: RSI100 EXTREME OVERBOUGHT + BEARISH FLOW TRAP =====
+        # Detector ini HARUS dipanggil SEBELUM ENERGY DIVERGENCE (-10200)
+        # untuk mencegah pemaksaan LONG saat kondisi sebenarnya adalah distribusi HFT
+        rsi100_trap = RSI100ExtremeOverboughtAggOFIBearishTrap.detect(
+            rsi6=rsi6_val,
+            agg=agg_val,
+            ofi_bias=ofi_bias,
+            ofi_strength=ofi_strength,
+            exchange_safe=result.get("exchange_safe_direction", "NEUTRAL"),
+            exchange_risk_score=result.get("exchange_risk_score", 0),
+            funding_rate=funding_rate_val,
+            volume_ratio=volume_ratio,
+            market_phase=market_phase,
+            change_5m=change_5m_val
+        )
+        if rsi100_trap["override"]:
+            result["bias"] = rsi100_trap["bias"]
+            result["reason"] = f"[RSI100 BEARISH TRAP] {rsi100_trap['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = rsi100_trap["priority"]
+            result["entry_allowed"] = True
+            return result
         
         # === GUARD 1: ENERGY DIVERGENCE (Cegah Kasus APEUSDT) ===
         # Saat harga turun drastis tapi up_energy >> down_energy, itu adalah divergence bullish – jangan pernah SHORT.
