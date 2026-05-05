@@ -2316,6 +2316,84 @@ class ExhaustedSqueezeAbsoluteReversal:
         }
 
 
+class GenuineLowVolumeSqueezeOverride:
+    """
+    PRIORITY -30760: Genuine short squeeze on dry volume.
+    Wins over HighUpEnergyFakePumpGuard (-30750) when short_liq is the
+    nearby target, sellers are absent, HFT agrees LONG, and RSI is not blow-off.
+    """
+    @staticmethod
+    def detect(short_liq: float, long_liq: float,
+               down_energy: float, up_energy: float,
+               volume_ratio: float, funding_rate: float,
+               hft_bias: str, rsi6: float, change_5m: float) -> dict:
+        if not (short_liq < 2.5 and short_liq < long_liq):
+            return {"override": False}
+        if down_energy >= 0.01:
+            return {"override": False}
+        if up_energy < 1.0:
+            return {"override": False}
+        if volume_ratio >= 0.65:
+            return {"override": False}
+        if funding_rate is None or funding_rate < 0.0002:
+            return {"override": False}
+        if hft_bias != "LONG":
+            return {"override": False}
+        if rsi6 > 90:
+            return {"override": False}
+        if change_5m > short_liq * 2.5:
+            return {"override": False}
+
+        return {
+            "override": True,
+            "bias": "LONG",
+            "reason": (
+                f"GENUINE LOW-VOLUME SQUEEZE: "
+                f"short_liq={short_liq:.2f}% dekat, down_energy=0, "
+                f"up_energy={up_energy:.2f}, volume={volume_ratio:.2f}x (dry), "
+                f"funding={funding_rate:.6f} (crowded long), HFT LONG -> "
+                f"HFT genuine squeeze pada liquidity tipis. Override fake pump. Force LONG."
+            ),
+            "priority": -30760
+        }
+
+
+class OversoldHighUpEnergyBounceShield:
+    """
+    PRIORITY -30800: Capitulation bounce shield that wins over
+    HighUpEnergyFakePumpGuard (-30750). Deep oversold RSI/Stoch plus large
+    up_energy, no sellers, and bullish order flow is treated as genuine bounce.
+    """
+    @staticmethod
+    def detect(rsi6: float, stoch_j: float, up_energy: float,
+               down_energy: float, agg: float, ofi_bias: str,
+               volume_ratio: float, funding_rate: float,
+               change_5m: float) -> dict:
+        if not (rsi6 < 25 and stoch_j < -20):
+            return {"override": False}
+        if up_energy < 5.0:
+            return {"override": False}
+        if down_energy >= 0.01:
+            return {"override": False}
+        if agg < 0.6 or ofi_bias != "LONG":
+            return {"override": False}
+        if funding_rate is not None and funding_rate < -0.003:
+            return {"override": False}
+
+        return {
+            "override": True,
+            "bias": "LONG",
+            "reason": (
+                f"OVERSOLD HIGH UP-ENERGY BOUNCE: "
+                f"RSI6={rsi6:.1f}, StochJ={stoch_j:.1f} (deeply oversold), "
+                f"up_energy={up_energy:.2f}, down_energy=0, "
+                f"agg={agg:.2f}, OFI LONG -> genuine capitulation bounce. "
+                f"Override HIGH_UP_ENERGY_FAKE_PUMP. Force LONG."
+            ),
+            "priority": -30800
+        }
+
+
 class HighUpEnergyFakePumpGuard:
     """
     PRIORITY -30750 (PALING TINGGI)
@@ -13849,6 +13927,7 @@ def apply_liq_absolute_with_rsi_guard(result: dict) -> tuple:
     funding = result.get("funding_rate", 0) or 0.0
     agg_val = result.get("agg", 0.5)
     up_energy_val = result.get("up_energy", 0)
+    down_energy_val = _num(result.get("down_energy", down_energy), 0.0)
     
     # Variabel untuk BullishBookBearishFlowOverride detector
     bid_slope = float(result.get("bid_slope", 1.0))
@@ -28017,6 +28096,39 @@ class RSI100ExtremeOverboughtAggOFIBearishTrap:
         }
 
 
+class DualTFOverboughtNoFuelGuard:
+    """
+    PRIORITY -10350: Detects late squeeze exhaustion when both 1m and 5m
+    RSI are overbought, squeeze fuel is gone, and price already moved up.
+    Wins over Energy Divergence and Greeks Gamma Extreme.
+    """
+    @staticmethod
+    def detect(rsi6: float, rsi6_5m: float, squeeze_fuel: int,
+               change_5m: float, obv_trend: str, funding_rate: float,
+               agg: float, ofi_bias: str) -> dict:
+        if not (rsi6 >= 70 and rsi6_5m >= 75):
+            return {"override": False}
+        if squeeze_fuel > 0:
+            return {"override": False}
+        if change_5m <= 0:
+            return {"override": False}
+        if obv_trend == "POSITIVE_EXTREME":
+            return {"override": False}
+
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"DUAL TF OVERBOUGHT + NO FUEL: "
+                f"RSI1m={rsi6:.1f}, RSI5m={rsi6_5m:.1f} (overbought), "
+                f"fuel_score={squeeze_fuel} (exhausted), "
+                f"change_5m={change_5m:.1f}%, OBV={obv_trend} -> "
+                f"squeeze sudah selesai, HFT akan dump. Override ENERGY DIVERGENCE & Greeks. Force SHORT."
+            ),
+            "priority": -10350
+        }
+
+
 class PhantomBidWallCrowdedLongShield:
     """
     PRIORITY -31550: Detects a phantom bid-wall crowded-long trap.
@@ -28068,8 +28180,7 @@ class CascadeDumpUltraCloseLongLiqOverride:
     def detect(long_liq: float, short_liq: float,
                ask_slope: float, bid_slope: float,
                funding_rate: float, change_5m: float,
-               down_energy: float, volume_ratio: float,
-               rsi6: float) -> dict:
+               down_energy: float, volume_ratio: float) -> dict:
         if not (long_liq < 1.0 and long_liq < short_liq):
             return {"override": False}
         if change_5m > -1.0:
@@ -28083,9 +28194,6 @@ class CascadeDumpUltraCloseLongLiqOverride:
             return {"override": False}
 
         if funding_rate is None or funding_rate <= 0.0005:
-            return {"override": False}
-
-        if rsi6 < 10:
             return {"override": False}
 
         ask_bid_ratio = ask_slope / bid_slope
@@ -28184,6 +28292,44 @@ class GenuineShortSqueezeExchangeShield:
                 f"genuine squeeze in progress. Override Exchange Hard Block. Force LONG."
             ),
             "priority": -10300
+        }
+
+
+class AbsoluteSqueezeExchangeShield:
+    """
+    PRIORITY -10200: Broader absolute squeeze shield that wins over
+    Exchange Hard Block (-10150) when order flow is almost perfectly bullish,
+    Greeks supports LONG, and sellers are absent.
+    """
+    @staticmethod
+    def detect(agg: float, ofi_bias: str, ofi_strength: float,
+               down_energy: float, short_liq: float, long_liq: float,
+               greeks_kill: str, greeks_liq7: str,
+               exchange_score: int, funding_rate: float) -> dict:
+        if not (agg > 0.9 and ofi_bias == "LONG" and ofi_strength > 0.9):
+            return {"override": False}
+        if down_energy >= 0.01:
+            return {"override": False}
+        if not (short_liq < 2.5 and short_liq < long_liq):
+            return {"override": False}
+        if greeks_kill != "LONG" and greeks_liq7 != "SHORT_TRADERS_DIE":
+            return {"override": False}
+        if exchange_score >= 7:
+            return {"override": False}
+        if funding_rate is not None and funding_rate < -0.001:
+            return {"override": False}
+
+        return {
+            "override": True,
+            "bias": "LONG",
+            "reason": (
+                f"ABSOLUTE SQUEEZE SHIELD: "
+                f"agg={agg:.2f}, OFI LONG {ofi_strength:.2f}, down_energy=0, "
+                f"short_liq={short_liq:.2f}%, Greeks kill={greeks_kill}, "
+                f"liq7={greeks_liq7} -> genuine short squeeze. "
+                f"Override Exchange Hard Block. Force LONG."
+            ),
+            "priority": -10200
         }
 
 
@@ -29738,6 +29884,46 @@ class BinanceAnalyzer:
             result["entry_allowed"] = True
             return result
 
+        # ===== PRIORITY -30800: OVERSOLD HIGH UP-ENERGY BOUNCE (LABUSDT FIX) =====
+        oversold_bounce = OversoldHighUpEnergyBounceShield.detect(
+            rsi6=rsi6_val,
+            stoch_j=stoch_j_val,
+            up_energy=up_energy_val,
+            down_energy=down_energy_val,
+            agg=agg_val,
+            ofi_bias=result.get("ofi_bias", ofi_bias),
+            volume_ratio=volume_ratio,
+            funding_rate=funding_rate_val,
+            change_5m=change_5m_val
+        )
+        if oversold_bounce["override"]:
+            result["bias"] = oversold_bounce["bias"]
+            result["reason"] = f"[OVERSOLD BOUNCE] {oversold_bounce['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = oversold_bounce["priority"]
+            result["entry_allowed"] = True
+            return result
+
+        # ===== PRIORITY -30760: GENUINE LOW-VOLUME SQUEEZE (SKYAIUSDT 12:00 FIX) =====
+        genuine_lowvol_sqz = GenuineLowVolumeSqueezeOverride.detect(
+            short_liq=short_liq,
+            long_liq=long_liq,
+            down_energy=down_energy_val,
+            up_energy=up_energy_val,
+            volume_ratio=volume_ratio,
+            funding_rate=funding_rate_val,
+            hft_bias=result.get("hft_6pct_bias", "NEUTRAL"),
+            rsi6=rsi6_val,
+            change_5m=change_5m_val
+        )
+        if genuine_lowvol_sqz["override"]:
+            result["bias"] = genuine_lowvol_sqz["bias"]
+            result["confidence"] = "ABSOLUTE"
+            result["reason"] = f"[GENUINE LOW-VOL SQZ] {genuine_lowvol_sqz['reason']} | " + result.get("reason", "")
+            result["priority_level"] = genuine_lowvol_sqz["priority"]
+            result["entry_allowed"] = True
+            return result
+
         # ========== HIGH UP ENERGY FAKE PUMP V2 (DEFERRED, PRIORITY -30750) ==========
         result, _high_up_energy_overridden = detect_high_up_energy_fake_pump_v2(result, defer_override=True)
 
@@ -29876,6 +30062,25 @@ class BinanceAnalyzer:
             result["priority_level"] = rsi100_trap["priority"]
             result["entry_allowed"] = True
             return result
+
+        # ===== PRIORITY -10350: DUAL TF OVERBOUGHT + NO FUEL (DOGSUSDT FIX) =====
+        dual_ob_no_fuel = DualTFOverboughtNoFuelGuard.detect(
+            rsi6=rsi6_val,
+            rsi6_5m=rsi6_5m_val,
+            squeeze_fuel=result.get("squeeze_fuel_score", 0),
+            change_5m=change_5m_val,
+            obv_trend=obv_trend,
+            funding_rate=funding_rate_val,
+            agg=agg_val,
+            ofi_bias=result.get("ofi_bias", ofi_bias)
+        )
+        if dual_ob_no_fuel["override"]:
+            result["bias"] = dual_ob_no_fuel["bias"]
+            result["reason"] = f"[DUAL TF OB NO FUEL] {dual_ob_no_fuel['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = dual_ob_no_fuel["priority"]
+            result["entry_allowed"] = True
+            return result
         
         # === GUARD 1: ENERGY DIVERGENCE (Cegah Kasus APEUSDT) ===
         # Saat harga turun drastis tapi up_energy >> down_energy, itu adalah divergence bullish – jangan pernah SHORT.
@@ -29957,6 +30162,27 @@ class BinanceAnalyzer:
             return result
         
         # Guard 4a: Aggregator supermayoritas sudah lock → Exchange tidak boleh override
+        # ===== PRIORITY -10200: ABSOLUTE SQUEEZE SHIELD (AIOTUSDT FIX) =====
+        abs_sqz_shield = AbsoluteSqueezeExchangeShield.detect(
+            agg=agg_val,
+            ofi_bias=result.get("ofi_bias", ofi_bias),
+            ofi_strength=result.get("ofi_strength", ofi_strength),
+            down_energy=down_energy_val,
+            short_liq=short_liq,
+            long_liq=long_liq,
+            greeks_kill=result.get("greeks_kill_direction", ""),
+            greeks_liq7=result.get("greeks_liq_7pct", "BOTH"),
+            exchange_score=result.get("exchange_risk_score", 0),
+            funding_rate=funding_rate_val
+        )
+        if abs_sqz_shield["override"]:
+            result["bias"] = abs_sqz_shield["bias"]
+            result["reason"] = f"[ABSOLUTE SQUEEZE SHIELD] {abs_sqz_shield['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = abs_sqz_shield["priority"]
+            result["entry_allowed"] = True
+            return result
+
         agg_votes = result.get("aggregator_votes", {})
         long_votes = agg_votes.get("LONG", 0)
         short_votes = agg_votes.get("SHORT", 0)
@@ -30598,8 +30824,7 @@ class BinanceAnalyzer:
             funding_rate=funding_rate_val,
             change_5m=change_5m_val,
             down_energy=down_energy_val,
-            volume_ratio=volume_ratio,
-            rsi6=rsi6_val
+            volume_ratio=volume_ratio
         )
         if cascade_dump["override"]:
             result["bias"] = cascade_dump["bias"]
@@ -36544,6 +36769,17 @@ class BinanceAnalyzer:
                             change_5m=change_5m,
                             funding_rate=funding_rate or 0.0
                         )
+                        genuine_lowvol_sqz = GenuineLowVolumeSqueezeOverride.detect(
+                            short_liq=liq["short_dist"],
+                            long_liq=liq["long_dist"],
+                            down_energy=down_energy,
+                            up_energy=up_energy,
+                            volume_ratio=volume_ratio,
+                            funding_rate=funding_rate or 0.0,
+                            hft_bias=hft_6pct["bias"],
+                            rsi6=rsi6,
+                            change_5m=change_5m
+                        )
                         fake_pump = HighUpEnergyFakePumpGuard.detect(
                             up_energy=up_energy,
                             down_energy=down_energy,
@@ -36753,6 +36989,21 @@ class BinanceAnalyzer:
                             final_confidence = "ABSOLUTE"
                             final_phase = "FUNDING_LED_SQUEEZE_SHAKEOUT"
                             priority = shakeout_guard["priority"]
+                            prob_engine.add(final_bias, 10.0)
+                            _liquidity_extreme_override = False
+                            priority_guard_hard_return = {
+                                "bias": final_bias,
+                                "reason": final_reason,
+                                "confidence": final_confidence,
+                                "phase": final_phase,
+                                "priority": priority,
+                            }
+                        elif genuine_lowvol_sqz["override"]:
+                            final_bias = genuine_lowvol_sqz["bias"]
+                            final_reason = genuine_lowvol_sqz["reason"]
+                            final_confidence = "ABSOLUTE"
+                            final_phase = "GENUINE_LOW_VOLUME_SQUEEZE"
+                            priority = genuine_lowvol_sqz["priority"]
                             prob_engine.add(final_bias, 10.0)
                             _liquidity_extreme_override = False
                             priority_guard_hard_return = {
