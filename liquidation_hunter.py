@@ -4640,7 +4640,7 @@ class MicroShortLiqBlowOffGuard:
                rsi6: float, rsi6_5m: float, stoch_j: float,
                up_energy: float, funding_rate: float, volume_ratio: float,
                exchange_safe_direction: str = "NEUTRAL",
-               book_bias: str = "NEUTRAL") -> dict:
+               book_bias: str = "NEUTRAL", stoch_k: float = 50.0) -> dict:
         # Hanya relevan jika short_liq ultra dekat
         if short_liq >= 1.0 or short_liq >= long_liq:
             return {"override": False}
@@ -4689,6 +4689,19 @@ class MicroShortLiqBlowOffGuard:
                     ),
                     "priority": -30780
                 }
+
+        # ===== JALUR D: SHORT LIQ SUDAH TERSAPU + OVERBOUGHT MAKSIMUM (BUSDT 03:48) =====
+        if short_liq <= 0 and rsi6 > 80 and stoch_k > 99 and stoch_j > 110 and funding_rate is not None and funding_rate > 0.001 and volume_ratio < 0.7:
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": (
+                    f"MICRO SHORT LIQ BLOW-OFF (SWEPT): short_liq={short_liq:.2f}% sudah tersapu, "
+                    f"RSI6={rsi6:.1f}, Stoch K={stoch_k:.1f} J={stoch_j:.1f}, funding={funding_rate:.6f} (crowded long) → "
+                    f"semua short mati, tidak ada buyer tersisa, dump imminent. Force SHORT."
+                ),
+                "priority": -30780
+            }
 
         return {"override": False}
 
@@ -30065,7 +30078,8 @@ class BinanceAnalyzer:
         blowoff_guard = MicroShortLiqBlowOffGuard.detect(
             short_liq=short_liq, long_liq=long_liq,
             change_5m=change_5m_val, rsi6=rsi6_val, rsi6_5m=rsi6_5m_val,
-            stoch_j=stoch_j_val, up_energy=up_energy_val,
+            stoch_j=stoch_j_val, stoch_k=stoch_k_val,
+            up_energy=up_energy_val,
             funding_rate=funding_rate_val, volume_ratio=volume_ratio,
             exchange_safe_direction=result.get("exchange_safe_direction", "NEUTRAL"),
             book_bias=result.get("_book_bias", "NEUTRAL")
