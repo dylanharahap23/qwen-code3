@@ -4629,14 +4629,18 @@ class AlgoHFTBearishConsensusOverride:
 class MicroShortLiqBlowOffGuard:
     """
     🔥 PRIORITY -30780 (MENGALAHKAN MicroShortLiqSqueezeShield -30760)
-    DUA JALUR DETEKSI BLOW-OFF:
-    A) up_energy besar tapi RSI5m > 90 (phantom bid wall overbought)
-    B) up_energy kecil + RSI6/stoch ekstrem (busuk blow-off top)
+    Tiga jalur deteksi BLOW-OFF TOP:
+    A) up_energy besar (>3) + RSI5m > 90 → phantom bid wall overbought
+    B) up_energy kecil (<0.5) + RSI ekstrem/stoch overflow → blow‑off klasik
+    C) RSI6 = 100 + stoch overflow + order book BEARISH dan/atau exchange safe SHORT
+       → konfirmasi tiga lapis, tidak peduli up_energy
     """
     @staticmethod
     def detect(short_liq: float, long_liq: float, change_5m: float,
                rsi6: float, rsi6_5m: float, stoch_j: float,
-               up_energy: float, funding_rate: float, volume_ratio: float) -> dict:
+               up_energy: float, funding_rate: float, volume_ratio: float,
+               exchange_safe_direction: str = "NEUTRAL",
+               book_bias: str = "NEUTRAL") -> dict:
         # Hanya relevan jika short_liq ultra dekat
         if short_liq >= 1.0 or short_liq >= long_liq:
             return {"override": False}
@@ -4667,6 +4671,21 @@ class MicroShortLiqBlowOffGuard:
                     "reason": (
                         f"MICRO SHORT LIQ BLOW-OFF (CLASSIC): RSI6={rsi6:.1f} RSI5m={rsi6_5m:.1f} StochJ={stoch_j:.1f}, "
                         f"up_energy={up_energy:.2f} (exhausted), funding={funding_rate:.6f} (crowded long) → force SHORT."
+                    ),
+                    "priority": -30780
+                }
+
+        # ===== JALUR C: KONFIRMASI TIGA LAPIS (RSI6=100, stoch overflow, bearish context) =====
+        if rsi6 >= 99 and stoch_j > 105 and volume_ratio < 0.6:
+            # Tambahan: exchange safe SHORT atau order book BEARISH
+            if exchange_safe_direction == "SHORT" or book_bias == "BEARISH":
+                return {
+                    "override": True,
+                    "bias": "SHORT",
+                    "reason": (
+                        f"MICRO SHORT LIQ BLOW-OFF (TRIPLE LAYER): RSI6={rsi6:.1f}, StochJ={stoch_j:.1f}, "
+                        f"up_energy={up_energy:.2f}, exchange_safe={exchange_safe_direction}, book={book_bias} → "
+                        f"konfirmasi berlapis, force SHORT."
                     ),
                     "priority": -30780
                 }
@@ -30047,7 +30066,9 @@ class BinanceAnalyzer:
             short_liq=short_liq, long_liq=long_liq,
             change_5m=change_5m_val, rsi6=rsi6_val, rsi6_5m=rsi6_5m_val,
             stoch_j=stoch_j_val, up_energy=up_energy_val,
-            funding_rate=funding_rate_val, volume_ratio=volume_ratio
+            funding_rate=funding_rate_val, volume_ratio=volume_ratio,
+            exchange_safe_direction=result.get("exchange_safe_direction", "NEUTRAL"),
+            book_bias=result.get("_book_bias", "NEUTRAL")
         )
         if blowoff_guard["override"]:
             result["bias"] = blowoff_guard["bias"]
