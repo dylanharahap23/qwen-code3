@@ -4626,6 +4626,50 @@ class AlgoHFTBearishConsensusOverride:
         }
 
 
+class MicroShortLiqBlowOffGuard:
+    """
+    🔥 PRIORITY -30780 (MENGALAHKAN MicroShortLiqSqueezeShield -30760)
+    Batalkan sinyal LONG dari micro short squeeze jika kondisi overbought ekstrem
+    dan energi beli habis. Ini adalah JEBAKAN BLOW-OFF TOP.
+    """
+    @staticmethod
+    def detect(short_liq: float, long_liq: float, change_5m: float,
+               rsi6: float, rsi6_5m: float, stoch_j: float,
+               up_energy: float, funding_rate: float, volume_ratio: float) -> dict:
+        # Hanya beraksi jika short_liq sangat dekat (seolah akan squeeze)
+        if short_liq >= 1.0 or short_liq >= long_liq:
+            return {"override": False}
+        # Harga sudah naik (squeeze tampak berjalan)
+        if change_5m <= 0.5:
+            return {"override": False}
+        # Minimal satu dari sinyal overbought ekstrem harus terpicu
+        rsi_extreme = (rsi6 >= 99 or rsi6_5m >= 85)
+        stoch_extreme = (stoch_j > 100)
+        if not (rsi_extreme or stoch_extreme):
+            return {"override": False}
+        # Energi beli hampir nol — kenaikan hanya karena vacuum
+        if up_energy > 0.5:
+            return {"override": False}
+        # Volume sangat kering — tidak ada konfirmasi
+        if volume_ratio > 0.5:
+            return {"override": False}
+        # Funding positif = crowded long (siap dilikuidasi)
+        if funding_rate is None or funding_rate <= 0.0003:
+            return {"override": False}
+
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "reason": (
+                f"MICRO SHORT LIQ BLOW-OFF GUARD: short_liq={short_liq:.2f}% ultra close "
+                f"tapi RSI6={rsi6:.1f}, RSI5m={rsi6_5m:.1f}, StochJ={stoch_j:.1f}, "
+                f"up_energy={up_energy:.2f} (no buyers), funding={funding_rate:.6f} (crowded long), "
+                f"vol={volume_ratio:.2f}x → ini BLOW-OFF TOP. Batalkan micro squeeze, force SHORT."
+            ),
+            "priority": -30780
+        }
+
+
 class MicroShortLiqSqueezeShield:
     """
     PRIORITY -30760 (lebih tinggi dari HIGH_UP_ENERGY_FAKE_PUMP -30750)
@@ -29993,6 +30037,21 @@ class BinanceAnalyzer:
         # ========== HIGH UP ENERGY FAKE PUMP V2 (DEFERRED, PRIORITY -30750) ==========
         result, _high_up_energy_overridden = detect_high_up_energy_fake_pump_v2(result, defer_override=True)
 
+
+        # ===== PRIORITY -30780: MICRO SHORT LIQ BLOW-OFF GUARD (BUSDT 02:23 FIX) =====
+        blowoff_guard = MicroShortLiqBlowOffGuard.detect(
+            short_liq=short_liq, long_liq=long_liq,
+            change_5m=change_5m_val, rsi6=rsi6_val, rsi6_5m=rsi6_5m_val,
+            stoch_j=stoch_j_val, up_energy=up_energy_val,
+            funding_rate=funding_rate_val, volume_ratio=volume_ratio
+        )
+        if blowoff_guard["override"]:
+            result["bias"] = blowoff_guard["bias"]
+            result["reason"] = f"[BLOW-OFF GUARD] {blowoff_guard['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = blowoff_guard["priority"]
+            result["entry_allowed"] = True
+            return result
 
         # ===== PRIORITY -30760: MICRO SHORT LIQ SQUEEZE SHIELD (DOGSUSDT 16:45 FIX) =====
         # Harus dipanggil SEBELUM HIGH_UP_ENERGY_FAKE_PUMP diproses, agar bisa membatalkan fake pump
