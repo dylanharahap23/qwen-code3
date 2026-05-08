@@ -1,4 +1,1 @@
-```
-__pycache__/
-*.pyc
-```
+Nothing to output - the file changes contain only source/config files (.md and .py) without any build artifacts, dependencies, or temp files that need to be ignored.
