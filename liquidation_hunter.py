@@ -14527,6 +14527,20 @@ def _validate_accumulation_context(result: dict) -> tuple:
 
 
 def _detect_continuation_dump(result: dict) -> dict:
+    """
+    LECTURER FIX v11: CONTINUATION_DUMP DETECTOR DENGAN 2-of-3 FAMILY CONFIRMATION
+    
+    MASALAH DARI BSBUSDT:
+    - Detector ini menganggap up_energy >> down_energy dalam down-candle sebagai "absorbed buyers" (bearish)
+    - PADAHAL itu adalah ICEBERG ACCUMULATION signature (bullish!)
+    - Single-point-of-failure: veto score >= 8 langsung lock SHORT tanpa konfirmasi
+    
+    FIX:
+    1. Tambah HARD VETO: jika funding < 0 DAN OFI LONG > 0.7 DAN up_energy > 2x down_energy
+       → ini adalah ACCUMULATION, BUKAN dump → BLOCK SHORT
+    2. Require 2-of-3 family confirmation sebelum HARD_LOCK
+    3. Energy asymmetry validator: cek sign vs price direction
+    """
     drawdowns = _forensic_price_drawdowns(result)
     drawdown_60m = _panglima_num(result.get("_forensic_drawdown_60m", drawdowns["drawdown_60m"]), 0.0)
     drawdown_15m = _panglima_num(result.get("_forensic_drawdown_15m", drawdowns["drawdown_15m"]), 0.0)
@@ -14534,6 +14548,7 @@ def _detect_continuation_dump(result: dict) -> dict:
     volume_ratio = _panglima_num(result.get("volume_ratio", 1.0), 1.0)
     change_5m = _panglima_num(result.get("change_5m", 0), 0.0)
     up_energy = _panglima_num(result.get("up_energy", 0), 0.0)
+    down_energy = _panglima_num(result.get("down_energy", 0), 0.0)
     obv_trend = str(result.get("obv_trend", "NEUTRAL"))
     hawkes_dir = str(result.get("_hawkes_mtf_direction", "NEUTRAL"))
     hawkes_quality = str(result.get("_hawkes_mtf_momentum_quality", "UNKNOWN"))
@@ -14541,10 +14556,47 @@ def _detect_continuation_dump(result: dict) -> dict:
     hawkes_4h_signed = _get_hawkes_signed_pressure(result, "4h", 0.0)
     bid_slope = _panglima_num(result.get("bid_slope", 0), 0.0)
     ask_slope = _panglima_num(result.get("ask_slope", 1), 1.0)
-
+    
+    # === NEW SIGNALS FOR 2-of-3 CONFIRMATION ===
+    funding = _panglima_num(result.get("funding_rate", 0) or 0.0, 0.0)
+    ofi_bias = str(result.get("ofi_bias", "NEUTRAL"))
+    ofi_strength = _panglima_num(result.get("ofi_strength", 0), 0.0)
+    stoch_j = _panglima_num(result.get("stoch_j", 50), 50.0)
+    rsi6 = _panglima_num(result.get("rsi6", 50), 50.0)
+    
+    # === LECTURER FIX #1: HARD VETO UNTUK HIDDEN ACCUMULATION ===
+    # Pattern BSBUSDT: up_energy tinggi + down_energy nol + funding negatif + OFI LONG
+    # Ini adalah ICEBERG ACCUMULATION, BUKAN continuation dump!
+    energy_asymmetry = up_energy / max(down_energy, 0.01) if down_energy < up_energy else 0.0
+    is_hidden_accumulation = (
+        energy_asymmetry > 2.0 and
+        change_5m < 0 and
+        funding < 0 and
+        ofi_bias == "LONG" and
+        ofi_strength > 0.7
+    )
+    
+    if is_hidden_accumulation:
+        return {"override": False, "score": 0, "reason": "HIDDEN_ACCUMULATION_DETECTED"}
+    
+    # === LECTURER FIX #2: GENUINE DUMP VALIDATOR ===
+    # Genuine dump HARUS memenuhi SEMUA kriteria ini:
+    genuine_dump_criteria = {
+        "down_energy_dominant": down_energy > up_energy,
+        "ofi_short_confirmed": ofi_bias == "SHORT" and ofi_strength > 0.6,
+        "funding_not_negative": funding >= 0,
+        "volume_or_move_significant": volume_ratio >= 0.8 or change_5m <= -2.0
+    }
+    
+    genuine_dump_count = sum(genuine_dump_criteria.values())
+    
+    # Jika tidak memenuhi minimal 3 dari 4 kriteria genuine dump → BUKAN dump sejati
+    if genuine_dump_count < 3:
+        return {"override": False, "score": 0, "reason": f"NOT_GENUINE_DUMP ({genuine_dump_count}/4)"}
+    
     score = 0
     reasons = []
-
+    
     if drawdown_60m <= -0.04:
         score += 3
         reasons.append(f"drawdown_60m={drawdown_60m:.1%}")
@@ -14560,9 +14612,16 @@ def _detect_continuation_dump(result: dict) -> dict:
     if volume_ratio < 0.5 and abs(change_5m) < 1.0:
         score += 2
         reasons.append(f"post-dump vacuum vol={volume_ratio:.2f}x change={change_5m:.2f}%")
+    # === LECTURER FIX: UBAH LOGIC UP_ENERGY DALAM DOWN-CANDLE ===
+    # up_energy > 2.0 dalam down-candle dengan funding negatif = ACCUMULATION, bukan absorbed buyers
     if up_energy > 2.0 and change_5m <= 0:
-        score += 2
-        reasons.append(f"absorbed buyers up_energy={up_energy:.2f} change={change_5m:.2f}%")
+        if funding < 0 and ofi_bias == "LONG":
+            # Ini adalah bullish divergence, bukan bearish!
+            score -= 3
+            reasons.append(f"accumulation_divergence up_energy={up_energy:.2f} funding={funding:.5f}")
+        else:
+            score += 2
+            reasons.append(f"absorbed buyers up_energy={up_energy:.2f} change={change_5m:.2f}%")
     if obv_trend == "NEUTRAL" and (drawdown_60m < -0.03 or (rsi5m < 40 and hawkes_1m_signed < 0)):
         score += 1
         reasons.append("OBV neutral inside dump")
@@ -14575,16 +14634,65 @@ def _detect_continuation_dump(result: dict) -> dict:
     if result.get("greeks_vega_active") and (drawdown_60m < -0.03 or hawkes_1m_signed < 0):
         score += 1
         reasons.append("Vega active inside down-leg")
-
+    
+    # === LECTURER FIX #3: 2-of-3 FAMILY CONFIRMATION ===
+    # Sebelum HARD_LOCK, minimal 2 dari 3 family harus konfirmasi
+    family_a_microstructure = 0  # OFI, energy, book
+    family_b_positioning = 0     # funding, delta_crowded, OI
+    family_c_liquidity = 0       # liq distances, Hawkes signed
+    
+    # Family A: Microstructure
+    if ofi_bias == "SHORT" and ofi_strength > 0.6:
+        family_a_microstructure += 1
+    if down_energy > up_energy and down_energy > 0.5:
+        family_a_microstructure += 1
+    if ask_slope > bid_slope * 1.2:
+        family_a_microstructure += 1
+    
+    # Family B: Positioning
+    if funding > 0:
+        family_b_positioning += 1
+    if funding > 0.001:
+        family_b_positioning += 1
+    greeks_delta = str(result.get("greeks_delta_crowded", ""))
+    if greeks_delta == "LONG":
+        family_b_positioning += 1
+    
+    # Family C: Liquidity & Momentum
+    long_liq = _panglima_num(result.get("long_liq", 99), 99.0)
+    short_liq = _panglima_num(result.get("short_liq", 99), 99.0)
+    if long_liq < 2.0 and long_liq < short_liq:
+        family_c_liquidity += 1
+    if hawkes_1m_signed < -20:
+        family_c_liquidity += 1
+    if drawdown_60m < -0.04:
+        family_c_liquidity += 1
+    
+    families_confirmed = sum([
+        1 if family_a_microstructure >= 2 else 0,
+        1 if family_b_positioning >= 2 else 0,
+        1 if family_c_liquidity >= 2 else 0
+    ])
+    
+    # === FINAL DECISION ===
     if score < 8:
         return {"override": False, "score": score}
-
+    
+    # Require minimal 2 families confirmed untuk HARD_LOCK
+    if families_confirmed < 2:
+        return {
+            "override": False,
+            "score": score,
+            "reason": f"INSUFFICIENT_FAMILY_CONFIRMATION ({families_confirmed}/2 required)"
+        }
+    
     return {
         "override": True,
         "bias": "SHORT",
         "reason": f"CONTINUATION DUMP DETECTOR score={score}: " + "; ".join(reasons),
         "priority": FORENSIC_GUARD_PRIORITY - 100,
         "score": score,
+        "families_confirmed": families_confirmed,
     }
 
 
@@ -14749,6 +14857,14 @@ def _is_genuine_squeeze_setup(result: dict) -> bool:
     
     CATATAN PENTING: Short squeeze sejati sering ignite dari book yang terlihat BEARISH
     (itu adalah spoof trap), jadi kita TIDAK meminta book_bias=BULLISH lagi.
+    
+    LECTURER FIX v11: SHORT-SQUEEZE IGNITION DETECTOR
+    Trigger LONG ketika semua kriteria ini terpenuhi:
+    - funding < 0 (shorts crowded)
+    - long_liq < 2.5% (close trigger)
+    - up_energy > 2× down_energy
+    - OFI LONG > 0.7
+    - stoch_j < −50 OR rsi6 < 30
     """
     hawkes_qual   = str(result.get("_hawkes_mtf_momentum_quality", ""))
     hawkes_dir    = str(result.get("_hawkes_mtf_direction", ""))
@@ -14767,6 +14883,13 @@ def _is_genuine_squeeze_setup(result: dict) -> bool:
     market_regime = str(result.get("market_regime", ""))
     hft_bias      = str(result.get("hft_6pct_bias", ""))
     algo_bias     = str(result.get("algo_type_bias", ""))
+    
+    # === NEW: SPOOFED ORDERBOOK DETECTOR ===
+    # Flag spoof ketika ask_bid_ratio diverges dari OFI direction:
+    # - ask_bid_ratio > 1.1 (asks heavy) TAPI OFI LONG > 0.7 → asks adalah SPOOFED
+    # - bid_slope > ask_slope TAPI OFI SHORT → bids adalah SPOOFED
+    is_spoofed_ask_wall = (ask_bid > 1.1 and ofi_b == "LONG" and ofi_str > 0.7)
+    is_spoofed_bid_wall = (ask_bid < 0.9 and ofi_b == "SHORT" and ofi_str > 0.7)
     
     # === LECTURER FIX: Liquidity Vacuum + Crowded Shorts Pattern ===
     # Ini adalah pattern paling powerful untuk short squeeze continuation
@@ -14797,6 +14920,25 @@ def _is_genuine_squeeze_setup(result: dict) -> bool:
     
     # HFT/algo consensus
     if hft_bias == algo_bias and hft_bias in ('LONG', 'SHORT'): cont_prob += 0.15
+    
+    # === LECTURER FIX v11: SHORT-SQUEEZE IGNITION DETECTOR ===
+    # Pattern dari BSBUSDT: funding negatif + short_liq dekat + up_energy dominan
+    # + OFI LONG + terminal oversold = LONG ignition setup
+    stoch_j = _panglima_num(result.get("stoch_j", 50), 50)
+    rsi6 = _panglima_num(result.get("rsi6", 50), 50)
+    
+    short_squeeze_ignition = (
+        funding < 0 and
+        short_liq < 2.5 and
+        short_liq < long_liq and
+        up_e > 2.0 * max(down_e, 0.01) and
+        ofi_b == "LONG" and
+        ofi_str > 0.7 and
+        (stoch_j < -50 or rsi6 < 30)
+    )
+    
+    if short_squeeze_ignition:
+        return True  # HIGH-CONVICTION LONG IGNITION — jangan veto!
     
     # === GENUINE SHORT SQUEEZE SETUP (pattern dari NILUSDT forensic) ===
     # Pattern: funding negatif + short_liq dekat + down_energy=0 + macro LONG
@@ -14863,6 +15005,8 @@ def _is_genuine_squeeze_setup(result: dict) -> bool:
         pass  # vacuum squeeze bisa dari book BEARISH (spoof)
     elif hidden_accumulation or mm_absorption:
         pass  # accumulation/absorption pattern
+    elif is_spoofed_ask_wall:
+        pass  # spoofed ask wall dengan OFI LONG = accumulation
     else:
         return False
     
