@@ -14651,9 +14651,74 @@ def _detect_obv_accumulation_lock(result: dict) -> dict:
     }
 
 
+def _is_genuine_squeeze_setup(result: dict) -> bool:
+    """
+    Return True = ini genuine squeeze, JANGAN di-veto.
+    Bukan distribusi, bukan exhaustion.
+    
+    Formula yang terbukti konsisten untuk genuine squeeze:
+    FRESH quality + 1m/3m signed positif + agg > 0.65 + OFI LONG + 
+    book BULLISH + funding < 0.001 + up_energy > 1.0
+    = Jangan veto, biarkan LONG
+    """
+    hawkes_qual   = str(result.get("_hawkes_mtf_momentum_quality", ""))
+    hawkes_dir    = str(result.get("_hawkes_mtf_direction", ""))
+    signed        = result.get("_hawkes_mtf_signed_pressure", {}) or {}
+    book_bias     = str(result.get("_book_bias", "NEUTRAL"))
+    ask_bid       = _panglima_num(result.get("_ask_bid_ratio", 1.0), 1.0)
+    agg_v         = _panglima_num(result.get("agg", 0.5), 0.5)
+    ofi_b         = str(result.get("ofi_bias", "NEUTRAL"))
+    ofi_str       = _panglima_num(result.get("ofi_strength", 0), 0)
+    funding       = _panglima_num(result.get("funding_rate", 0) or 0.0, 0.0)
+    up_e          = _panglima_num(result.get("up_energy", 0), 0)
+    down_e        = _panglima_num(result.get("down_energy", 0), 0)
+    
+    # Hawkes harus FRESH (bukan EXHAUSTED)
+    if hawkes_qual != "FRESH":
+        return False
+    
+    # Hawkes direction harus LONG
+    if hawkes_dir != "LONG":
+        return False
+    
+    # Signed pressure 1m + 3m harus positif (momentum sekarang LONG)
+    p1m = _panglima_num(signed.get("1m", 0), 0)
+    p3m = _panglima_num(signed.get("3m", 0), 0)
+    if p1m < 5 or p3m < 10:
+        return False
+    
+    # Order book genuinely bullish (bukan spoof)
+    # Bid spoof biasanya bid >> ask dengan volume kering DAN agg rendah
+    # Genuine: bid > ask DAN agg tinggi
+    if book_bias == "BULLISH" and agg_v > 0.65:
+        pass  # genuine bid dominance
+    else:
+        return False
+    
+    # OFI harus mendukung LONG
+    if ofi_b != "LONG" or ofi_str < 0.5:
+        return False
+    
+    # Funding tidak crowded LONG (tidak ada yang akan di-exit dump)
+    if funding > 0.001:
+        return False
+    
+    # Ada buying pressure nyata
+    if up_e < 1.0 or down_e > 0.1:
+        return False
+    
+    return True  # Genuine squeeze — jangan veto
+
+
 def _detect_squeeze_quality_veto(result: dict, proposed_bias: str) -> dict:
     if proposed_bias not in ("LONG", "SHORT"):
         return {"override": False}
+
+    # ── WHITELIST: Genuine squeeze jangan diveto ──
+    # Fix dari kasus BSBUSDT 02:26: SQUEEZE_QUALITY_VETO terlalu agresif
+    # menangkap genuine setup dengan short_liq dekat tapi semua indikator LONG kuat
+    if proposed_bias == "LONG" and _is_genuine_squeeze_setup(result):
+        return {"override": False}  # Skip veto, biarkan LONG jalan
 
     target_liq, other_liq = _target_liq_for_bias(result, proposed_bias)
     if not (target_liq < 1.5 and target_liq < other_liq):
