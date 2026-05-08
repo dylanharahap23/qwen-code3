@@ -834,12 +834,29 @@ def compute_hawkes_multi_tf_intensity(symbol: str, fetcher=None, client=None) ->
             intensities[tf] = mu
             signed_pressure[tf] = 0.0
 
-    dominant_tf = max(intensities, key=intensities.get)
-    max_intensity = intensities[dominant_tf]
+    # === LECTURER FIX: SIGNED-PRESSURE DOMINANCE, BUKAN INTENSITY DOMINANCE ===
+    # Masalah dari NILUSDT: sistem menggunakan intensity-weighted dominance (1m selalu menang)
+    # Solusi: gunakan signed-pressure-weighted dominance (4h/1h yang besar lebih penting)
+    
+    # Hitung macro pressure score (1h + 4h) vs micro noise (1m + 3m)
+    macro_pressure = signed_pressure.get('1h', 0) + signed_pressure.get('4h', 0)
+    micro_pressure = signed_pressure.get('1m', 0) + signed_pressure.get('3m', 0)
+    
+    # Jika macro pressure > 100 dan berlawanan dengan micro, MACRO YANG MENANG
+    if abs(macro_pressure) > 100 and abs(micro_pressure) < 50:
+        # Macro dominates → arah = sign(macro_pressure)
+        direction = "LONG" if macro_pressure > 0 else "SHORT" if macro_pressure < 0 else "NEUTRAL"
+        dominant_tf = "4h" if abs(signed_pressure.get('4h', 0)) >= abs(signed_pressure.get('1h', 0)) else "1h"
+        max_intensity = intensities.get(dominant_tf, mu)
+    else:
+        # Normal case: intensity-based dominance masih berlaku
+        dominant_tf = max(intensities, key=intensities.get)
+        max_intensity = intensities[dominant_tf]
+        dominant_pressure = signed_pressure.get(dominant_tf, 0.0)
+        direction = "LONG" if dominant_pressure > 0 else "SHORT" if dominant_pressure < 0 else "NEUTRAL"
+    
     baseline_ratio = max_intensity / mu if mu > 0 else 1.0
     hot_timeframes = [tf for tf, val in intensities.items() if val > mu * 3.0]
-    dominant_pressure = signed_pressure.get(dominant_tf, 0.0)
-    direction = "LONG" if dominant_pressure > 0 else "SHORT" if dominant_pressure < 0 else "NEUTRAL"
     momentum_quality = {
         "1m": "FRESH",
         "3m": "FRESH",
@@ -14353,6 +14370,16 @@ def compute_squeeze_fuel_score(result: dict) -> int:
     Score >= 3 : fuel cukup untuk genuine squeeze
     Score 0-2  : fuel rendah, hati-hati
     Score < 0  : tidak ada fuel, jangan masuk LONG meskipun short_liq dekat
+    
+    LECTURER FIX: Formula lama bias terhadap funding positif (crowded LONG).
+    Untuk SHORT SQUEEZE, funding NEGATIF justru adalah FUEL (crowded SHORT yang bisa di-squeeze).
+    
+    Updated formula:
+    - funding negatif ekstrem (-0.002) = +fuel untuk SHORT SQUEEZE
+    - funding positif ekstrem (+0.002) = +fuel untuk LONG SQUEEZE  
+    - down_energy = 0 = +fuel besar (tidak ada seller defense)
+    - up_energy tinggi = +fuel
+    - liq asymmetry = +fuel
     """
     score = 0
     funding = result.get("funding_rate", 0) or 0.0
@@ -14362,18 +14389,74 @@ def compute_squeeze_fuel_score(result: dict) -> int:
     exchange_dir = result.get("exchange_safe_direction", "NEUTRAL")
     exchange_score = result.get("exchange_risk_score", 0)
     agg = result.get("agg", 0.5)
-
-    # Fuel positif
-    if funding > 0.0002:   score += 2   # short crowded dengan posisi baru
-    if ofi_bias == "LONG" and ofi_strength > 0.4:  score += 1
-    if stoch_j < 80:       score += 1   # belum overbought
-    if agg > 0.65:         score += 1   # demand nyata
-
-    # Fuel negatif
-    if funding < -0.0001:  score -= 2   # short sudah crowded sebelumnya
-    if stoch_j > 115:      score -= 2   # overbought ekstrem
-    if exchange_score >= 6 and exchange_dir == "SHORT":  score -= 2
-
+    
+    # === LECTURER FIX: ENERGY ASYMMETRY ===
+    up_energy = _panglima_num(result.get("up_energy", 0), 0)
+    down_energy = _panglima_num(result.get("down_energy", 0), 0)
+    
+    # down_energy = 0 adalah sinyal terkuat untuk SHORT SQUEEZE (tidak ada seller)
+    if down_energy == 0 and up_energy > 1:
+        score += 3  # Critical: zero seller defense
+    
+    # === LECTURER FIX: FUNDING CROWDING DIRECTIONAL ===
+    # Funding negatif = crowded SHORT = fuel untuk SHORT SQUEEZE (LONG bias)
+    # Funding positif = crowded LONG = fuel untuk LONG SQUEEZE (SHORT bias)
+    if funding < -0.002:
+        score += 3  # Short sangat crowded → explosive SHORT SQUEEZE potential
+    elif funding < -0.001:
+        score += 2  # Short moderately crowded
+    elif funding < -0.0003:
+        score += 1  # Short slightly crowded
+    
+    if funding > 0.002:
+        score += 3  # Long sangat crowded → explosive LONG SQUEEZE potential
+    elif funding > 0.001:
+        score += 2  # Long moderately crowded
+    elif funding > 0.0002:
+        score += 1  # Long slightly crowded
+    
+    # === LIQUIDATION ASYMMETRY ===
+    short_liq = _panglima_num(result.get("short_liq", 99), 99)
+    long_liq = _panglima_num(result.get("long_liq", 99), 99)
+    
+    # Jika short_liq jauh lebih dekat dari long_liq → fuel untuk SHORT SQUEEZE
+    if short_liq < 2.0 and short_liq < long_liq * 0.6:
+        score += 2  # Asymmetric magnet to upside
+    elif short_liq < 1.0:
+        score += 1  # Very close short liq
+    
+    # Jika long_liq jauh lebih dekat dari short_liq → fuel untuk LONG SQUEEZE
+    if long_liq < 2.0 and long_liq < short_liq * 0.6:
+        score += 2  # Asymmetric magnet to downside
+    elif long_liq < 1.0:
+        score += 1  # Very close long liq
+    
+    # === OFI CONFIRMATION ===
+    if ofi_bias == "LONG" and ofi_strength > 0.4:
+        score += 1
+    if ofi_bias == "SHORT" and ofi_strength > 0.4:
+        score += 1
+    
+    # === STOCHASTIC ROOM ===
+    if stoch_j < 80:
+        score += 1   # belum overbought (room to run up)
+    if stoch_j > 20:
+        score += 1   # belum oversold (room to run down)
+    
+    # === AGGREGATOR DEMAND ===
+    if agg > 0.65:
+        score += 1   # demand nyata
+    
+    # === NEGATIVE FUEL (exhaustion/blockers) ===
+    if stoch_j > 115:
+        score -= 2   # overbought ekstrem
+    if stoch_j < 5:
+        score -= 2   # oversold ekstrem
+    if exchange_score >= 6 and exchange_dir == "SHORT":
+        score -= 2
+    if exchange_score >= 6 and exchange_dir == "LONG":
+        score -= 2
+    
     return score
 
 
@@ -14656,10 +14739,16 @@ def _is_genuine_squeeze_setup(result: dict) -> bool:
     Return True = ini genuine squeeze, JANGAN di-veto.
     Bukan distribusi, bukan exhaustion.
     
+    UPDATED: Mengintegrasikan saran dosen untuk mendeteksi genuine squeeze
+    yang ignite dari apparent bearishness (spoofed asks, sweep down, then reversal).
+    
     Formula yang terbukti konsisten untuk genuine squeeze:
-    FRESH quality + 1m/3m signed positif + agg > 0.65 + OFI LONG + 
-    book BULLISH + funding < 0.001 + up_energy > 1.0
+    - FRESH quality + funding negatif (crowded shorts) + short_liq dekat + 
+      down_energy=0 + macro pressure positif (1h+4h) + HFT/Algo consensus LONG
     = Jangan veto, biarkan LONG
+    
+    CATATAN PENTING: Short squeeze sejati sering ignite dari book yang terlihat BEARISH
+    (itu adalah spoof trap), jadi kita TIDAK meminta book_bias=BULLISH lagi.
     """
     hawkes_qual   = str(result.get("_hawkes_mtf_momentum_quality", ""))
     hawkes_dir    = str(result.get("_hawkes_mtf_direction", ""))
@@ -14672,7 +14761,81 @@ def _is_genuine_squeeze_setup(result: dict) -> bool:
     funding       = _panglima_num(result.get("funding_rate", 0) or 0.0, 0.0)
     up_e          = _panglima_num(result.get("up_energy", 0), 0)
     down_e        = _panglima_num(result.get("down_energy", 0), 0)
+    short_liq     = _panglima_num(result.get("short_liq", 99), 99)
+    long_liq      = _panglima_num(result.get("long_liq", 99), 99)
+    volume_ratio  = _panglima_num(result.get("volume_ratio", 1.0), 1.0)
+    market_regime = str(result.get("market_regime", ""))
+    hft_bias      = str(result.get("hft_6pct_bias", ""))
+    algo_bias     = str(result.get("algo_type_bias", ""))
     
+    # === LECTURER FIX: Liquidity Vacuum + Crowded Shorts Pattern ===
+    # Ini adalah pattern paling powerful untuk short squeeze continuation
+    vacuum_score = 0
+    if volume_ratio < 0.6: vacuum_score += 2
+    if down_e < 0.2 or up_e < 0.2: vacuum_score += 2  # one-sided
+    if min(short_liq, long_liq) < 2.0: vacuum_score += 2
+    if market_regime == 'LIQUIDATION_HUNT': vacuum_score += 2
+    if abs(funding) > 0.0015: vacuum_score += 2
+    
+    closer_side = 'LONG' if short_liq < long_liq else 'SHORT'
+    asymmetry = max(short_liq, long_liq) / max(min(short_liq, long_liq), 0.01)
+    if asymmetry > 2.5: vacuum_score += 3
+    
+    vacuum_active = vacuum_score >= 7
+    
+    # === Squeeze Continuation Probability ===
+    cont_prob = 0.0
+    if funding < -0.002: cont_prob += 0.30  # crowded shorts
+    if funding >  0.002: cont_prob -= 0.30
+    if min(short_liq, long_liq) < 1.5: cont_prob += 0.20
+    if down_e == 0 and up_e > 1: cont_prob += 0.20
+    if up_e == 0 and down_e > 1: cont_prob -= 0.20
+    
+    # MTF macro pressure (1h+4h, BUKAN 1m)
+    p_macro = _panglima_num(signed.get('1h', 0), 0) + _panglima_num(signed.get('4h', 0), 0)
+    cont_prob += max(min(p_macro / 300, 0.20), -0.20)
+    
+    # HFT/algo consensus
+    if hft_bias == algo_bias and hft_bias in ('LONG', 'SHORT'): cont_prob += 0.15
+    
+    # === GENUINE SHORT SQUEEZE SETUP (pattern dari NILUSDT forensic) ===
+    # Pattern: funding negatif + short_liq dekat + down_energy=0 + macro LONG
+    if (vacuum_active and 
+        cont_prob > 0.5 and 
+        funding < -0.0015 and 
+        short_liq < 2.0 and 
+        short_liq < long_liq and
+        down_e < 0.3 and
+        p_macro > 50):
+        return True  # Genuine short squeeze setup — jangan veto
+    
+    # === HIDDEN ACCUMULATION DETECTOR ===
+    # Signs: low vol + price stable/up + zero down energy + neg funding + bearish book (spoof)
+    change_5m = _panglima_num(result.get("change_5m", 0), 0)
+    hidden_accumulation = (
+        volume_ratio < 0.7 and
+        change_5m >= 0 and
+        down_e < 0.2 and
+        funding < -0.001 and
+        book_bias == 'BEARISH'  # bearish book during accumulation = spoof
+    )
+    
+    if hidden_accumulation and short_liq < 2.0 and short_liq < long_liq:
+        return True  # Hidden accumulation untuk upside — jangan veto
+    
+    # === MARKET MAKER ABSORPTION DETECTOR ===
+    # MM absorbs when: heavy ask wall + low actual sells + price holding + crowded shorts
+    spoof_wall = ask_bid > 2.0
+    no_sellers = down_e < 0.3
+    holding    = change_5m > -0.5  # not dumping despite 'pressure'
+    crowded_shorts = funding < -0.0015
+    
+    mm_absorption = spoof_wall and no_sellers and holding and crowded_shorts
+    
+    if mm_absorption and short_liq < 2.0 and short_liq < long_liq:
+        return True  # MM absorption untuk upside repricing — jangan veto
+    
+    # === CLASSIC GENUINE SQUEEZE (pattern lama yang masih valid) ===
     # Hawkes harus FRESH (bukan EXHAUSTED)
     if hawkes_qual != "FRESH":
         return False
@@ -14682,29 +14845,43 @@ def _is_genuine_squeeze_setup(result: dict) -> bool:
         return False
     
     # Signed pressure 1m + 3m harus positif (momentum sekarang LONG)
+    # RELAXED: untuk short squeeze dari sweep, 1m/3m bisa negatif sesaat
     p1m = _panglima_num(signed.get("1m", 0), 0)
     p3m = _panglima_num(signed.get("3m", 0), 0)
-    if p1m < 5 or p3m < 10:
-        return False
+    
+    # Jika vacuum_active dan cont_prob tinggi, abaikan 1m/3m noise
+    if not (vacuum_active and cont_prob > 0.5):
+        if p1m < 5 or p3m < 10:
+            return False
     
     # Order book genuinely bullish (bukan spoof)
-    # Bid spoof biasanya bid >> ask dengan volume kering DAN agg rendah
-    # Genuine: bid > ask DAN agg tinggi
+    # LECTURER FIX: Untuk short squeeze, book bisa BEARISH (spoof trap)
+    # Jadi kita cek apakah ada absorption atau hidden accumulation
     if book_bias == "BULLISH" and agg_v > 0.65:
         pass  # genuine bid dominance
+    elif vacuum_active and cont_prob > 0.5:
+        pass  # vacuum squeeze bisa dari book BEARISH (spoof)
+    elif hidden_accumulation or mm_absorption:
+        pass  # accumulation/absorption pattern
     else:
         return False
     
     # OFI harus mendukung LONG
-    if ofi_b != "LONG" or ofi_str < 0.5:
-        return False
+    # LECTURER FIX: OFI bisa SHORT sesaat sebelum squeeze (spoof)
+    if not (vacuum_active and cont_prob > 0.5):
+        if ofi_b != "LONG" or ofi_str < 0.5:
+            return False
     
     # Funding tidak crowded LONG (tidak ada yang akan di-exit dump)
-    if funding > 0.001:
+    # LECTURER FIX: funding NEGATIF justru bagus untuk short squeeze (crowded shorts)
+    if funding > 0.001 and not (vacuum_active and cont_prob > 0.5):
         return False
     
     # Ada buying pressure nyata
-    if up_e < 1.0 or down_e > 0.1:
+    if up_e < 1.0 and not (vacuum_active and cont_prob > 0.5):
+        return False
+    
+    if down_e > 0.1 and not (vacuum_active and cont_prob > 0.5):
         return False
     
     return True  # Genuine squeeze — jangan veto
