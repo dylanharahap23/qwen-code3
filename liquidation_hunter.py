@@ -82,6 +82,49 @@ _forensic_price_memory: Dict[str, List[Tuple[float, float]]] = {}
 # ================= POST-SQUEEZE DECAY REGIME TRACKER =================
 _post_squeeze_decay_until: Dict[str, float] = {}  # symbol -> timestamp until which LONG is blocked
 
+
+# ================= GENUINE SQUEEZE DETECTOR (LECTURER'S SARAN) =================
+def _is_genuine_squeeze_active(result: dict) -> bool:
+    """
+    Deteksi apakah kondisi saat ini adalah genuine short squeeze yang TIDAK BOLEH
+    diganggu oleh detektor distribusi/exit-liquidity.
+    """
+    short_liq = result.get("short_liq", 99.0)
+    long_liq = result.get("long_liq", 99.0)
+    up_energy = result.get("up_energy", 0.0)
+    down_energy = result.get("down_energy", 0.0)
+    agg = result.get("agg", 0.5)
+    ofi_bias = result.get("ofi_bias", "NEUTRAL")
+    ofi_strength = result.get("ofi_strength", 0.0)
+    funding = result.get("funding_rate", 0.0) or 0.0
+    greeks_kill = result.get("greeks_kill_direction", "")
+    gamma_intensity = result.get("greeks_gamma_intensity", "LOW")
+    delta_crowded = result.get("greeks_delta_crowded", "")
+    pre_kill_sweep_bias = result.get("_pre_kill_sweep_bias", "")
+
+    # Kasus 1: short_liq sangat dekat + buy pressure nyata
+    if short_liq < 1.5 and up_energy > 0.5 and down_energy < 0.01:
+        return True
+
+    # Kasus 2: short_liq dekat + buy pressure kuat + order flow bullish
+    if short_liq < 2.0 and up_energy > 1.0 and agg > 0.8 and ofi_bias == "LONG" and ofi_strength > 0.7:
+        return True
+
+    # Kasus 3: funding negatif (short crowded) + short_liq dalam jangkauan
+    if funding < -0.001 and short_liq < 3.0:
+        return True
+
+    # Kasus 4: Greeks sudah commit LONG dengan gamma tinggi
+    if greeks_kill == "LONG" and gamma_intensity in ("HIGH", "EXTREME") and delta_crowded == "SHORT":
+        return True
+
+    # Kasus 5: pre-kill sweep sudah mendeteksi short_liq ultra dekat
+    if short_liq < 1.0 and pre_kill_sweep_bias == "LONG":
+        return True
+
+    return False
+
+
 # ================= LECTURER FIX v10: SIGNAL CONSISTENCY VALIDATION =================
 def validate_signal_consistency(result: dict) -> bool:
     """
@@ -16654,14 +16697,15 @@ def _apply_forensic_market_structure_guards(result: dict,
 
     # --- HARD VETO dari Hawkes exhaustion ---
     hawkes_exhaust = _hawkes_exhaustion_v2(result)
-    if hawkes_exhaust.get("exhausted") and hawkes_exhaust.get("status") in ("ECHO_NOT_IGNITION", "EXHAUSTED_LAGGING_MACRO"):
-        # Batalkan semua squeeze continuation dan paksa SHORT jika bias saat ini LONG
-        if result.get("bias") == "LONG":
-            return _apply_forensic_forced_bias(
-                result,
-                {"bias": "SHORT", "reason": f"HAWKES_EXHAUSTION_VETO: {hawkes_exhaust['reason']}", "priority": -31800},
-                "HAWKES_EXHAUSTION_VETO"
-            ), True
+    if not _is_genuine_squeeze_active(result):
+        if hawkes_exhaust.get("exhausted") and hawkes_exhaust.get("status") in ("ECHO_NOT_IGNITION", "EXHAUSTED_LAGGING_MACRO"):
+            # Batalkan semua squeeze continuation dan paksa SHORT jika bias saat ini LONG
+            if result.get("bias") == "LONG":
+                return _apply_forensic_forced_bias(
+                    result,
+                    {"bias": "SHORT", "reason": f"HAWKES_EXHAUSTION_VETO: {hawkes_exhaust['reason']}", "priority": -31800},
+                    "HAWKES_EXHAUSTION_VETO"
+                ), True
 
     obv_lock = _detect_obv_accumulation_lock(result)
     if obv_lock.get("lock"):
@@ -31622,6 +31666,10 @@ class HiddenDistributionDetector:
     """
     @staticmethod
     def detect(result: dict) -> dict:
+        # GUARD: Skip jika genuine squeeze sedang aktif
+        if _is_genuine_squeeze_active(result):
+            return {"override": False}
+        
         down_energy = result.get("down_energy", 0)
         ask_slope = result.get("ask_slope", 0)
         bid_slope = result.get("bid_slope", 1)
@@ -31689,6 +31737,10 @@ class ExitLiquidityDetector:
     """
     @staticmethod
     def detect(result: dict) -> dict:
+        # GUARD: Skip jika genuine squeeze sedang aktif
+        if _is_genuine_squeeze_active(result):
+            return {"override": False}
+        
         ask_slope = result.get("ask_slope", 0)
         bid_slope = result.get("bid_slope", 1)
         ask_bid_ratio = ask_slope / max(bid_slope, 1e-9) if bid_slope > 0 else 1.0
@@ -31729,6 +31781,10 @@ class ThinAskVacuumClassifier:
     """
     @staticmethod
     def classify(result: dict) -> dict:
+        # GUARD: Skip jika genuine squeeze sedang aktif
+        if _is_genuine_squeeze_active(result):
+            return {"override": False}
+        
         up_energy = result.get("up_energy", 0)
         down_energy = result.get("down_energy", 0)
         volume_ratio = result.get("volume_ratio", 1.0)
@@ -33107,14 +33163,16 @@ class BinanceAnalyzer:
                 return result
         else:
             # Aktifkan decay jika kondisi terpenuhi: pump >4% dalam 5m, volume_ratio<0.7, ask_bid>1.3
-            change_5m = result.get("change_5m", 0)
-            volume_ratio = result.get("volume_ratio", 1.0)
-            ask_slope = result.get("ask_slope", 0)
-            bid_slope = result.get("bid_slope", 1)
-            ask_bid_ratio = ask_slope / max(bid_slope, 1e-9) if bid_slope > 0 else 1.0
-            if change_5m > 4.0 and volume_ratio < 0.7 and ask_bid_ratio > 1.3:
-                _post_squeeze_decay_until[symbol] = now + 3600  # 60 menit
-                result["_post_squeeze_decay_activated"] = True
+            # GUARD: Jangan aktifkan decay jika genuine squeeze sedang berlangsung
+            if not _is_genuine_squeeze_active(result):
+                change_5m = result.get("change_5m", 0)
+                volume_ratio = result.get("volume_ratio", 1.0)
+                ask_slope = result.get("ask_slope", 0)
+                bid_slope = result.get("bid_slope", 1)
+                ask_bid_ratio = ask_slope / max(bid_slope, 1e-9) if bid_slope > 0 else 1.0
+                if change_5m > 4.0 and volume_ratio < 0.7 and ask_bid_ratio > 1.3:
+                    _post_squeeze_decay_until[symbol] = now + 3600  # 60 menit
+                    result["_post_squeeze_decay_activated"] = True
         
         # Rule 6 harus berlaku di semua path: jika regime detector sudah
         # menandai MANIPULATION/SKIP, detector high-priority tidak boleh
