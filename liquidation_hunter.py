@@ -79,6 +79,9 @@ HAWKES_MTF_TTL_SEC = 60
 # ================= FORENSIC PRICE-STATE MEMORY =================
 _forensic_price_memory: Dict[str, List[Tuple[float, float]]] = {}
 
+# ================= POST-SQUEEZE DECAY REGIME TRACKER =================
+_post_squeeze_decay_until: Dict[str, float] = {}  # symbol -> timestamp until which LONG is blocked
+
 # ================= LECTURER FIX v10: SIGNAL CONSISTENCY VALIDATION =================
 def validate_signal_consistency(result: dict) -> bool:
     """
@@ -13648,6 +13651,28 @@ def _terminal_blowoff_short_detector(result: dict) -> dict:
 
 
 def _thin_ask_vacuum_continuation(result: dict) -> dict:
+    """
+    DEPRECATED: Gunakan ThinAskVacuumClassifier.classify() sebagai pengganti.
+    Fungsi ini tetap ada untuk backward compatibility.
+    """
+    # Guard: BAIT phase atau ask_bid tinggi → no_rejection bukan sinyal bullish
+    market_phase = result.get("market_phase", "UNKNOWN")
+    ask_slope = _panglima_num(result.get("ask_slope", 0), 0.0)
+    bid_slope = _panglima_num(result.get("bid_slope", 1), 1.0)
+    ask_bid_ratio = ask_slope / max(bid_slope, 1e-9)
+    
+    if market_phase == "BAIT" or ask_bid_ratio > 1.25:
+        down_energy = _panglima_num(result.get("down_energy", 0), 0.0)
+        up_energy = _panglima_num(result.get("up_energy", 0), 0.0)
+        no_rejection = down_energy <= max(0.3 * max(up_energy, 0.01), ENERGY_ZERO_THRESHOLD)
+        if no_rejection and ask_bid_ratio > 1.25:
+            return {
+                "override": True, "bias": "SHORT",
+                "reason": f"THIN_ASK_VACUUM_OVERRIDE_CANCELLED: Ask wall {ask_bid_ratio:.2f}>1.25 in BAIT phase -> supply overrides vacuum",
+                "priority": -30740
+            }
+        return {"override": False}
+    
     signed = result.get("_hawkes_mtf_signed_pressure", {}) or {}
     if not isinstance(signed, dict):
         signed = {}
@@ -16034,6 +16059,14 @@ def _hawkes_fresh_directional_lock_candidate(result: dict, direction: str = None
     if hawkes_dir not in ("LONG", "SHORT"):
         return {"lock": False}
 
+    # Tambahan kondisi: tidak mengunci LONG jika Hawkes exhausted dan volume kering
+    hawkes_exhaustion = _hawkes_exhaustion_v2(result)
+    volume_ratio = _panglima_num(result.get("volume_ratio", 1.0), 1.0)
+    if hawkes_dir == "LONG" and hawkes_exhaustion.get("exhausted") and volume_ratio < 0.7:
+        result["_hawkes_lock_rejected_by_exhaustion_dry_volume"] = True
+        result["_hawkes_exhaustion_v2"] = hawkes_exhaustion
+        return {"lock": False}
+
     macro_override = _macro_signed_pressure_override(result)
     if macro_override.get("override") and macro_override.get("bias") != hawkes_dir:
         result["_hawkes_lock_rejected_by_macro_pressure"] = True
@@ -16618,6 +16651,17 @@ def _apply_forensic_market_structure_guards(result: dict,
     continuation_dump = _detect_continuation_dump(result)
     if continuation_dump.get("override"):
         return _apply_forensic_forced_bias(result, continuation_dump, "CONTINUATION_DUMP"), True
+
+    # --- HARD VETO dari Hawkes exhaustion ---
+    hawkes_exhaust = _hawkes_exhaustion_v2(result)
+    if hawkes_exhaust.get("exhausted") and hawkes_exhaust.get("status") in ("ECHO_NOT_IGNITION", "EXHAUSTED_LAGGING_MACRO"):
+        # Batalkan semua squeeze continuation dan paksa SHORT jika bias saat ini LONG
+        if result.get("bias") == "LONG":
+            return _apply_forensic_forced_bias(
+                result,
+                {"bias": "SHORT", "reason": f"HAWKES_EXHAUSTION_VETO: {hawkes_exhaust['reason']}", "priority": -31800},
+                "HAWKES_EXHAUSTION_VETO"
+            ), True
 
     obv_lock = _detect_obv_accumulation_lock(result)
     if obv_lock.get("lock"):
@@ -31571,6 +31615,169 @@ class PhantomBidWallCrowdedLongShield:
         }
 
 
+class HiddenDistributionDetector:
+    """
+    PRIORITY -31580 (di atas PhantomBidWallCrowdedLongShield -31550)
+    Mendeteksi distribusi tersembunyi (BANANA pattern) dengan skor >=7 → HARD VETO LONG.
+    """
+    @staticmethod
+    def detect(result: dict) -> dict:
+        down_energy = result.get("down_energy", 0)
+        ask_slope = result.get("ask_slope", 0)
+        bid_slope = result.get("bid_slope", 1)
+        ask_bid_ratio = ask_slope / max(bid_slope, 1e-9) if bid_slope > 0 else 1.0
+        up_energy = result.get("up_energy", 0)
+        ofi_bias = result.get("ofi_bias", "NEUTRAL")
+        ofi_strength = result.get("ofi_strength", 0.0)
+        volume_ratio = result.get("volume_ratio", 1.0)
+        change_5m = result.get("change_5m", 0)
+        hawkes_quality = result.get("_hawkes_mtf_momentum_quality", "UNKNOWN")
+        hawkes_status = result.get("_hawkes_exhaustion_v2", {}).get("status", "")
+        market_phase = result.get("market_phase", "UNKNOWN")
+        greeks_vega_score = result.get("greeks_vega_score", 0)
+        funding_rate = result.get("funding_rate", 0) or 0.0
+        short_liq = result.get("short_liq", 99)
+        obv_trend = result.get("obv_trend", "NEUTRAL")
+
+        score = 0
+        signals = []
+
+        # Phantom no seller with real supply
+        if down_energy < 0.01 and ask_bid_ratio > 1.3:
+            score += 3
+            signals.append("phantom_no_seller_with_real_supply")
+        # Energy OFI contradiction (distribution)
+        if up_energy > 0 and ofi_bias == "SHORT" and ofi_strength > 0.8:
+            score += 3
+            signals.append("energy_OFI_contradiction_distribution")
+        # Price up on low volume
+        if volume_ratio < 0.7 and change_5m > 1.5:
+            score += 2
+            signals.append("price_up_on_no_volume_distribution")
+        # Hawkes echo residue
+        if hawkes_quality == "EXHAUSTED" and hawkes_status in ("ECHO_NOT_IGNITION", "EXHAUSTED_LAGGING_MACRO"):
+            score += 2
+            signals.append("hawkes_echo_residue")
+        # Vega bait distribution cover
+        if market_phase == "BAIT" and greeks_vega_score >= 5:
+            score += 2
+            signals.append("vega_bait_distribution_cover")
+        # No fresh short crowd to squeeze
+        if abs(funding_rate) < 0.0001 and short_liq < 2.0:
+            score += 1
+            signals.append("no_fresh_short_crowd_to_squeeze")
+        # OBV not confirming pump
+        if obv_trend == "NEUTRAL" and change_5m > 1.5:
+            score += 1
+            signals.append("OBV_not_confirming_pump")
+
+        if score >= 7:
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"HIDDEN DISTRIBUTION DETECTED (score={score}): " + "; ".join(signals),
+                "priority": -31580,
+                "confidence": "ABSOLUTE"
+            }
+        return {"override": False}
+
+
+class ExitLiquidityDetector:
+    """
+    PRIORITY -29050: Mendeteksi bahwa MM sedang menggunakan pump ini untuk exit.
+    Jika 4+ kondisi terpenuhi → HARD VETO LONG.
+    """
+    @staticmethod
+    def detect(result: dict) -> dict:
+        ask_slope = result.get("ask_slope", 0)
+        bid_slope = result.get("bid_slope", 1)
+        ask_bid_ratio = ask_slope / max(bid_slope, 1e-9) if bid_slope > 0 else 1.0
+        ofi_bias = result.get("ofi_bias", "NEUTRAL")
+        up_energy = result.get("up_energy", 0)
+        down_energy = result.get("down_energy", 0)
+        volume_ratio = result.get("volume_ratio", 1.0)
+        hawkes_macro = result.get("_hawkes_mtf_signed_pressure", {}).get("4h", 0) + result.get("_hawkes_mtf_signed_pressure", {}).get("1h", 0)
+        hawkes_micro = result.get("_hawkes_mtf_signed_pressure", {}).get("1m", 0) + result.get("_hawkes_mtf_signed_pressure", {}).get("3m", 0)
+        change_5m = result.get("change_5m", 0)
+        rsi6 = result.get("rsi6", 50)
+        funding_rate = result.get("funding_rate", 0) or 0.0
+
+        conditions = [
+            ask_bid_ratio > 1.25,
+            ofi_bias != ("LONG" if up_energy > down_energy else "SHORT"),  # OFI opposite to energy direction
+            volume_ratio < 0.8,
+            (hawkes_macro / max(hawkes_micro, 0.01)) > 3.0,
+            change_5m > 1.5 and rsi6 < 65,
+            abs(funding_rate) < 0.0001
+        ]
+        count = sum(conditions)
+        if count >= 4:
+            return {
+                "override": True,
+                "bias": "SHORT",
+                "reason": f"EXIT LIQUIDITY DETECTED (conditions={count}/6): MM is distributing",
+                "priority": -29050,
+                "confidence": "ABSOLUTE"
+            }
+        return {"override": False}
+
+
+class ThinAskVacuumClassifier:
+    """
+    Menggantikan _thin_ask_vacuum_continuation dengan klasifikasi yang benar.
+    Output: "REAL_CONTINUATION", "TERMINAL_VACUUM_FADE", "AMBIGUOUS_NO_TRADE"
+    """
+    @staticmethod
+    def classify(result: dict) -> dict:
+        up_energy = result.get("up_energy", 0)
+        down_energy = result.get("down_energy", 0)
+        volume_ratio = result.get("volume_ratio", 1.0)
+        ask_slope = result.get("ask_slope", 0)
+        bid_slope = result.get("bid_slope", 1)
+        ask_bid_ratio = ask_slope / max(bid_slope, 1e-9) if bid_slope > 0 else 1.0
+        funding_rate = result.get("funding_rate", 0) or 0.0
+        hawkes_quality = result.get("_hawkes_mtf_momentum_quality", "UNKNOWN")
+        ofi_bias = result.get("ofi_bias", "NEUTRAL")
+        market_phase = result.get("market_phase", "UNKNOWN")
+        change_60m = result.get("_forensic_drawdown_60m", 0)  # bisa diisi dari forensic
+        short_liq = result.get("short_liq", 99)
+        long_liq = result.get("long_liq", 99)
+
+        # Real continuation score
+        real_score = 0
+        if up_energy / max(down_energy, 0.01) > 2.0:
+            real_score += 2
+        if volume_ratio > 1.0:
+            real_score += 2
+        if ask_bid_ratio < 1.1:
+            real_score += 2
+        if abs(funding_rate) > 0.0002 and ((funding_rate > 0 and short_liq < long_liq) or (funding_rate < 0 and long_liq < short_liq)):
+            real_score += 1
+        if hawkes_quality in ("DEVELOPING", "FRESH"):
+            real_score += 2
+
+        # Terminal vacuum (fake continuation) score
+        fake_score = 0
+        if ask_bid_ratio > 1.25:
+            fake_score += 3
+        if ofi_bias != ("LONG" if up_energy > down_energy else "SHORT"):
+            fake_score += 2
+        if volume_ratio < 0.7:
+            fake_score += 2
+        if hawkes_quality == "EXHAUSTED":
+            fake_score += 2
+        if market_phase == "BAIT":
+            fake_score += 2
+        if change_60m > 0.05:  # sudah naik >5% dalam 60m
+            fake_score += 2
+
+        if fake_score >= real_score + 2:
+            return {"override": True, "bias": "SHORT", "reason": "TERMINAL_VACUUM_FADE", "priority": -30740}
+        if real_score >= fake_score + 3:
+            return {"override": True, "bias": "LONG", "reason": "REAL_CONTINUATION", "priority": -30740}
+        return {"override": False, "reason": "AMBIGUOUS_NO_TRADE"}
+
+
 class CascadeDumpUltraCloseLongLiqOverride:
     """
     PRIORITY -28000: Detects cascade dump despite ultra-close long_liq and
@@ -32885,6 +33092,30 @@ class BinanceAnalyzer:
         4. Gamma Delay (Gamma EXTREME tapi delta exposure < 0.95 => tunda)
         5. Entry Filter (tambahkan rekomendasi entry di output)
         """
+        # ===== POST-SQUEEZE DECAY REGIME TRACKER =====
+        global _post_squeeze_decay_until
+        now = time.time()
+        symbol = result.get("symbol", "UNKNOWN")
+        if symbol in _post_squeeze_decay_until and now < _post_squeeze_decay_until[symbol]:
+            result["_post_squeeze_decay_active"] = True
+            # Blokir semua sinyal LONG continuation
+            if result.get("bias") == "LONG" and result.get("priority_level", 0) > -31800:
+                result["bias"] = "SHORT"
+                result["confidence"] = "ABSOLUTE"
+                result["priority_level"] = -31800
+                result["reason"] = "[POST-SQUEEZE DECAY ACTIVE] Blocking LONG due to recent pump >4% with ask_bid>1.3 and low volume. " + result.get("reason", "")
+                return result
+        else:
+            # Aktifkan decay jika kondisi terpenuhi: pump >4% dalam 5m, volume_ratio<0.7, ask_bid>1.3
+            change_5m = result.get("change_5m", 0)
+            volume_ratio = result.get("volume_ratio", 1.0)
+            ask_slope = result.get("ask_slope", 0)
+            bid_slope = result.get("bid_slope", 1)
+            ask_bid_ratio = ask_slope / max(bid_slope, 1e-9) if bid_slope > 0 else 1.0
+            if change_5m > 4.0 and volume_ratio < 0.7 and ask_bid_ratio > 1.3:
+                _post_squeeze_decay_until[symbol] = now + 3600  # 60 menit
+                result["_post_squeeze_decay_activated"] = True
+        
         # Rule 6 harus berlaku di semua path: jika regime detector sudah
         # menandai MANIPULATION/SKIP, detector high-priority tidak boleh
         # return lebih dulu dan memaksa entry.
@@ -33157,6 +33388,26 @@ class BinanceAnalyzer:
             result["reason"] = f"[PHANTOM BID WALL TRAP] {phantom_trap['reason']} | " + result.get("reason", "")
             result["confidence"] = "ABSOLUTE"
             result["priority_level"] = phantom_trap["priority"]
+            result["entry_allowed"] = True
+            return result
+
+        # ===== PRIORITY -31580: HIDDEN DISTRIBUTION DETECTOR =====
+        hidden_dist = HiddenDistributionDetector.detect(result)
+        if hidden_dist["override"]:
+            result["bias"] = hidden_dist["bias"]
+            result["reason"] = f"[HIDDEN DISTRIBUTION] {hidden_dist['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = hidden_dist["priority"]
+            result["entry_allowed"] = True
+            return result
+
+        # ===== PRIORITY -29050: EXIT LIQUIDITY DETECTOR =====
+        exit_liq = ExitLiquidityDetector.detect(result)
+        if exit_liq["override"]:
+            result["bias"] = exit_liq["bias"]
+            result["reason"] = f"[EXIT LIQUIDITY] {exit_liq['reason']} | " + result.get("reason", "")
+            result["confidence"] = "ABSOLUTE"
+            result["priority_level"] = exit_liq["priority"]
             result["entry_allowed"] = True
             return result
 
