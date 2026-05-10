@@ -94,21 +94,27 @@ def validate_signal_consistency(result: dict) -> bool:
     bias = result.get("bias")
     entry_allowed = result.get("entry_allowed", False)
 
-    # Rule 1: directional signal (LONG/SHORT) HARUS entry_allowed=True
-    # Jika bias LONG/SHORT tapi entry_allowed=False, itu kontradiksi
+    # Rule 1: directional signal (LONG/SHORT) biasanya HARUS entry_allowed=True.
+    # Exception: supervisor boleh menyimpan directional bias sambil SKIP entry
+    # saat dual-liq trap aktif, supaya arah market tidak hilang dari snapshot.
     if bias in ("LONG", "SHORT") and not entry_allowed:
+        if result.get("_dual_liq_trap_skip_enforced"):
+            return True
         return False
 
     # Rule 2: Dual Liq Trap dengan trap_score >= 4 (sangat berbahaya)
     dual_liq_trap = result.get("dual_liq_trap", {})
     if isinstance(dual_liq_trap, dict) and dual_liq_trap.get("dual_liq_trap", False):
         if dual_liq_trap.get("trap_score", 0) >= 4:
+            if result.get("_dual_liq_trap_skip_enforced"):
+                return True
             return False
 
     # Rule 3: Bias-Kill Conflict (arah bertentangan dengan kill direction yang stabil)
     bias_kill_conflict = result.get("bias_kill_conflict", {})
     if isinstance(bias_kill_conflict, dict) and bias_kill_conflict.get("has_conflict", False):
-        return False
+        if bias_kill_conflict.get("correct_direction") != bias:
+            return False
 
     # Rule 4: Kill direction instability yang berbahaya
     kill_stability = result.get("kill_direction_stability", {})
@@ -841,9 +847,16 @@ def compute_hawkes_multi_tf_intensity(symbol: str, fetcher=None, client=None) ->
     # Hitung macro pressure score (1h + 4h) vs micro noise (1m + 3m)
     macro_pressure = signed_pressure.get('1h', 0) + signed_pressure.get('4h', 0)
     micro_pressure = signed_pressure.get('1m', 0) + signed_pressure.get('3m', 0)
+    macro_sign = _pressure_sign(macro_pressure)
+    micro_sign = _pressure_sign(micro_pressure)
     
     # Jika macro pressure > 100 dan berlawanan dengan micro, MACRO YANG MENANG
-    if abs(macro_pressure) > 100 and abs(micro_pressure) < 50:
+    if (
+        macro_sign != 0 and
+        micro_sign != 0 and
+        macro_sign != micro_sign and
+        abs(macro_pressure) > max(abs(micro_pressure) * 0.5, 5.0)
+    ):
         # Macro dominates → arah = sign(macro_pressure)
         direction = "LONG" if macro_pressure > 0 else "SHORT" if macro_pressure < 0 else "NEUTRAL"
         dominant_tf = "4h" if abs(signed_pressure.get('4h', 0)) >= abs(signed_pressure.get('1h', 0)) else "1h"
@@ -13098,6 +13111,7 @@ def has_critical_override_lock(result: dict) -> bool:
         "_liq_absolute_lock",
         "_reverse_bait_detected",
         "_fake_squeeze_detected",
+        "_dual_liq_trap_skip_enforced",
     )
     if any(result.get(flag) for flag in hard_flags):
         return True
@@ -13115,6 +13129,13 @@ def apply_critical_override_lock(result: dict, source: str = "") -> dict:
     LECTURER FIX v11: Tambahkan validasi final sebelum CRITICAL_OVERRIDE_LOCK dikunci.
     Cegah lock jika konsensus terlalu kuat berlawanan.
     """
+    result, supervisor_final = _apply_post_capitulation_arbitration_tiers(
+        result,
+        source=f"{source}_PRELOCK" if source else "CRITICAL_PRELOCK"
+    )
+    if supervisor_final:
+        return result
+
     result, panglima_vetoed = apply_panglima_greeks_veto(result, source)
     if panglima_vetoed:
         return result
@@ -13161,6 +13182,13 @@ def render_final_output(result: dict) -> dict:
     Single source of truth for anything rendered or returned to the bot.
     _final_bias_locked wins over stale bias fields.
     """
+    result, supervisor_final = _apply_post_capitulation_arbitration_tiers(
+        result,
+        source="RENDER_FINAL_OUTPUT"
+    )
+    if supervisor_final:
+        return result
+
     result, _ = _apply_forensic_market_structure_guards(
         result,
         source="RENDER_FINAL_OUTPUT"
@@ -13182,6 +13210,1267 @@ def render_final_output(result: dict) -> dict:
     return result
 
 
+def _pressure_sign(value: float, deadband: float = 1e-9) -> int:
+    if value > deadband:
+        return 1
+    if value < -deadband:
+        return -1
+    return 0
+
+
+def _hawkes_macro_micro_context(result: dict) -> dict:
+    signed = result.get("_hawkes_mtf_signed_pressure", {}) or {}
+    if not isinstance(signed, dict):
+        signed = {}
+
+    macro = (
+        _panglima_num(signed.get("1h", 0), 0.0) +
+        _panglima_num(signed.get("4h", 0), 0.0)
+    )
+    micro = (
+        _panglima_num(signed.get("1m", 0), 0.0) +
+        _panglima_num(signed.get("3m", 0), 0.0)
+    )
+    macro_sign = _pressure_sign(macro)
+    micro_sign = _pressure_sign(micro)
+    macro_bias = "LONG" if macro_sign > 0 else "SHORT" if macro_sign < 0 else "NEUTRAL"
+    micro_bias = "LONG" if micro_sign > 0 else "SHORT" if micro_sign < 0 else "NEUTRAL"
+
+    disagreement = (
+        macro_sign != 0 and
+        micro_sign != 0 and
+        macro_sign != micro_sign and
+        abs(macro) > max(abs(micro) * 0.5, 5.0)
+    )
+    return {
+        "signed": signed,
+        "macro": macro,
+        "micro": micro,
+        "macro_bias": macro_bias,
+        "micro_bias": micro_bias,
+        "disagreement": disagreement,
+    }
+
+
+def _hawkes_exhaustion_v2(result: dict) -> dict:
+    ctx = _hawkes_macro_micro_context(result)
+    signed = ctx["signed"]
+    intensities = result.get("_hawkes_mtf_intensities", {}) or {}
+    if not isinstance(intensities, dict):
+        intensities = {}
+
+    one_m_signed = _panglima_num(signed.get("1m", 0), 0.0)
+    one_m_intensity = _panglima_num(intensities.get("1m", 0), 0.0)
+    macro_abs = abs(ctx["macro"])
+    micro_abs = abs(ctx["micro"])
+    same_sign = (
+        _pressure_sign(ctx["macro"]) != 0 and
+        _pressure_sign(ctx["macro"]) == _pressure_sign(ctx["micro"])
+    )
+    pyramid_ratio = macro_abs / max(micro_abs, 1e-6)
+
+    statuses = []
+    if same_sign and pyramid_ratio > 5.0 and micro_abs < 80.0:
+        statuses.append("EXHAUSTED_LAGGING_MACRO")
+    if one_m_intensity > 20.0 and abs(one_m_signed) < one_m_intensity * 0.5:
+        statuses.append("ECHO_NOT_IGNITION")
+    if same_sign and micro_abs > macro_abs * 0.30:
+        statuses.append("GENUINE_FRESH")
+
+    exhausted = any(s in statuses for s in ("EXHAUSTED_LAGGING_MACRO", "ECHO_NOT_IGNITION"))
+    status = "AMBIGUOUS"
+    if "EXHAUSTED_LAGGING_MACRO" in statuses:
+        status = "EXHAUSTED_LAGGING_MACRO"
+    elif "ECHO_NOT_IGNITION" in statuses:
+        status = "ECHO_NOT_IGNITION"
+    elif "GENUINE_FRESH" in statuses:
+        status = "GENUINE_FRESH"
+
+    return {
+        "status": status,
+        "statuses": statuses,
+        "exhausted": exhausted,
+        "macro": ctx["macro"],
+        "micro": ctx["micro"],
+        "macro_bias": ctx["macro_bias"],
+        "micro_bias": ctx["micro_bias"],
+        "pyramid_ratio": pyramid_ratio,
+        "one_m_intensity": one_m_intensity,
+        "one_m_signed": one_m_signed,
+        "reason": (
+            f"HAWKES_EXHAUSTION_V2 status={status}, macro={ctx['macro']:.1f}, "
+            f"micro={ctx['micro']:.1f}, ratio={pyramid_ratio:.2f}, "
+            f"1m_intensity={one_m_intensity:.1f}, 1m_signed={one_m_signed:.1f}."
+        ),
+    }
+
+
+def _macro_signed_pressure_override(result: dict) -> dict:
+    ctx = _hawkes_macro_micro_context(result)
+    exhaustion = _hawkes_exhaustion_v2(result)
+    if (
+        exhaustion.get("exhausted") and
+        not ctx["disagreement"] and
+        ctx["macro_bias"] in ("LONG", "SHORT")
+    ):
+        return {
+            "override": False,
+            "macro_exhausted_demoted": True,
+            "hawkes_exhaustion_v2": exhaustion,
+            "reason": exhaustion["reason"] + " Macro Hawkes demoted to context-only.",
+            **ctx,
+        }
+
+    if not ctx["disagreement"]:
+        return {"override": False, **ctx}
+
+    quality = str(result.get("_hawkes_mtf_momentum_quality", "UNKNOWN"))
+    regime = str(result.get("market_regime", "UNKNOWN"))
+    if quality == "EXHAUSTED":
+        if ctx["micro_bias"] in ("LONG", "SHORT") and abs(ctx["micro"]) >= 20.0:
+            return {
+                "override": True,
+                "bias": ctx["micro_bias"],
+                "macro_exhausted_inversion": True,
+                "reason": (
+                    f"EXHAUSTED_MACRO_INVERSION: macro(1h+4h)={ctx['macro']:.1f} is lagging "
+                    f"post-move residue while micro(1m+3m)={ctx['micro']:.1f}; "
+                    f"trust fresh micro={ctx['micro_bias']}."
+                ),
+                **ctx,
+            }
+        return {
+            "override": False,
+            "macro_exhausted_demoted": True,
+            "reason": (
+                f"MACRO_DEMOTED: quality=EXHAUSTED, macro={ctx['macro']:.1f}, "
+                f"micro={ctx['micro']:.1f}."
+            ),
+            **ctx,
+        }
+
+    if regime == "LIQUIDATION_HUNT":
+        try:
+            liq_classifier = _liquidation_hunt_dump_classifier(result)
+        except NameError:
+            liq_classifier = {"override": False}
+        if (
+            liq_classifier.get("override") and
+            liq_classifier.get("bias") == ctx["micro_bias"] and
+            abs(ctx["micro"]) >= 20.0
+        ):
+            return {
+                "override": True,
+                "bias": ctx["micro_bias"],
+                "liquidation_hunt_micro_priority": True,
+                "reason": (
+                    f"LIQ_HUNT_MICRO_PRIORITY: macro={ctx['macro']:.1f} is context-only; "
+                    f"classifier confirms fresh micro={ctx['micro']:.1f} -> {ctx['micro_bias']}."
+                ),
+                **ctx,
+            }
+        return {
+            "override": False,
+            "liquidation_hunt_macro_demoted": True,
+            "reason": (
+                f"LIQ_HUNT_MACRO_DEMOTED: macro={ctx['macro']:.1f} vs micro={ctx['micro']:.1f}; "
+                "macro Hawkes is advisory only in liquidation hunt."
+            ),
+            **ctx,
+        }
+
+    return {
+        "override": True,
+        "bias": ctx["macro_bias"],
+        "reason": (
+            f"MACRO_SIGNED_PRESSURE_OVERRIDE: macro(1h+4h)={ctx['macro']:.1f} "
+            f"vs micro(1m+3m)={ctx['micro']:.1f}; trust macro={ctx['macro_bias']}"
+        ),
+        **ctx,
+    }
+
+
+def _apply_macro_pressure_to_hawkes(result: dict, source: str) -> dict:
+    macro = _macro_signed_pressure_override(result)
+    if not macro.get("override"):
+        return result
+
+    result["_macro_signed_pressure_override"] = True
+    result["_macro_signed_pressure_bias"] = macro["bias"]
+    result["_macro_signed_pressure_macro"] = round(macro["macro"], 4)
+    result["_macro_signed_pressure_micro"] = round(macro["micro"], 4)
+    result.setdefault("_hawkes_mtf_direction_before_macro_override", result.get("_hawkes_mtf_direction"))
+    result["_hawkes_mtf_direction"] = macro["bias"]
+    result["_hawkes_direction"] = macro["bias"]
+
+    if not result.get("_macro_signed_pressure_reason_added"):
+        result["_macro_signed_pressure_reason_added"] = True
+        result["reason"] = f"[{source}] {macro['reason']} | " + result.get("reason", "")
+    return result
+
+
+def _terminal_capitulation_floor_bias(result: dict) -> dict:
+    rsi5m = _panglima_num(result.get("rsi6_5m", 50), 50.0)
+    up_energy = _panglima_num(result.get("up_energy", 0), 0.0)
+    down_energy = _panglima_num(result.get("down_energy", 0), 0.0)
+
+    if down_energy <= ENERGY_ZERO_THRESHOLD and rsi5m < 5:
+        return {
+            "override": True,
+            "bias": "LONG",
+            "source": "TIER0_CAPITULATION_FLOOR_VETO",
+            "reason": (
+                f"TIER0_CAPITULATION_FLOOR_VETO: down_energy={down_energy:.3f} "
+                f"and RSI5m={rsi5m:.1f}<5. SHORT forbidden; terminal bounce bias LONG."
+            ),
+        }
+
+    if up_energy <= ENERGY_ZERO_THRESHOLD and rsi5m > 95:
+        return {
+            "override": True,
+            "bias": "SHORT",
+            "source": "TIER0_BLOWOFF_TOP_VETO",
+            "reason": (
+                f"TIER0_BLOWOFF_TOP_VETO: up_energy={up_energy:.3f} "
+                f"and RSI5m={rsi5m:.1f}>95. LONG forbidden; terminal fade bias SHORT."
+            ),
+        }
+
+    return {"override": False}
+
+
+def _neutral_book_ofi_spoof(result: dict) -> bool:
+    _ensure_order_book_bias_fields(result)
+    ratio = _panglima_num(result.get("_ask_bid_ratio", 1.0), 1.0)
+    ofi_bias = str(result.get("ofi_bias", "NEUTRAL"))
+    ofi_strength = _panglima_num(result.get("ofi_strength", 0), 0.0)
+    return 0.75 <= ratio <= 1.25 and ofi_bias == "SHORT" and ofi_strength >= 0.70
+
+
+def _liquidity_vacuum_markdown(result: dict) -> dict:
+    volume_ratio = _panglima_num(result.get("volume_ratio", 1.0), 1.0)
+    ofi_bias = str(result.get("ofi_bias", "NEUTRAL"))
+    ofi_strength = _panglima_num(result.get("ofi_strength", 0), 0.0)
+    obv_trend = str(result.get("obv_trend", "NEUTRAL"))
+    ask_slope = _panglima_num(result.get("ask_slope", 0), 0.0)
+    bid_slope = _panglima_num(result.get("bid_slope", 1), 1.0)
+    change_5m = _panglima_num(result.get("change_5m", 0), 0.0)
+    phase = str(result.get("market_phase", result.get("phase", "UNKNOWN")))
+
+    book_thin = volume_ratio < 0.50
+    flow_dead = ofi_bias == "NEUTRAL" and ofi_strength <= 0.10 and obv_trend == "NEUTRAL"
+    bid_pulled = bid_slope < ask_slope * 1.10
+    drifting = abs(change_5m) > 1.50
+    bait_context = phase in ("BAIT", "CAPITULATION", "MACD_DUEL_FOLLOW")
+    active = book_thin and flow_dead and bid_pulled and drifting and bait_context
+    bias = "SHORT" if change_5m < 0 else "LONG"
+
+    return {
+        "override": active,
+        "bias": bias,
+        "source": "LIQUIDITY_VACUUM_MARKDOWN" if bias == "SHORT" else "LIQUIDITY_VACUUM_MARKUP",
+        "confidence": "HIGH",
+        "book_thin": book_thin,
+        "flow_dead": flow_dead,
+        "bid_pulled": bid_pulled,
+        "drifting": drifting,
+        "reason": (
+            f"LIQUIDITY_VACUUM: vol={volume_ratio:.2f}x, OFI={ofi_bias} {ofi_strength:.2f}, "
+            f"OBV={obv_trend}, bid/ask={bid_slope / max(ask_slope, 1e-9):.2f}, "
+            f"change_5m={change_5m:.2f}%, phase={phase}. Direction follows drift={bias}."
+        ),
+    }
+
+
+def _lower_tf_signed_pressure(result: dict) -> float:
+    signed = result.get("_hawkes_mtf_signed_pressure", {}) or {}
+    if not isinstance(signed, dict):
+        return 0.0
+    return (
+        _panglima_num(signed.get("1m", 0), 0.0) +
+        _panglima_num(signed.get("3m", 0), 0.0) +
+        _panglima_num(signed.get("15m", 0), 0.0) +
+        _panglima_num(signed.get("1h", 0), 0.0)
+    )
+
+
+def _hawkes_mean_revert_up_context(result: dict) -> dict:
+    signed = result.get("_hawkes_mtf_signed_pressure", {}) or {}
+    if not isinstance(signed, dict):
+        signed = {}
+
+    four_h = _panglima_num(signed.get("4h", 0), 0.0)
+    lower = _lower_tf_signed_pressure(result)
+    active = four_h < -3.0 and lower > 20.0
+    return {
+        "override": active,
+        "bias": "LONG",
+        "source": "HAWKES_SHORT_CASCADE_MEAN_REVERT_UP",
+        "four_h": four_h,
+        "lower_tf": lower,
+        "reason": (
+            f"HAWKES_SHORT_CASCADE_MEAN_REVERT_UP: 4h signed={four_h:.1f} "
+            f"while lower TF sum={lower:.1f}; old SHORT cascade is being faded upward."
+        ),
+    }
+
+
+def _classify_squeeze_setup(result: dict) -> dict:
+    signed_revert = _hawkes_mean_revert_up_context(result)
+    signed = result.get("_hawkes_mtf_signed_pressure", {}) or {}
+    if not isinstance(signed, dict):
+        signed = {}
+    up_energy = _panglima_num(result.get("up_energy", 0), 0.0)
+    down_energy = _panglima_num(result.get("down_energy", 0), 0.0)
+    bid_slope = _panglima_num(result.get("bid_slope", 0), 0.0)
+    ask_slope = _panglima_num(result.get("ask_slope", 1), 1.0)
+    short_liq = _panglima_num(result.get("short_liq", 99), 99.0)
+    long_liq = _panglima_num(result.get("long_liq", 99), 99.0)
+    volume_ratio = _panglima_num(result.get("volume_ratio", 1.0), 1.0)
+    funding = _panglima_num(result.get("funding_rate", 0) or 0.0, 0.0)
+    change_5m = _panglima_num(result.get("change_5m", 0), 0.0)
+    ofi_bias = str(result.get("ofi_bias", "NEUTRAL"))
+    ofi_strength = _panglima_num(result.get("ofi_strength", 0), 0.0)
+    hft_bias = str(result.get("hft_6pct_bias", "NEUTRAL"))
+    algo_bias = str(result.get("algo_type_bias", "NEUTRAL"))
+    greeks_kill = str(result.get("greeks_kill_direction", "NEUTRAL"))
+    greeks_delta_crowded = str(result.get("greeks_delta_crowded", "NEUTRAL"))
+    greeks_gamma = str(result.get("greeks_gamma_intensity", "LOW"))
+    ask_bid_ratio = ask_slope / max(bid_slope, 1e-9)
+    bid_ask_ratio = bid_slope / max(ask_slope, 1e-9)
+    four_h_signed = _panglima_num(signed.get("4h", 0), 0.0)
+    lower_tf_signed = _lower_tf_signed_pressure(result)
+    pre_ignition = abs(change_5m) < 1.0
+    gamma_short_trapped = (
+        greeks_kill == "LONG" and
+        greeks_delta_crowded == "SHORT" and
+        greeks_gamma in ("HIGH", "EXTREME")
+    )
+    flow_consensus_long = (
+        (ofi_bias == "LONG" and ofi_strength >= 0.90) or
+        (hft_bias == "LONG" and algo_bias == "LONG") or
+        gamma_short_trapped
+    )
+
+    fake_score = 0
+    fake_reasons = []
+    if down_energy > 0.5 * max(up_energy, 0.01):
+        fake_score += 2
+        fake_reasons.append("counter_sell_energy")
+    if ask_slope > bid_slope:
+        fake_score += 2
+        fake_reasons.append("ask_resistance")
+    if funding > 0.0020:
+        fake_score += 1
+        fake_reasons.append(f"funding_extreme={funding:.6f}")
+    if volume_ratio < 0.8 and ask_bid_ratio > 1.1 and up_energy < 0.5:
+        fake_score += 3
+        fake_reasons.append("bid_wall_pulled")
+
+    real_score = 0
+    real_reasons = []
+    if up_energy > 5.0 * max(down_energy, 0.10):
+        real_score += 3
+        real_reasons.append(f"energy_asymmetry={up_energy:.2f}/{down_energy:.3f}")
+    if bid_ask_ratio > 1.5:
+        real_score += 2
+        real_reasons.append(f"bid_stack={bid_ask_ratio:.2f}x")
+    if short_liq < 1.5 and short_liq < long_liq:
+        real_score += 2
+        real_reasons.append(f"short_liq_magnet={short_liq:.2f}%")
+    if volume_ratio < 0.7 and bid_ask_ratio > 1.2 and ask_bid_ratio < 0.85:
+        real_score += 2
+        real_reasons.append(f"thin_asks_vacuum={volume_ratio:.2f}x")
+    if signed_revert.get("override"):
+        real_score += 3
+        real_reasons.append("4h_short_cascade_faded_by_lower_tf")
+    if four_h_signed > 50 and lower_tf_signed > 0:
+        real_score += 2
+        real_reasons.append(f"sustained_long_pressure_4h={four_h_signed:.1f}/lower={lower_tf_signed:.1f}")
+    if pre_ignition and short_liq < 1.5 and short_liq < long_liq:
+        real_score += 2
+        real_reasons.append(f"pre_ignition_short_liq_magnet_change={change_5m:.2f}%")
+    if flow_consensus_long:
+        real_score += 2
+        real_reasons.append("flow_or_gamma_confirms_LONG")
+    if abs(funding) < 0.0015:
+        real_score += 1
+        real_reasons.append(f"funding_sustainable={funding:.6f}")
+
+    verdict = "REAL" if real_score >= fake_score + 2 and real_score >= 7 else "FAKE" if fake_score >= real_score + 2 else "AMBIGUOUS"
+    return {
+        "verdict": verdict,
+        "real_score": real_score,
+        "fake_score": fake_score,
+        "real_reasons": real_reasons,
+        "fake_reasons": fake_reasons,
+        "reason": (
+            f"SQUEEZE_SETUP_CLASSIFIER verdict={verdict}, real={real_score}, fake={fake_score}. "
+            f"REAL[{'; '.join(real_reasons)}] FAKE[{'; '.join(fake_reasons)}]"
+        ),
+    }
+
+
+def _terminal_blowoff_short_detector(result: dict) -> dict:
+    up_energy = _panglima_num(result.get("up_energy", 0), 0.0)
+    down_energy = _panglima_num(result.get("down_energy", 0), 0.0)
+    rsi6 = _panglima_num(result.get("rsi6", 50), 50.0)
+    rsi5m = _panglima_num(result.get("rsi6_5m", 50), 50.0)
+    change_5m = _panglima_num(result.get("change_5m", 0), 0.0)
+    bid_slope = _panglima_num(result.get("bid_slope", 1), 1.0)
+    ask_slope = _panglima_num(result.get("ask_slope", 0), 0.0)
+    slope_ratio = ask_slope / max(bid_slope, 1e-9)
+    ask_bid_ratio = _panglima_num(result.get("_ask_bid_ratio", slope_ratio), slope_ratio)
+    ofi_bias = str(result.get("ofi_bias", "NEUTRAL"))
+    ofi_strength = _panglima_num(result.get("ofi_strength", 0), 0.0)
+    agg = _panglima_num(result.get("agg", 0.5), 0.5)
+
+    active = (
+        up_energy > 8.0 and
+        rsi6 > 85.0 and
+        rsi5m > 90.0 and
+        change_5m > 1.50 and
+        ask_bid_ratio > 1.40
+    )
+
+    return {
+        "override": active,
+        "bias": "SHORT",
+        "source": "TERMINAL_BLOWOFF_REAL_SUPPLY",
+        "confidence": "HIGH",
+        "reason": (
+            f"TERMINAL_BLOWOFF_REAL_SUPPLY: up/down={up_energy:.2f}/{down_energy:.3f}, "
+            f"RSI={rsi6:.1f}/{rsi5m:.1f}, change_5m={change_5m:.2f}%, "
+            f"ask_bid={ask_bid_ratio:.2f}, agg={agg:.2f}, OFI={ofi_bias} {ofi_strength:.2f}. "
+            "Post-move blowoff with real overhead supply; do not treat as pre-ignition squeeze."
+        ),
+    }
+
+
+def _thin_ask_vacuum_continuation(result: dict) -> dict:
+    signed = result.get("_hawkes_mtf_signed_pressure", {}) or {}
+    if not isinstance(signed, dict):
+        signed = {}
+
+    up_energy = _panglima_num(result.get("up_energy", 0), 0.0)
+    down_energy = _panglima_num(result.get("down_energy", 0), 0.0)
+    bid_slope = _panglima_num(result.get("bid_slope", 0), 0.0)
+    ask_slope = _panglima_num(result.get("ask_slope", 1), 1.0)
+    ask_bid_ratio = ask_slope / max(bid_slope, 1e-9)
+    short_liq = _panglima_num(result.get("short_liq", 99), 99.0)
+    long_liq = _panglima_num(result.get("long_liq", 99), 99.0)
+    volume_ratio = _panglima_num(result.get("volume_ratio", 1.0), 1.0)
+    thin_metric = _panglima_num(
+        result.get("thin_asks_vacuum", volume_ratio if ask_bid_ratio < 0.90 else 1.0),
+        volume_ratio if ask_bid_ratio < 0.90 else 1.0
+    )
+    change_5m = _panglima_num(result.get("change_5m", 0), 0.0)
+    ofi_bias = str(result.get("ofi_bias", "NEUTRAL"))
+    ofi_strength = _panglima_num(result.get("ofi_strength", 0), 0.0)
+    hft_bias = str(result.get("hft_6pct_bias", "NEUTRAL"))
+    algo_bias = str(result.get("algo_type_bias", "NEUTRAL"))
+    greeks_kill = str(result.get("greeks_kill_direction", "NEUTRAL"))
+    greeks_delta_crowded = str(result.get("greeks_delta_crowded", "NEUTRAL"))
+    greeks_gamma = str(result.get("greeks_gamma_intensity", "LOW"))
+    four_h_signed = _panglima_num(signed.get("4h", 0), 0.0)
+    lower_tf_signed = _lower_tf_signed_pressure(result)
+
+    gamma_short_trapped = (
+        greeks_kill == "LONG" and
+        greeks_delta_crowded == "SHORT" and
+        greeks_gamma in ("HIGH", "EXTREME")
+    )
+    flow_support = (
+        (ofi_bias == "LONG" and ofi_strength >= 0.90) or
+        (hft_bias == "LONG" and algo_bias == "LONG") or
+        gamma_short_trapped
+    )
+    pre_ignition = abs(change_5m) < 1.0
+    no_rejection = down_energy <= max(0.3 * max(up_energy, 0.01), ENERGY_ZERO_THRESHOLD)
+    short_magnet = short_liq < 1.5 and short_liq < long_liq
+
+    score = 0
+    reasons = []
+    if ask_bid_ratio < 1.0:
+        score += 2
+        reasons.append(f"ask_bid={ask_bid_ratio:.2f}<1")
+    if thin_metric < 0.60 or (volume_ratio < 0.70 and ask_bid_ratio < 0.85):
+        score += 2
+        reasons.append(f"thin_asks_vacuum={thin_metric:.2f}")
+    if down_energy <= ENERGY_ZERO_THRESHOLD:
+        score += 2
+        reasons.append("down_energy=0")
+    if short_magnet:
+        score += 2
+        reasons.append(f"short_liq_magnet={short_liq:.2f}%")
+    if ofi_bias == "LONG" and ofi_strength >= 0.90:
+        score += 2
+        reasons.append(f"OFI_LONG={ofi_strength:.2f}")
+    if four_h_signed > 50:
+        score += 2
+        reasons.append(f"4h_signed={four_h_signed:.1f}")
+    if pre_ignition:
+        score += 3
+        reasons.append(f"pre_ignition_change={change_5m:.2f}%")
+
+    active = (
+        score >= 9 and
+        pre_ignition and
+        no_rejection and
+        short_magnet and
+        flow_support and
+        (four_h_signed > 50 or lower_tf_signed > 20)
+    )
+
+    return {
+        "override": active,
+        "bias": "LONG",
+        "source": "THIN_ASK_VACUUM_CONTINUATION",
+        "confidence": "HIGH",
+        "score": score,
+        "flow_support": flow_support,
+        "gamma_short_trapped": gamma_short_trapped,
+        "pre_ignition": pre_ignition,
+        "no_rejection": no_rejection,
+        "short_magnet": short_magnet,
+        "reason": (
+            f"THIN_ASK_VACUUM_CONTINUATION score={score}: {', '.join(reasons)}; "
+            f"flow_support={flow_support}, lower_tf={lower_tf_signed:.1f}. "
+            "Close short-liq is magnetism, not bait, because there is no rejection print."
+        ),
+    }
+
+
+def _early_squeeze_continuation_long(result: dict) -> dict:
+    squeeze = _classify_squeeze_setup(result)
+    thin_vacuum = _thin_ask_vacuum_continuation(result)
+    macro_ctx = _hawkes_macro_micro_context(result)
+
+    up_energy = _panglima_num(result.get("up_energy", 0), 0.0)
+    down_energy = _panglima_num(result.get("down_energy", 0), 0.0)
+    short_liq = _panglima_num(result.get("short_liq", 99), 99.0)
+    long_liq = _panglima_num(result.get("long_liq", 99), 99.0)
+    change_5m = _panglima_num(result.get("change_5m", 0), 0.0)
+    volume_ratio = _panglima_num(result.get("volume_ratio", 1.0), 1.0)
+    funding = _panglima_num(result.get("funding_rate", 0) or 0.0, 0.0)
+    bid_slope = _panglima_num(result.get("bid_slope", 1), 1.0)
+    ask_slope = _panglima_num(result.get("ask_slope", 0), 0.0)
+    ask_bid_ratio = ask_slope / max(bid_slope, 1e-9)
+    rsi6 = _panglima_num(result.get("rsi6", 50), 50.0)
+    rsi5m = _panglima_num(result.get("rsi6_5m", 50), 50.0)
+    ofi_bias = str(result.get("ofi_bias", "NEUTRAL"))
+    ofi_strength = _panglima_num(result.get("ofi_strength", 0), 0.0)
+    agg = _panglima_num(result.get("agg", 0.5), 0.5)
+    flow = _panglima_num(result.get("flow", agg), agg)
+    hft_bias = str(result.get("hft_6pct_bias", "NEUTRAL"))
+    algo_bias = str(result.get("algo_type_bias", "NEUTRAL"))
+
+    nearest_short = short_liq < 0.75 and short_liq < long_liq * 0.35
+    no_sellers = down_energy <= ENERGY_ZERO_THRESHOLD
+    no_aggressive_sell = not (
+        (ofi_bias == "SHORT" and ofi_strength >= 0.70) or
+        (hft_bias == "SHORT" and algo_bias == "SHORT")
+    )
+    passive_ask_being_lifted = (
+        ask_bid_ratio <= 1.50 or
+        (ofi_bias == "LONG" and ofi_strength >= 0.90 and agg >= 0.90 and flow >= 0.90 and no_sellers)
+    )
+    aligned_long_pressure = (
+        macro_ctx.get("macro_bias") == "LONG" and
+        macro_ctx.get("micro_bias") == "LONG" and
+        _panglima_num(macro_ctx.get("macro", 0), 0.0) > 20.0 and
+        _panglima_num(macro_ctx.get("micro", 0), 0.0) > 3.0
+    )
+    no_rejection = (
+        no_sellers and
+        no_aggressive_sell and
+        change_5m > 0 and
+        change_5m < 2.0 and
+        passive_ask_being_lifted
+    )
+    flow_support = (
+        (ofi_bias == "LONG" and ofi_strength >= 0.90) or
+        (thin_vacuum.get("score", 0) >= 8 and ask_bid_ratio < 0.85) or
+        (ask_bid_ratio < 0.85 and funding <= 0 and volume_ratio < 0.90)
+    )
+    overbought_strength = rsi6 >= 95.0 or rsi5m >= 90.0
+    real_classifier = (
+        squeeze.get("verdict") == "REAL" and
+        squeeze.get("real_score", 0) >= 8 and
+        squeeze.get("fake_score", 0) <= 2
+    )
+    stale_up_energy_short = change_5m < 0 or (ofi_bias == "SHORT" and ofi_strength >= 0.70)
+
+    active = (
+        nearest_short and
+        no_rejection and
+        aligned_long_pressure and
+        flow_support and
+        overbought_strength and
+        real_classifier and
+        not stale_up_energy_short
+    )
+
+    return {
+        "override": active,
+        "bias": "LONG",
+        "source": "EARLY_SQUEEZE_CONTINUATION_LONG",
+        "confidence": "HIGH",
+        "nearest_short": nearest_short,
+        "no_rejection": no_rejection,
+        "aligned_long_pressure": aligned_long_pressure,
+        "passive_ask_being_lifted": passive_ask_being_lifted,
+        "flow_support": flow_support,
+        "overbought_strength": overbought_strength,
+        "real_classifier": real_classifier,
+        "thin_ask_vacuum": thin_vacuum,
+        "squeeze_classifier": squeeze,
+        "reason": (
+            f"EARLY_SQUEEZE_CONTINUATION_LONG: short_liq={short_liq:.2f}% vs long_liq={long_liq:.2f}%, "
+            f"change_5m={change_5m:.2f}%, up/down={up_energy:.2f}/{down_energy:.3f}, "
+            f"macro/micro={macro_ctx.get('macro', 0):.1f}/{macro_ctx.get('micro', 0):.1f}, "
+            f"ask_bid={ask_bid_ratio:.2f}, OFI={ofi_bias} {ofi_strength:.2f}, agg/flow={agg:.2f}/{flow:.2f}. "
+            "This is early continuation squeeze: close short-liq magnet + no rejection + aligned LONG pressure."
+        ),
+    }
+
+
+def _mm_repricing_long_detector(result: dict) -> dict:
+    signed_revert = _hawkes_mean_revert_up_context(result)
+    squeeze = _classify_squeeze_setup(result)
+    thin_vacuum = _thin_ask_vacuum_continuation(result)
+    early_continuation = _early_squeeze_continuation_long(result)
+    signed = result.get("_hawkes_mtf_signed_pressure", {}) or {}
+    if not isinstance(signed, dict):
+        signed = {}
+    up_energy = _panglima_num(result.get("up_energy", 0), 0.0)
+    down_energy = _panglima_num(result.get("down_energy", 0), 0.0)
+    bid_slope = _panglima_num(result.get("bid_slope", 0), 0.0)
+    ask_slope = _panglima_num(result.get("ask_slope", 1), 1.0)
+    short_liq = _panglima_num(result.get("short_liq", 99), 99.0)
+    long_liq = _panglima_num(result.get("long_liq", 99), 99.0)
+    volume_ratio = _panglima_num(result.get("volume_ratio", 1.0), 1.0)
+    funding = _panglima_num(result.get("funding_rate", 0) or 0.0, 0.0)
+    rsi6 = _panglima_num(result.get("rsi6", 50), 50.0)
+    rsi5m = _panglima_num(result.get("rsi6_5m", 50), 50.0)
+    change_5m = _panglima_num(result.get("change_5m", 0), 0.0)
+    ofi_bias = str(result.get("ofi_bias", "NEUTRAL"))
+    ofi_strength = _panglima_num(result.get("ofi_strength", 0), 0.0)
+    hft_bias = str(result.get("hft_6pct_bias", "NEUTRAL"))
+    algo_bias = str(result.get("algo_type_bias", "NEUTRAL"))
+    greeks_kill = str(result.get("greeks_kill_direction", "NEUTRAL"))
+    greeks_delta_crowded = str(result.get("greeks_delta_crowded", "NEUTRAL"))
+    greeks_gamma = str(result.get("greeks_gamma_intensity", "LOW"))
+
+    ask_bid_ratio = ask_slope / max(bid_slope, 1e-9)
+    bid_ask_ratio = bid_slope / max(ask_slope, 1e-9)
+    funding_extreme = abs(funding) > 0.0015
+    four_h_signed = _panglima_num(signed.get("4h", 0), 0.0)
+    micro_signed = (
+        _panglima_num(signed.get("1m", 0), 0.0) +
+        _panglima_num(signed.get("3m", 0), 0.0)
+    )
+    lower_tf_signed = _lower_tf_signed_pressure(result)
+    pre_ignition = abs(change_5m) < 1.0
+    no_rejection = down_energy <= max(0.3 * max(up_energy, 0.01), ENERGY_ZERO_THRESHOLD)
+    gamma_short_trapped = (
+        greeks_kill == "LONG" and
+        greeks_delta_crowded == "SHORT" and
+        greeks_gamma in ("HIGH", "EXTREME")
+    )
+    flow_consensus_long = (
+        (ofi_bias == "LONG" and ofi_strength >= 0.90) or
+        (hft_bias == "LONG" and algo_bias == "LONG") or
+        gamma_short_trapped
+    )
+    sustained_long_pressure = (
+        four_h_signed > 50.0 and
+        lower_tf_signed > 0.0 and
+        micro_signed > -5.0
+    )
+    overbought_strength = (
+        rsi6 > 70 and
+        rsi5m > 60 and
+        up_energy > 1.0 and
+        down_energy <= ENERGY_ZERO_THRESHOLD and
+        volume_ratio < 0.8
+    )
+
+    signals = {
+        "old_short_cascade_absorbed": signed_revert.get("override", False),
+        "bid_stack": bid_ask_ratio > 1.5,
+        "thin_asks": ask_bid_ratio < 0.70,
+        "low_volume_vacuum": volume_ratio < 0.80,
+        "short_liq_magnet": short_liq < 1.5 and short_liq < long_liq,
+        "one_sided_buy_energy": up_energy > 3.0 * max(down_energy, 0.10),
+        "funding_not_extreme": not funding_extreme,
+        "overbought_is_strength": overbought_strength,
+        "sustained_long_pressure": sustained_long_pressure,
+        "pre_ignition": pre_ignition,
+        "flow_consensus_long": flow_consensus_long,
+        "gamma_short_trapped": gamma_short_trapped,
+        "thin_ask_vacuum": thin_vacuum.get("override", False),
+        "early_squeeze_continuation": early_continuation.get("override", False),
+    }
+    score = sum(1 for ok in signals.values() if ok)
+
+    old_short_cascade_path = (
+        score >= 6 and
+        squeeze.get("verdict") == "REAL" and
+        signals["old_short_cascade_absorbed"] and
+        signals["short_liq_magnet"] and
+        (signals["bid_stack"] or signals["thin_asks"])
+    )
+    sustained_pre_ignition_path = (
+        squeeze.get("real_score", 0) >= 7 and
+        squeeze.get("fake_score", 0) <= 2 and
+        signals["short_liq_magnet"] and
+        pre_ignition and
+        no_rejection and
+        (sustained_long_pressure or signed_revert.get("override")) and
+        (flow_consensus_long or thin_vacuum.get("override"))
+    )
+    unanimous_flow_path = (
+        squeeze.get("real_score", 0) >= 6 and
+        signals["short_liq_magnet"] and
+        pre_ignition and
+        no_rejection and
+        sustained_long_pressure and
+        flow_consensus_long
+    )
+    active = old_short_cascade_path or sustained_pre_ignition_path or unanimous_flow_path or thin_vacuum.get("override", False)
+    active = active or early_continuation.get("override", False)
+
+    return {
+        "override": active,
+        "bias": "LONG",
+        "source": "MM_REPRICING_LONG",
+        "confidence": "HIGH",
+        "score": score,
+        "signals": signals,
+        "squeeze_classifier": squeeze,
+        "thin_ask_vacuum": thin_vacuum,
+        "early_squeeze_continuation": early_continuation,
+        "reason": (
+            f"MM_REPRICING_LONG score={score}/14: bid/ask={bid_ask_ratio:.2f}x, "
+            f"ask_bid={ask_bid_ratio:.2f}, short_liq={short_liq:.2f}%, "
+            f"long_liq={long_liq:.2f}%, up/down={up_energy:.2f}/{down_energy:.3f}, "
+            f"change_5m={change_5m:.2f}%, funding={funding:.6f}, "
+            f"4h_signed={four_h_signed:.1f}, micro_signed={micro_signed:.1f}. "
+            f"{signed_revert.get('reason', '')} {squeeze.get('reason', '')} "
+            f"{thin_vacuum.get('reason', '')} {early_continuation.get('reason', '')}"
+        ),
+    }
+
+
+def _liquidation_hunt_dump_classifier(result: dict) -> dict:
+    macro = _hawkes_macro_micro_context(result)
+    hawkes_exhaustion = _hawkes_exhaustion_v2(result)
+    vacuum = _liquidity_vacuum_markdown(result)
+    squeeze_v2 = _short_squeeze_ignition_v2(result)
+    regime = str(result.get("market_regime", "UNKNOWN"))
+    phase = str(result.get("market_phase", result.get("phase", "UNKNOWN")))
+    quality = str(result.get("_hawkes_mtf_momentum_quality", "UNKNOWN"))
+    current_bias = result.get("_final_bias_locked", result.get("bias", "NEUTRAL"))
+
+    change_5m = _panglima_num(result.get("change_5m", 0), 0.0)
+    volume_ratio = _panglima_num(result.get("volume_ratio", 1.0), 1.0)
+    short_liq = _panglima_num(result.get("short_liq", 99), 99.0)
+    long_liq = _panglima_num(result.get("long_liq", 99), 99.0)
+    funding = _panglima_num(result.get("funding_rate", 0) or 0.0, 0.0)
+    ofi_bias = str(result.get("ofi_bias", "NEUTRAL"))
+    ofi_strength = _panglima_num(result.get("ofi_strength", 0), 0.0)
+    hft_bias = str(result.get("hft_6pct_bias", "NEUTRAL"))
+    algo_bias = str(result.get("algo_type_bias", "NEUTRAL"))
+    ask_slope = _panglima_num(result.get("ask_slope", 0), 0.0)
+    bid_slope = _panglima_num(result.get("bid_slope", 1), 1.0)
+    rsi5m = _panglima_num(result.get("rsi6_5m", 50), 50.0)
+    rsi6 = _panglima_num(result.get("rsi6", 50), 50.0)
+    up_energy = _panglima_num(result.get("up_energy", 0), 0.0)
+    down_energy = _panglima_num(result.get("down_energy", 0), 0.0)
+    regime_reason = str(result.get("regime_reason", ""))
+    reason_text = str(result.get("reason", ""))
+
+    ask_bid_ratio = ask_slope / max(bid_slope, 1e-9)
+    long_liq_swept = long_liq < 99 and change_5m <= -max(long_liq * 0.80, 0.10)
+    post_sweep_bid_wall = bid_slope > ask_slope * 1.20 or str(result.get("_book_bias", "")) == "BULLISH"
+    bid_withdrawal = (
+        volume_ratio < 0.80 and
+        change_5m < -1.0 and
+        down_energy <= ENERGY_ZERO_THRESHOLD and
+        up_energy < 0.20 and
+        ask_bid_ratio > 1.10
+    )
+
+    cont_score = 0
+    cont_reasons = []
+    if ofi_bias == "SHORT" and ofi_strength >= 0.70:
+        cont_score += 2
+        cont_reasons.append(f"OFI_SHORT={ofi_strength:.2f}")
+    if long_liq < short_liq * 0.50:
+        cont_score += 2
+        cont_reasons.append(f"long_liq={long_liq:.2f}% << short_liq={short_liq:.2f}%")
+    elif long_liq < short_liq and long_liq < 3.0:
+        cont_score += 1
+        cont_reasons.append(f"long_liq_nearest={long_liq:.2f}%")
+    if funding > 0 and current_bias == "LONG":
+        cont_score += 2
+        cont_reasons.append(f"funding_positive_traps_LONG={funding:.6f}")
+    elif funding > 0 and long_liq < short_liq:
+        cont_score += 1
+        cont_reasons.append(f"funding_positive={funding:.6f}")
+    if hft_bias == "SHORT" and algo_bias == "SHORT":
+        cont_score += 2
+        cont_reasons.append("HFT+ALGO_SHORT")
+    if macro["micro"] < -20:
+        cont_score += 2
+        cont_reasons.append(f"fresh_micro_pressure={macro['micro']:.1f}")
+    if quality == "EXHAUSTED" and macro["macro_bias"] == "LONG":
+        cont_score += 2
+        cont_reasons.append("exhausted_macro_LONG_residue")
+    if hawkes_exhaustion.get("status") == "EXHAUSTED_LAGGING_MACRO":
+        cont_score += 3
+        cont_reasons.append(f"hawkes_inverted_pyramid={hawkes_exhaustion['pyramid_ratio']:.2f}x")
+    if hawkes_exhaustion.get("status") == "ECHO_NOT_IGNITION":
+        cont_score += 2
+        cont_reasons.append("hawkes_echo_not_ignition")
+    if ask_bid_ratio > 1.15:
+        cont_score += 1
+        cont_reasons.append(f"ask_stack_ratio={ask_bid_ratio:.2f}")
+    if bid_withdrawal:
+        cont_score += 2
+        cont_reasons.append("passive_bid_withdrawal")
+    if vacuum.get("override") and vacuum.get("bias") == "SHORT":
+        cont_score += 3
+        cont_reasons.append("liquidity_vacuum_markdown")
+    if rsi6 < 30 and rsi5m > 65 and phase == "BAIT":
+        cont_score += 2
+        cont_reasons.append(f"RSI_TOP_UNWIND 1m={rsi6:.1f} vs 5m={rsi5m:.1f}")
+    if long_liq > short_liq * 1.20 and change_5m < 0 and phase == "BAIT":
+        cont_score += 2
+        cont_reasons.append(f"larger_long_liq_pool={long_liq:.2f}% after short_liq bait={short_liq:.2f}%")
+    if abs(funding) < 0.0001 and current_bias == "LONG":
+        cont_score += 1
+        cont_reasons.append(f"funding_noise_no_squeeze={funding:.6f}")
+    if (
+        squeeze_v2.get("score", 0) >= 4 and
+        not squeeze_v2.get("checks", {}).get("crowded_shorts") and
+        not squeeze_v2.get("checks", {}).get("spoof_aware") and
+        not squeeze_v2.get("checks", {}).get("stoch_divergence")
+    ):
+        cont_score += 2
+        cont_reasons.append("failed_squeeze_core_checks")
+    if volume_ratio < 0.50 and change_5m < 0 and down_energy <= ENERGY_ZERO_THRESHOLD and up_energy > 0.50:
+        cont_score += 1
+        cont_reasons.append("stale_up_energy_low_volume")
+    if (
+        result.get("greeks_override_allowed") is False and
+        result.get("greeks_vega_active") and
+        phase == "BAIT" and
+        change_5m < 0
+    ):
+        cont_score += 2
+        cont_reasons.append("rejected_greeks_vega_bias_not_counted")
+
+    rev_score = 0
+    rev_reasons = []
+    if rsi5m < 15:
+        rev_score += 3
+        rev_reasons.append(f"RSI5m={rsi5m:.1f}<15")
+    if post_sweep_bid_wall:
+        rev_score += 2
+        rev_reasons.append("bid_wall_replenished")
+    if funding < -0.0005:
+        rev_score += 2
+        rev_reasons.append(f"crowded_shorts={funding:.6f}")
+    if long_liq_swept and post_sweep_bid_wall:
+        rev_score += 3
+        rev_reasons.append("long_liq_swept_with_bid_reload")
+    if ofi_bias == "LONG" and ofi_strength >= 0.60:
+        rev_score += 2
+        rev_reasons.append(f"OFI_LONG={ofi_strength:.2f}")
+    if result.get("_agg_spoof_blocked"):
+        rev_score += 2
+        rev_reasons.append("agg_spoof_blocked")
+
+    fake_accumulation = (
+        regime == "ACCUMULATION" and
+        "score=0" in regime_reason and
+        phase == "BAIT" and
+        change_5m <= -0.50
+    )
+    raw_distribution = (
+        phase in ("BAIT", "CAPITULATION", "LOW_VOL_OVERSOLD_CAPITULATION") and
+        change_5m <= -0.50 and
+        (
+            vacuum.get("override") or
+            hawkes_exhaustion.get("exhausted") or
+            ofi_bias == "SHORT" or
+            macro["micro"] < -20
+        )
+    )
+    eligible = raw_distribution or fake_accumulation or (
+        regime == "LIQUIDATION_HUNT" and
+        phase in ("BAIT", "CAPITULATION", "LOW_VOL_OVERSOLD_CAPITULATION") and
+        change_5m <= -0.50
+    )
+    dead_cat = (
+        (regime == "LIQUIDATION_HUNT" or fake_accumulation) and
+        quality == "EXHAUSTED" and
+        long_liq < 3.0 and
+        funding > 0 and
+        ofi_bias == "SHORT" and
+        ofi_strength >= 0.70
+    )
+    continuation = eligible and (
+        dead_cat or
+        (vacuum.get("override") and hawkes_exhaustion.get("exhausted") and cont_score >= 6) or
+        (cont_score >= rev_score + 3 and cont_score >= 6)
+    )
+    genuine_reversal = eligible and rev_score >= cont_score + 3 and rev_score >= 6
+
+    verdict = (
+        "CONTINUATION_SHORT" if continuation else
+        "GENUINE_REVERSAL_LONG" if genuine_reversal else
+        "AMBIGUOUS_SKIP" if eligible and abs(cont_score - rev_score) < 3 else
+        "ADVISORY"
+    )
+    bias = "SHORT" if continuation else "LONG" if genuine_reversal else "NEUTRAL"
+
+    return {
+        "override": continuation or genuine_reversal,
+        "bias": bias,
+        "source": (
+            "LIQ_HUNT_CONTINUATION_SHORT" if continuation else
+            "LIQ_HUNT_GENUINE_REVERSAL_LONG" if genuine_reversal else
+            "LIQ_HUNT_DUMP_CLASSIFIER"
+        ),
+        "confidence": "HIGH",
+        "verdict": verdict,
+        "eligible": eligible,
+        "dead_cat_setup": dead_cat,
+        "cont_score": cont_score,
+        "rev_score": rev_score,
+        "cont_reasons": cont_reasons,
+        "rev_reasons": rev_reasons,
+        "reason": (
+            f"{verdict}: cont={cont_score}, rev={rev_score}, "
+            f"regime={regime}, phase={phase}, change_5m={change_5m:.2f}%, "
+            f"long_liq={long_liq:.2f}%, short_liq={short_liq:.2f}%, "
+            f"funding={funding:.6f}, OFI={ofi_bias} {ofi_strength:.2f}, "
+            f"micro={macro['micro']:.1f}, quality={quality}. "
+            f"CONT[{'; '.join(cont_reasons)}] REV[{'; '.join(rev_reasons)}]"
+        ),
+    }
+
+
+def _mm_absorption_active(result: dict) -> dict:
+    down_energy = _panglima_num(result.get("down_energy", 0), 0.0)
+    obv_trend = str(result.get("obv_trend", "NEUTRAL"))
+    volume_ratio = _panglima_num(result.get("volume_ratio", 1.0), 1.0)
+    change_5m = _panglima_num(result.get("change_5m", 0), 0.0)
+    funding = _panglima_num(result.get("funding_rate", 0) or 0.0, 0.0)
+
+    active = (
+        down_energy <= ENERGY_ZERO_THRESHOLD and
+        obv_trend in ("NEGATIVE_EXTREME", "NEGATIVE_STRONG", "NEGATIVE") and
+        volume_ratio < 1.0 and
+        change_5m < -2.0 and
+        funding < 0
+    )
+    return {
+        "override": active,
+        "bias": "LONG",
+        "source": "MM_ABSORPTION_FLUSH",
+        "reason": (
+            f"MM_ABSORPTION_FLUSH: down_energy={down_energy:.3f}, OBV={obv_trend}, "
+            f"vol={volume_ratio:.2f}x, change_5m={change_5m:.2f}%, funding={funding:.6f}. "
+            "Hidden accumulation under sell flush; ignore Hawkes tail."
+        ),
+    }
+
+
+def _fake_dump_reversal_signature(result: dict) -> dict:
+    macro = _hawkes_macro_micro_context(result)
+    down_energy = _panglima_num(result.get("down_energy", 0), 0.0)
+    rsi5m = _panglima_num(result.get("rsi6_5m", 50), 50.0)
+    funding = _panglima_num(result.get("funding_rate", 0) or 0.0, 0.0)
+    volume_ratio = _panglima_num(result.get("volume_ratio", 1.0), 1.0)
+    change_5m = _panglima_num(result.get("change_5m", 0), 0.0)
+    stoch_j = _panglima_num(result.get("stoch_j", 50), 50.0)
+    ofi_bias = str(result.get("ofi_bias", "NEUTRAL"))
+    ofi_strength = _panglima_num(result.get("ofi_strength", 0), 0.0)
+
+    criteria = {
+        "zero_seller_energy": down_energy <= ENERGY_ZERO_THRESHOLD,
+        "macro_positive": macro["macro"] > 0,
+        "terminal_rsi5m": rsi5m < 5,
+        "negative_funding": funding < 0,
+        "thin_volume": volume_ratio < 1.0,
+        "ofi_book_spoof": (
+            result.get("_agg_spoof_blocked") or
+            (ofi_bias == "SHORT" and ofi_strength >= 0.70 and _neutral_book_ofi_spoof(result))
+        ),
+        "stoch_divergence": stoch_j > 50 and rsi5m < 20,
+    }
+    score = sum(1 for ok in criteria.values() if ok)
+    continuation = _liquidation_hunt_dump_classifier(result)
+    ofi_short_not_spoofed = (
+        ofi_bias == "SHORT" and
+        ofi_strength >= 0.70 and
+        not result.get("_agg_spoof_blocked") and
+        not _neutral_book_ofi_spoof(result)
+    )
+    long_liq_magnet_against_reversal = (
+        _panglima_num(result.get("long_liq", 99), 99.0) <
+        _panglima_num(result.get("short_liq", 99), 99.0) and
+        funding >= 0
+    )
+    exhausted_macro_against_reversal = (
+        str(result.get("_hawkes_mtf_momentum_quality", "UNKNOWN")) == "EXHAUSTED" and
+        macro["macro"] > 0 and
+        macro["micro"] < -20
+    )
+    reversal_core = (
+        criteria["terminal_rsi5m"] or
+        criteria["negative_funding"] or
+        result.get("_agg_spoof_blocked")
+    )
+    disconfirmed = (
+        continuation.get("override") or
+        ofi_short_not_spoofed or
+        long_liq_magnet_against_reversal or
+        exhausted_macro_against_reversal
+    )
+    active = change_5m < 0 and score >= 6 and reversal_core and not disconfirmed
+
+    return {
+        "override": active,
+        "bias": "LONG",
+        "source": "FAKE_DUMP_REVERSAL",
+        "score": score,
+        "criteria": criteria,
+        "reason": (
+            f"FAKE_DUMP_REVERSAL: genuine dump failed ({score}/7 reversal criteria). "
+            f"macro={macro['macro']:.1f}, micro={macro['micro']:.1f}, RSI5m={rsi5m:.1f}, "
+            f"down_energy={down_energy:.3f}, vol={volume_ratio:.2f}x, "
+            f"reversal_core={reversal_core}, disconfirmed={disconfirmed}."
+        ),
+    }
+
+
+def _short_squeeze_ignition_v2(result: dict) -> dict:
+    macro = _hawkes_macro_micro_context(result)
+    short_liq = _panglima_num(result.get("short_liq", 99), 99.0)
+    long_liq = _panglima_num(result.get("long_liq", 99), 99.0)
+    rsi5m = _panglima_num(result.get("rsi6_5m", 50), 50.0)
+    rsi6 = _panglima_num(result.get("rsi6", 50), 50.0)
+    up_energy = _panglima_num(result.get("up_energy", 0), 0.0)
+    down_energy = _panglima_num(result.get("down_energy", 0), 0.0)
+    funding = _panglima_num(result.get("funding_rate", 0) or 0.0, 0.0)
+    change_5m = _panglima_num(result.get("change_5m", 0), 0.0)
+    stoch_j = _panglima_num(result.get("stoch_j", 50), 50.0)
+    ofi_bias = str(result.get("ofi_bias", "NEUTRAL"))
+
+    long_pool_swept = long_liq < 99 and change_5m <= -max(long_liq * 0.80, 0.10)
+    near_short_pool = short_liq < max(long_liq * 2.0, 0.01) or (long_pool_swept and short_liq < 8.0)
+    capitulation = rsi5m < 5 or rsi6 < 25
+    no_sellers = down_energy <= ENERGY_ZERO_THRESHOLD or up_energy > 2.0 * max(down_energy, 1e-6)
+    crowded = funding < -0.0001
+    spoof_aware = ofi_bias == "LONG" or result.get("_agg_spoof_blocked") or _neutral_book_ofi_spoof(result)
+    macro_ok = macro["macro"] > 0
+    stoch_divergence = stoch_j > 50 and capitulation
+
+    checks = {
+        "relative_short_pool": near_short_pool,
+        "capitulation": capitulation,
+        "no_sellers": no_sellers,
+        "crowded_shorts": crowded,
+        "spoof_aware": spoof_aware,
+        "macro_ok": macro_ok,
+        "stoch_divergence": stoch_divergence,
+    }
+    score = sum(1 for ok in checks.values() if ok)
+    post_flush_context = change_5m < -0.50 or long_pool_swept or rsi5m < 15
+    blowoff_or_bait = rsi5m > 70 or (rsi6 > 70 and change_5m >= 0)
+    active = (
+        score >= 4 and
+        post_flush_context and
+        crowded and
+        no_sellers and
+        not blowoff_or_bait
+    )
+
+    return {
+        "override": active,
+        "bias": "LONG",
+        "source": "SHORT_SQUEEZE_IGNITION_V2",
+        "score": score,
+        "checks": checks,
+        "reason": (
+            f"SHORT_SQUEEZE_IGNITION_V2 score={score}/7: short_liq={short_liq:.2f}%, "
+            f"long_liq={long_liq:.2f}%, long_swept={long_pool_swept}, "
+            f"RSI5m={rsi5m:.1f}, up/down={up_energy:.2f}/{down_energy:.3f}, "
+            f"funding={funding:.6f}, macro={macro['macro']:.1f}, "
+            f"post_flush={post_flush_context}, blowoff_or_bait={blowoff_or_bait}."
+        ),
+    }
+
+
+def _apply_dual_liq_trap_skip(result: dict, source: str) -> tuple:
+    dual = result.get("dual_liq_trap", {})
+    if not isinstance(dual, dict):
+        return result, False
+    if not dual.get("dual_liq_trap") or dual.get("trap_score", 0) < 4:
+        return result, False
+
+    directional_bias = result.get("bias")
+    if directional_bias not in ("LONG", "SHORT"):
+        directional_bias = result.get("_final_bias_locked")
+
+    result["_dual_liq_trap_skip_enforced"] = True
+    result["_dual_liq_trap_skip_source"] = source
+    result["entry_allowed"] = False
+    result["confidence"] = "BLOCK"
+    result["entry_reason"] = (
+        f"DUAL LIQ TRAP SKIP enforced (score {dual.get('trap_score', 0)}/5). "
+        f"{dual.get('reason', '')}"
+    )
+    result["_override_critical_lock"] = True
+    result["_override_critical_source"] = source
+
+    if directional_bias in ("LONG", "SHORT"):
+        result["_supervisor_directional_bias"] = directional_bias
+        result["_final_bias_locked"] = directional_bias
+        result["bias"] = directional_bias
+        result["bias_display"] = directional_bias
+        result["reason"] = (
+            f"[DUAL_LIQ_TRAP_SKIP] Directional bias={directional_bias}, "
+            "but entry is blocked because both liq pools are trap-active. | "
+            + result.get("reason", "")
+        )
+    else:
+        result["bias"] = "NEUTRAL"
+        result["bias_display"] = "NEUTRAL"
+        result["_final_bias_locked"] = "NEUTRAL"
+        result["reason"] = "[DUAL_LIQ_TRAP_SKIP] No committed direction; force SKIP. | " + result.get("reason", "")
+
+    return result, True
+
+
+def _force_supervisor_bias(result: dict, decision: dict, source: str) -> dict:
+    bias = decision.get("bias", "NEUTRAL")
+    priority_base = globals().get("FORENSIC_GUARD_PRIORITY", -100200)
+    confidence = decision.get("confidence")
+    if not confidence:
+        confidence = "ABSOLUTE" if bias in ("LONG", "SHORT") else "BLOCK"
+
+    result["bias"] = bias
+    result["bias_display"] = bias
+    result["confidence"] = confidence
+    result["entry_allowed"] = bias in ("LONG", "SHORT")
+    result["priority_level"] = decision.get("priority", priority_base - 500)
+    result["_final_bias_locked"] = bias
+    result["_override_critical_lock"] = True
+    result["_override_critical_source"] = decision.get("source", source)
+    result["_post_capitulation_supervisor"] = True
+    result["_post_capitulation_supervisor_source"] = decision.get("source", source)
+    result["reason"] = f"[{decision.get('source', source)}] {decision.get('reason', '')} | " + result.get("reason", "")
+
+    result, _ = _apply_dual_liq_trap_skip(result, decision.get("source", source))
+    return result
+
+
+def _apply_post_capitulation_arbitration_tiers(result: dict, source: str = "POST_CAP_SUPERVISOR") -> tuple:
+    """
+    Lecturer supervisor: consume hard post-capitulation signals before any
+    ARBITRATE_EARLY_RETURN or Hawkes directional lock can freeze a stale bias.
+    """
+    result = _apply_macro_pressure_to_hawkes(result, source)
+
+    tier0 = _terminal_capitulation_floor_bias(result)
+    if tier0.get("override"):
+        return _force_supervisor_bias(result, tier0, source), True
+
+    terminal_blowoff = _terminal_blowoff_short_detector(result)
+    result["_terminal_blowoff_short_detector"] = terminal_blowoff
+    if terminal_blowoff.get("override"):
+        return _force_supervisor_bias(result, terminal_blowoff, source), True
+
+    mm_repricing = _mm_repricing_long_detector(result)
+    result["_mm_repricing_long"] = mm_repricing
+    if mm_repricing.get("override"):
+        return _force_supervisor_bias(result, mm_repricing, source), True
+
+    liq_hunt_dump = _liquidation_hunt_dump_classifier(result)
+    result["_liquidation_hunt_dump_classifier"] = liq_hunt_dump
+    if liq_hunt_dump.get("override"):
+        return _force_supervisor_bias(result, liq_hunt_dump, source), True
+
+    mm_absorption = _mm_absorption_active(result)
+    if mm_absorption.get("override"):
+        return _force_supervisor_bias(result, mm_absorption, source), True
+
+    fake_dump = _fake_dump_reversal_signature(result)
+    if fake_dump.get("override") and result.get("bias") != "LONG":
+        result["_fake_dump_reversal_signature"] = fake_dump
+        return _force_supervisor_bias(result, fake_dump, source), True
+
+    squeeze = _short_squeeze_ignition_v2(result)
+    result["_short_squeeze_ignition_v2"] = squeeze
+    if squeeze.get("override"):
+        return _force_supervisor_bias(result, squeeze, source), True
+
+    bias_conflict = result.get("bias_kill_conflict", {})
+    if result.get("_agg_spoof_blocked") and isinstance(bias_conflict, dict):
+        correct = bias_conflict.get("correct_direction")
+        if correct in ("LONG", "SHORT"):
+            decision = {
+                "bias": correct,
+                "source": "AGG_SPOOF_BIAS_KILL_RESOLVER",
+                "reason": (
+                    f"agg spoof blocked and bias_kill_conflict corrected direction={correct}. "
+                    "Resolve before early-return lock."
+                ),
+            }
+            return _force_supervisor_bias(result, decision, source), True
+
+    if isinstance(bias_conflict, dict) and bias_conflict.get("has_conflict"):
+        correct = bias_conflict.get("correct_direction")
+        if correct in ("LONG", "SHORT"):
+            decision = {
+                "bias": correct,
+                "source": "BIAS_KILL_CONFLICT_RESOLVER",
+                "reason": (
+                    f"bias-kill conflict resolved to {correct}; stale bias cannot be locked."
+                ),
+            }
+            return _force_supervisor_bias(result, decision, source), True
+
+    result, dual_skip = _apply_dual_liq_trap_skip(result, "DUAL_LIQ_TRAP_SKIP")
+    if dual_skip:
+        return result, True
+
+    macro = _macro_signed_pressure_override(result)
+    if macro.get("override"):
+        lock_source = str(result.get("_override_critical_source", ""))
+        current_bias = result.get("_final_bias_locked", result.get("bias", "NEUTRAL"))
+        hawkes_or_early = (
+            result.get("_hawkes_directional_lock") or
+            lock_source.startswith("HAWKES") or
+            lock_source == "ARBITRATE_EARLY_RETURN"
+        )
+        if hawkes_or_early and current_bias in ("LONG", "SHORT") and current_bias != macro["bias"]:
+            decision = {
+                "bias": macro["bias"],
+                "source": "MACRO_SIGNED_PRESSURE_OVERRIDE",
+                "reason": macro["reason"] + "; stale Hawkes/early lock overruled.",
+            }
+            return _force_supervisor_bias(result, decision, source), True
+
+    return result, False
+
+
 def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict:
     """
     KOMPANDAN ABSOLUT v2 (Hybrid Dosen + Detektor Existing)
@@ -13190,6 +14479,13 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
     jika kondisi SUPER KETAT terpenuhi. Jika tidak, semua detektormu
     tetap berperan sebagai penasihat lewat voting yang sudah disempurnakan.
     """
+    result, supervisor_final = _apply_post_capitulation_arbitration_tiers(
+        result,
+        source="ARBITRATE_TIER0_TO_TIER4"
+    )
+    if supervisor_final:
+        return result
+
     result, forensic_overridden = _apply_forensic_market_structure_guards(
         result,
         source="ARBITRATE_START"
@@ -13493,6 +14789,12 @@ def arbitrate_final_decision(result: dict, expert_opinions: list = None) -> dict
     # ========== EKSEKUSI LAPISAN ============================================
 
     if has_critical_override_lock(result):
+        result, supervisor_final = _apply_post_capitulation_arbitration_tiers(
+            result,
+            source="ARBITRATE_CRITICAL_PRE_RETURN"
+        )
+        if supervisor_final:
+            return result
         if _spring_reversal_allowed(result):
             return _apply_spring_reversal(result)
         if _exhausted_squeeze_absolute_allowed(result):
@@ -14732,6 +16034,44 @@ def _hawkes_fresh_directional_lock_candidate(result: dict, direction: str = None
     if hawkes_dir not in ("LONG", "SHORT"):
         return {"lock": False}
 
+    macro_override = _macro_signed_pressure_override(result)
+    if macro_override.get("override") and macro_override.get("bias") != hawkes_dir:
+        result["_hawkes_lock_rejected_by_macro_pressure"] = True
+        result["_macro_signed_pressure_bias"] = macro_override.get("bias")
+        return {"lock": False}
+
+    terminal_floor = _terminal_capitulation_floor_bias(result)
+    if terminal_floor.get("override") and terminal_floor.get("bias") != hawkes_dir:
+        result["_hawkes_lock_rejected_by_terminal_floor"] = True
+        return {"lock": False}
+
+    liq_classifier = _liquidation_hunt_dump_classifier(result)
+    if liq_classifier.get("override") and liq_classifier.get("bias") != hawkes_dir:
+        result["_hawkes_lock_rejected_by_liq_hunt_classifier"] = True
+        result["_hawkes_lock_liq_classifier"] = liq_classifier
+        return {"lock": False}
+
+    hawkes_exhaustion = _hawkes_exhaustion_v2(result)
+    if (
+        hawkes_exhaustion.get("exhausted") and
+        hawkes_dir == hawkes_exhaustion.get("macro_bias") and
+        liq_classifier.get("bias") != hawkes_dir
+    ):
+        result["_hawkes_lock_rejected_by_exhaustion_v2"] = True
+        result["_hawkes_exhaustion_v2"] = hawkes_exhaustion
+        return {"lock": False}
+
+    if hawkes_dir == "SHORT":
+        if _mm_absorption_active(result).get("override"):
+            result["_hawkes_lock_rejected_by_mm_absorption"] = True
+            return {"lock": False}
+        if _fake_dump_reversal_signature(result).get("override"):
+            result["_hawkes_lock_rejected_by_fake_dump"] = True
+            return {"lock": False}
+        if _short_squeeze_ignition_v2(result).get("override"):
+            result["_hawkes_lock_rejected_by_squeeze_ignition_v2"] = True
+            return {"lock": False}
+
     ratio = _panglima_num(result.get("_hawkes_mtf_ratio", 0), 0.0)
     quality = str(result.get("_hawkes_mtf_momentum_quality", "UNKNOWN"))
     cascade = bool(result.get("_hawkes_mtf_cascade", False))
@@ -14747,23 +16087,28 @@ def _hawkes_fresh_directional_lock_candidate(result: dict, direction: str = None
     opposite = _opposite_bias(hawkes_dir)
     confirmations = 0
     reasons = []
+    rejected_greeks_vote = (
+        result.get("greeks_override_allowed") is False or
+        "GREEKS_BAIT_VEGA_BLOCKED" in str(result.get("reason", ""))
+    )
 
-    if str(result.get("greeks_kill_direction", "")) == hawkes_dir:
+    if not rejected_greeks_vote and str(result.get("greeks_kill_direction", "")) == hawkes_dir:
         confirmations += 2
         reasons.append(f"greeks_kill={hawkes_dir}")
-    if str(result.get("greeks_bias", "")) == hawkes_dir:
+    if not rejected_greeks_vote and str(result.get("greeks_bias", "")) == hawkes_dir:
         confirmations += 1
         reasons.append(f"greeks_bias={hawkes_dir}")
-    if str(result.get("greeks_delta_crowded", "")) == opposite:
+    if str(result.get("greeks_delta_crowded", "")) == opposite and str(result.get("market_phase", "")) != "BAIT":
         confirmations += 2
         reasons.append(f"crowded={opposite}")
 
     up_energy = _panglima_num(result.get("up_energy", 0), 0.0)
     down_energy = _panglima_num(result.get("down_energy", 0), 0.0)
-    if hawkes_dir == "LONG" and up_energy > 0.5 and down_energy < 0.01:
+    volume_ratio = _panglima_num(result.get("volume_ratio", 1.0), 1.0)
+    if hawkes_dir == "LONG" and up_energy > 1.0 and down_energy < 0.01 and volume_ratio >= 0.50:
         confirmations += 1
         reasons.append("one_sided_buy_energy")
-    if hawkes_dir == "SHORT" and down_energy > 0.5 and up_energy < 0.01:
+    if hawkes_dir == "SHORT" and down_energy > 1.0 and up_energy < 0.01 and volume_ratio >= 0.50:
         confirmations += 1
         reasons.append("one_sided_sell_energy")
 
@@ -14777,10 +16122,10 @@ def _hawkes_fresh_directional_lock_candidate(result: dict, direction: str = None
         reasons.append("bearish_book")
 
     funding = _panglima_num(result.get("funding_rate", 0), 0.0)
-    if hawkes_dir == "LONG" and funding < 0:
+    if hawkes_dir == "LONG" and funding < -0.0002:
         confirmations += 1
         reasons.append("negative_funding")
-    if hawkes_dir == "SHORT" and funding > 0:
+    if hawkes_dir == "SHORT" and funding > 0.0002:
         confirmations += 1
         reasons.append("positive_funding")
 
@@ -14883,6 +16228,20 @@ def _is_genuine_squeeze_setup(result: dict) -> bool:
     market_regime = str(result.get("market_regime", ""))
     hft_bias      = str(result.get("hft_6pct_bias", ""))
     algo_bias     = str(result.get("algo_type_bias", ""))
+
+    squeeze_v2 = _short_squeeze_ignition_v2(result)
+    result["_short_squeeze_ignition_v2"] = squeeze_v2
+    if squeeze_v2.get("override"):
+        return True
+
+    if _mm_absorption_active(result).get("override"):
+        return True
+
+    if _mm_repricing_long_detector(result).get("override"):
+        return True
+
+    if _fake_dump_reversal_signature(result).get("override"):
+        return True
     
     # === NEW: SPOOFED ORDERBOOK DETECTOR ===
     # Flag spoof ketika ask_bid_ratio diverges dari OFI direction:
@@ -15040,6 +16399,15 @@ def _detect_squeeze_quality_veto(result: dict, proposed_bias: str) -> dict:
     # menangkap genuine setup dengan short_liq dekat tapi semua indikator LONG kuat
     if proposed_bias == "LONG" and _is_genuine_squeeze_setup(result):
         return {"override": False}  # Skip veto, biarkan LONG jalan
+    if proposed_bias == "LONG":
+        mm_repricing = _mm_repricing_long_detector(result)
+        if mm_repricing.get("override"):
+            result["_squeeze_quality_veto_rebutted_by_mm_repricing"] = mm_repricing
+            return {"override": False}
+        thin_vacuum = _thin_ask_vacuum_continuation(result)
+        if thin_vacuum.get("override"):
+            result["_squeeze_quality_veto_rebutted_by_thin_ask_vacuum"] = thin_vacuum
+            return {"override": False}
 
     target_liq, other_liq = _target_liq_for_bias(result, proposed_bias)
     if not (target_liq < 1.5 and target_liq < other_liq):
@@ -15064,8 +16432,23 @@ def _detect_squeeze_quality_veto(result: dict, proposed_bias: str) -> dict:
     exchange_score = _panglima_num(result.get("exchange_risk_score", 0), 0.0)
     delta_exposure = _panglima_num(result.get("greeks_delta_exposure", 0), 0.0)
     delta_crowded = str(result.get("greeks_delta_crowded", "NEUTRAL"))
+    greeks_kill = str(result.get("greeks_kill_direction", "NEUTRAL"))
     rsi6 = _panglima_num(result.get("rsi6", 50), 50.0)
     rsi5m = _panglima_num(result.get("rsi6_5m", 50), 50.0)
+    up_energy = _panglima_num(result.get("up_energy", 0), 0.0)
+    down_energy = _panglima_num(result.get("down_energy", 0), 0.0)
+    change_5m = _panglima_num(result.get("change_5m", 0), 0.0)
+    bid_slope = _panglima_num(result.get("bid_slope", 1), 1.0)
+    ask_slope = _panglima_num(result.get("ask_slope", 0), 0.0)
+    ask_bid_ratio = ask_slope / max(bid_slope, 1e-9)
+    macro_ctx = _hawkes_macro_micro_context(result)
+    macro_micro_forced = (
+        str(result.get("_hawkes_mtf_momentum_quality", "UNKNOWN")) == "EXHAUSTED" and
+        macro_ctx.get("micro_bias") == forced_bias and
+        abs(_panglima_num(macro_ctx.get("micro", 0), 0.0)) >= 20.0
+    )
+    terminal_blowoff = _terminal_blowoff_short_detector(result)
+    liq_hunt_dump = _liquidation_hunt_dump_classifier(result)
 
     real_squeeze_confirmed = (
         volume_ratio > 1.5 and
@@ -15073,6 +16456,29 @@ def _detect_squeeze_quality_veto(result: dict, proposed_bias: str) -> dict:
         hawkes_dir == proposed_bias and
         _ofi_aligned_with_bias(result, proposed_bias, 0.40) and
         gamma_exec and gamma_score >= 3
+    )
+    real_squeeze_confirmed = real_squeeze_confirmed or _mm_repricing_long_detector(result).get("override", False)
+
+    rejection_evidence = (
+        down_energy > 0.3 * max(up_energy, 0.01) or
+        ask_bid_ratio > 1.50 or
+        (change_5m > 1.50 and rsi6 > 85.0)
+    )
+    institutional_forced_bias = (
+        exchange_score >= 6 and
+        exchange_dir == forced_bias and
+        (
+            greeks_kill == forced_bias or
+            delta_crowded == proposed_bias or
+            delta_exposure > 0.90
+        )
+    )
+    valid_veto_context = (
+        rejection_evidence or
+        institutional_forced_bias or
+        macro_micro_forced or
+        terminal_blowoff.get("override", False) or
+        (liq_hunt_dump.get("override") and liq_hunt_dump.get("bias") == forced_bias)
     )
 
     reasons = []
@@ -15108,12 +16514,26 @@ def _detect_squeeze_quality_veto(result: dict, proposed_bias: str) -> dict:
     if not hard_veto:
         return {"override": False}
 
+    if not valid_veto_context:
+        result["_squeeze_quality_veto_demoted"] = {
+            "proposed_bias": proposed_bias,
+            "forced_bias": forced_bias,
+            "target_liq": target_liq,
+            "reasons": reasons,
+            "rejection_evidence": rejection_evidence,
+            "institutional_forced_bias": institutional_forced_bias,
+            "macro_micro_forced": macro_micro_forced,
+        }
+        return {"override": False}
+
     return {
         "override": True,
         "bias": forced_bias,
         "reason": (
             f"SQUEEZE QUALITY VETO: target_liq={target_liq:.2f}% for {proposed_bias} "
-            f"is bait, force {forced_bias}. " + "; ".join(reasons)
+            f"is bait, force {forced_bias}. "
+            f"valid_context(rejection={rejection_evidence}, institutional={institutional_forced_bias}, "
+            f"macro_micro={macro_micro_forced}). " + "; ".join(reasons)
         ),
         "priority": FORENSIC_GUARD_PRIORITY,
     }
@@ -15248,6 +16668,42 @@ def _should_allow_critical_lock(result: dict,
             return False
     hawkes_mtf_veto, _ = _detect_hawkes_mtf_veto_context(result, lock_bias)
     if hawkes_mtf_veto:
+        return False
+
+    terminal_floor = _terminal_capitulation_floor_bias(result)
+    if terminal_floor.get("override") and lock_bias != terminal_floor.get("bias"):
+        return False
+
+    terminal_blowoff = _terminal_blowoff_short_detector(result)
+    if terminal_blowoff.get("override") and lock_bias != terminal_blowoff.get("bias"):
+        return False
+
+    mm_repricing = _mm_repricing_long_detector(result)
+    if mm_repricing.get("override") and lock_bias != mm_repricing.get("bias"):
+        return False
+
+    liq_hunt_dump = _liquidation_hunt_dump_classifier(result)
+    if liq_hunt_dump.get("override") and lock_bias != liq_hunt_dump.get("bias"):
+        return False
+
+    if lock_bias == "SHORT":
+        if _mm_absorption_active(result).get("override"):
+            return False
+        if _fake_dump_reversal_signature(result).get("override"):
+            return False
+        if _short_squeeze_ignition_v2(result).get("override"):
+            return False
+
+    macro_override = _macro_signed_pressure_override(result)
+    if (
+        macro_override.get("override") and
+        macro_override.get("bias") in ("LONG", "SHORT") and
+        lock_bias != macro_override.get("bias") and
+        (
+            str(lock_source).startswith("HAWKES") or
+            lock_source in ("ARBITRATE_EARLY_RETURN", "PHYSICS_ABSOLUTE")
+        )
+    ):
         return False
 
     # ── RULE 1: Fuel kosong + liq micro = jangan SHORT ──
