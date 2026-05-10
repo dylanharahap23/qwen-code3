@@ -13296,6 +13296,161 @@ def get_valid_ofi(result: dict) -> tuple:
     return ofi_bias, ofi_strength, False
 
 
+# ============================================================
+# PATCH: TIER0_SCOPE_VALIDATOR
+# TIER0_CAPITULATION_FLOOR_VETO hanya valid jika:
+# - RSI14 benar-benar oversold (< 25)
+# - long_liq TIDAK lebih dekat dari short_liq (tidak ada long sweep risk)
+# - Volume ratio tidak terlalu rendah (< 0.2 = ghost candle, tidak valid)
+# Jika gagal validasi: turunkan ke entry_allowed = False
+# ============================================================
+def _validate_tier0_capitulation_scope(result: dict) -> dict:
+    """
+    TIER0 seharusnya hanya valid untuk genuine capitulation floor.
+    Jika long_liq lebih dekat + micro semua SHORT + BAIT phase:
+    ini bukan capitulation, ini distribusi dengan RSI5m=0 sebagai glitch.
+    """
+    override_source = result.get("_override_critical_source", "")
+    if "TIER0_CAPITULATION_FLOOR_VETO" not in override_source:
+        return result  # Bukan TIER0, skip
+
+    rsi14 = result.get("rsi14", 50.0)
+    long_liq = result.get("long_liq", 99.0)
+    short_liq = result.get("short_liq", 99.0)
+    volume_ratio = result.get("volume_ratio", 1.0)
+    market_phase = result.get("market_phase", "")
+    rsi6_5m = result.get("rsi6_5m", 50.0)
+
+    # RSI5m = 0.0 bisa jadi DATA GLITCH pada volume rendah
+    # TIER0 tidak valid jika trigger-nya adalah RSI5m glitch
+    rsi5m_likely_glitch = (rsi6_5m <= 1.0 and volume_ratio < 0.4)
+
+    # Long liq lebih dekat = bukan capitulation floor yang aman
+    long_liq_magnetic = long_liq < short_liq
+
+    # BAIT phase artinya market belum confirm arah
+    is_bait = market_phase == "BAIT"
+
+    if rsi5m_likely_glitch and long_liq_magnetic and is_bait:
+        result["entry_allowed"] = False
+        result["_tier0_scope_invalid"] = True
+        result["_tier0_scope_reason"] = (
+            f"TIER0_SCOPE_INVALID: RSI5m={rsi6_5m} kemungkinan DATA GLITCH "
+            f"(volume_ratio={volume_ratio:.2f}x terlalu rendah untuk RSI valid). "
+            f"long_liq={long_liq:.2f}% < short_liq={short_liq:.2f}% = bukan capitulation floor. "
+            f"TIER0 override di-cancel. Tunggu RSI5m valid atau long_liq tersapu."
+        )
+        existing_reason = result.get("reason", "")
+        result["reason"] = (
+            f"[TIER0_SCOPE_INVALID] {result['_tier0_scope_reason']} | "
+            + existing_reason
+        )
+    return result
+
+
+# ============================================================
+# PATCH: BAIT_GREEKS_ABSOLUTE_VETO
+# Jika market phase BAIT + Greeks ABSOLUTE SHORT = NO ENTRY
+# Mencegah TIER0 override masuk di kondisi distribusi terselubung
+# ============================================================
+def _bait_greeks_absolute_veto(result: dict) -> dict:
+    """
+    Jika kondisi BAIT phase + Greeks confidence ABSOLUTE SHORT
+    + long_liq lebih dekat dari short_liq:
+    → Block entry meskipun TIER0 active
+    → Tidak mengubah bias (biar tetap ada untuk tracking),
+      hanya set entry_allowed = False
+    """
+    market_phase = result.get("market_phase", "")
+    greeks_confidence = result.get("greeks_confidence", "")
+    greeks_kill_direction = result.get("greeks_kill_direction", "")
+    long_liq = result.get("long_liq", 99.0)
+    short_liq = result.get("short_liq", 99.0)
+    bias = result.get("_final_bias_locked", result.get("bias", "NEUTRAL"))
+    override_source = result.get("_override_critical_source", "")
+
+    # Kondisi: BAIT phase, Greeks ABSOLUTE bilang SHORT, tapi bias LONG
+    bait_greeks_short = (
+        market_phase == "BAIT" and
+        greeks_confidence == "ABSOLUTE" and
+        greeks_kill_direction == "SHORT" and
+        bias == "LONG"
+    )
+
+    # Long liq lebih dekat = magnet ke bawah dulu
+    long_liq_closer = long_liq < short_liq
+
+    if bait_greeks_short and long_liq_closer:
+        result["entry_allowed"] = False
+        result["_bait_greeks_veto_active"] = True
+        result["_bait_greeks_veto_reason"] = (
+            f"BAIT_GREEKS_ABSOLUTE_VETO: market=BAIT, greeks=ABSOLUTE SHORT, "
+            f"long_liq={long_liq:.2f}% < short_liq={short_liq:.2f}%. "
+            f"Long liq pool lebih dekat = price magnet ke bawah. "
+            f"Entry LONG diblok meskipun {override_source} active."
+        )
+        # Tambahkan ke reason untuk visibility
+        existing_reason = result.get("reason", "")
+        result["reason"] = (
+            f"[BAIT_GREEKS_ABSOLUTE_VETO] {result['_bait_greeks_veto_reason']} | "
+            + existing_reason
+        )
+    return result
+
+
+# ============================================================
+# PATCH: MICRO_CASCADE_SHORT_DISTRIBUTION_GUARD
+# Jika 1m + 3m + 15m semua signed pressure negatif = distribusi aktif
+# Guard ini hanya block entry, tidak flip bias
+# ============================================================
+def _micro_cascade_distribution_guard(result: dict) -> dict:
+    """
+    Deteksi distribusi aktif: semua micro TF signed pressure negatif.
+    Jika terjadi saat bias LONG + long_liq lebih dekat = blok entry.
+    Tidak merusak TIER0 atau macro analysis, hanya gate entry.
+    """
+    signed = result.get("_hawkes_mtf_signed_pressure", {}) or {}
+    if not isinstance(signed, dict):
+        return result
+
+    tf_1m = signed.get("1m", 0.0)
+    tf_3m = signed.get("3m", 0.0)
+    tf_15m = signed.get("15m", 0.0)
+
+    bias = result.get("_final_bias_locked", result.get("bias", "NEUTRAL"))
+    long_liq = result.get("long_liq", 99.0)
+    short_liq = result.get("short_liq", 99.0)
+    market_phase = result.get("market_phase", "")
+
+    # Semua micro TF negatif = distribusi aktif (sellers in control sekarang)
+    all_micro_short = (tf_1m < 0 and tf_3m < 0 and tf_15m < 0)
+
+    # Intensitas distribusi (makin negatif makin kuat)
+    micro_distribution_strength = abs(tf_1m) + abs(tf_3m) + abs(tf_15m)
+
+    if (
+        all_micro_short and
+        bias == "LONG" and
+        long_liq < short_liq and
+        market_phase in ("BAIT", "PREP") and
+        micro_distribution_strength > 30.0  # threshold: total pressure cukup kuat
+    ):
+        result["entry_allowed"] = False
+        result["_micro_cascade_guard_active"] = True
+        result["_micro_cascade_guard_reason"] = (
+            f"MICRO_CASCADE_DISTRIBUTION_GUARD: 1m={tf_1m:.1f}, 3m={tf_3m:.1f}, "
+            f"15m={tf_15m:.1f} semua SHORT (total={micro_distribution_strength:.1f}). "
+            f"Distribusi aktif + long_liq={long_liq:.2f}% lebih dekat. "
+            f"Entry LONG diblok — tunggu micro TF balik positif."
+        )
+        existing_reason = result.get("reason", "")
+        result["reason"] = (
+            f"[MICRO_CASCADE_DISTRIBUTION] {result['_micro_cascade_guard_reason']} | "
+            + existing_reason
+        )
+    return result
+
+
 def render_final_output(result: dict) -> dict:
     """
     Single source of truth for anything rendered or returned to the bot.
@@ -13313,6 +13468,12 @@ def render_final_output(result: dict) -> dict:
         source="RENDER_FINAL_OUTPUT"
     )
     result, _ = apply_panglima_greeks_veto(result, "RENDER_FINAL_OUTPUT")
+
+    # ===== PATCH BARU — tambahkan di akhir, sebelum return =====
+    result = _validate_tier0_capitulation_scope(result)   # PATCH 3 dulu
+    result = _bait_greeks_absolute_veto(result)            # PATCH 1
+    result = _micro_cascade_distribution_guard(result)    # PATCH 2
+    # ===========================================================
 
     final_locked = result.get("_final_bias_locked")
     if final_locked in ("LONG", "SHORT", "NEUTRAL"):
